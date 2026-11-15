@@ -25,7 +25,8 @@ import sys
 
 import numpy as np
 
-VENV_PY = "/media/fpgadev/Dev_Tools/OpenEMS/install/venv/bin/python"
+# Python of an environment with openEMS and CSXCAD installed
+VENV_PY = os.environ.get("OPENPCBSI_OPENEMS_PYTHON", "/media/fpgadev/Dev_Tools/OpenEMS/install/venv/bin/python")
 
 
 def _bbox_hit(pts, box, m=0.2):

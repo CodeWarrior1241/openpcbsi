@@ -11,3 +11,7 @@ deps/tmp/
 
 __pycache__/
 *.pyc
+
+# internal design documents, kept out of the public repository
+REQUIREMENTS.md
+docs/G0_survey.md

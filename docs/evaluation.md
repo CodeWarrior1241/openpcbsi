@@ -1,11 +1,11 @@
 # Design evaluation: files and schema
 
-`python3 -m openpcbsi evaluate` (REQUIREMENTS G18 to G21) writes `evaluation.json` and
+`python3 -m openpcbsi evaluate` writes `evaluation.json` and
 `evaluation.html` into the run directory, beside `report.json`. This page describes the JSON, the
 waiver file and the exit codes. The schema is versioned: a change that removes or renames a field
 raises the version in `schema`.
 
-## Exit codes (G21)
+## Exit codes
 
 | Code | Meaning |
 |------|---------|
@@ -40,17 +40,18 @@ case), `assumed inputs` (judged on assumed rail currents), `not run` (inputs mis
 `ripple_pct` on any rail), `not built`, `pass`. A family takes the worst status of the checks that
 ran.
 
-Families: `G1` (electrical rules not named in section 5.13), `RP` (return path, 5.13), `SD`
-(supply delivery, 5.12, with G11), `SI` (G2 to G9), `TH` (G13), `EMC` (G14), `EV` (process, 5.15),
-`PL` and `FS` (not built).
+Families: `G1` (general electrical rules), `RP` (return path and grounding), `SD` (supply
+delivery: DC drop and PDN impedance), `SI` (impedance, crosstalk, net models, vias), `TH`
+(thermal), `EMC`, `EV` (process: KiCad DRC), `PL` (placement) and `FS` (field-solver gates); the
+last two are not built yet.
 
-### A finding (G19)
+### A finding
 
 | Field | Content |
 |-------|---------|
 | `id` | Stable ID `<check>-<10 hex>`: hash of the check, nets, references, layer, position rounded to 0.1 mm and the finding kind. A second finding with the same hash in one run gets `.1`, `.2`. |
 | `severity` | `info`, `pass`, `warn` or `fail`. G1 `error` maps to `fail`, `warning` to `warn`. |
-| `check`, `family`, `requirement` | The G1 rule key or check name (`dc`, `pdn`, `kicad_drc`, ...), its family and the REQUIREMENTS ID. |
+| `check`, `family`, `requirement` | The G1 rule key or check name (`dc`, `pdn`, `kicad_drc`, ...), its family and the project's internal requirement ID (for example `RP1`, `SD1`). |
 | `value`, `limit`, `unit` | Measured value and the limit it was judged against, where there is one. |
 | `best` | Best achievable value, where a check computes one (none yet). |
 | `nets`, `refs`, `layer`, `x`, `y` | Where it is (mm, board coordinates). |
@@ -59,7 +60,7 @@ Families: `G1` (electrical rules not named in section 5.13), `RP` (return path, 
 | `area` | The exclusion area it lies in, or empty. Area findings are listed, not counted. |
 | `waived` | Null, or `{reason, reviewer, waiver}`. |
 
-## Waiver file (G20)
+## Waiver file
 
 ```toml
 [[waiver]]
