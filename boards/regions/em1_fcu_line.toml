@@ -1,0 +1,13 @@
+# G8 smoke test / G17 case "2D solver against openEMS": 4 mm of the 0.15 mm PMOD3 track on F.Cu
+# over the solid L2 ground (outside the fields), ports 4 mm apart, stack cut at In1.Cu.
+[region]
+name = "em1_fcu_line"
+box = [70.0, 100.6, 75.0, 102.25]
+bottom = "In1.Cu"
+ports = [ { name = "p1", at = [70.5, 101.415], layer = "F.Cu" },
+          { name = "p2", at = [74.5, 101.415], layer = "F.Cu" } ]
+fmax_ghz = 20.0
+res_mm = [0.05, 0.035]
+tol_db = 0.5
+threads = 4
+compare_z = { layer = "F.Cu", w = 0.15 }

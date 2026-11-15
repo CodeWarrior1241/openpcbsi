@@ -1,0 +1,9 @@
+# KiPI pin for openlynx. Change only together with a re-check of kipi_driver.py (it uses
+# KiPI's internal API: solve_tree, solve_ac, KiCadFileSource, snapshot_io, PISetup).
+repo = "https://github.com/drewsum/KiPI.git"
+tag = "v1.0.1"
+commit = "3ffce16aa5a0248ccdbdda8603c3c484ac99f570"
+python = "python3"            # system Python 3.12 (KiPI supports 3.10-3.13)
+venv = "kipi-venv"
+requirements = "KiPI/requirements-standalone.txt"
+pinned_on = "2026-11-15"

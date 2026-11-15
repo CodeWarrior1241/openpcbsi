@@ -1,0 +1,287 @@
+# openlynx configuration for the AU7P FMC pilot board
+# (Work/Sandbox/Minimalist_AU7P_Board, REQUIREMENTS.md sections 3, 4 and 7).
+# Limits are the proposals of the pilot's section 7; they are to be fixed at review.
+
+[board]
+raster_res = 0.025
+reference_nets = ["GND"]
+power_as_reference = false
+
+# --- signal classes by edge rate -------------------------------------------------------------
+[classes.GTH]
+patterns = ["FMC_DP0*", "FMC_GBTCLK*", "GTH_*"]
+rise_ps = 35            # 12.5 Gb/s max in SBVC484 (DS931 table 51)
+nyquist_ghz = 6.25
+z_diff = 100.0
+z_tol = 10.0
+min_spacing_mm = 0.5    # PC7: GTH pairs 0.5 mm from any other net (3.9)
+
+[classes.LVDS]
+patterns = ["FMC_LA*", "FMC_CLK*"]
+rise_ps = 300           # AD9361 LVDS, bit period >= 2 ns (4.3)
+nyquist_ghz = 1.0       # edge-rate knee rather than bit rate (LVDS checks run to 5 GHz in 7.1)
+z_diff = 100.0
+z_tol = 10.0
+min_spacing_mm = 0.36        # PC7: 3 x track width from non-pair nets
+min_spacing_pairs_mm = 0.0   # pair-to-pair spacing: no limit stated in section 7 (reported, not judged)
+
+# --- exclusion areas ("the fields") -----------------------------------------------------------
+[areas.bga]
+footprints = ["U1"]
+margin = 0.0
+
+[areas.fmc]
+footprints = ["J1"]
+margin = 0.0
+
+# L6 (In5.Cu) is referenced to the L5 ground fill (In4.Cu) and to L7 (In6.Cu)
+[reference_layers]
+"F.Cu" = ["In1.Cu"]
+"In2.Cu" = ["In1.Cu", "In3.Cu"]
+"In5.Cu" = ["In4.Cu", "In6.Cu"]
+"B.Cu" = ["In6.Cu"]
+
+# --- rules ------------------------------------------------------------------------------------
+[rules.ref_plane]
+classes = ["GTH", "LVDS"]
+margin_h = 3.0
+limit_mm = 0.0
+
+[rules.split_crossing]
+classes = ["GTH", "LVDS"]
+
+[rules.return_via]
+classes = ["GTH", "LVDS"]
+limit_mm = 1.0
+
+[rules.via_stub]
+classes = ["GTH", "LVDS"]
+factor = 3.0
+
+[rules.edge_distance]
+classes = ["GTH", "LVDS"]
+board_edge_mm = 1.0
+plane_edge_mm = 1.0
+
+[rules.stitching]
+classes = ["GTH"]
+max_gap_mm = 2.3        # lambda/10 at 6.25 GHz, er ~4.2
+band_mm = 1.5
+board_edge_gap_mm = 5.0
+
+[rules.pair_coupling]
+classes = ["GTH", "LVDS"]
+max_gap_mm = 0.18
+limit_mm = 1.0
+
+[rules.parallel]
+classes = ["GTH", "LVDS"]
+max_spacing_mm = 1.0
+
+[rules.pad_plane]
+classes = ["GTH", "LVDS"]
+
+[rules.decap]
+via_mm = 0.3
+load_refs = ["U1"]
+load_mm = 15.0
+
+[rules.stubs]
+classes = ["GTH", "LVDS"]
+
+[rules.thermal_vias]
+parts = ["U10", "U11", "U12", "U13", "U14", "U15", "U16"]
+
+# --- 2D cross-sections (G6) -------------------------------------------------------------------
+[xsec]
+res_um = 5.0
+mask_er = 3.8
+roughness_um = 0.4      # ENIG on JLC standard foil: assumption, not a fabricator figure
+freqs_ghz = [0.1, 1.0, 6.25, 12.5]
+er_ref_ghz = 1.0
+# fabricator figures (none yet: section 6 says confirm against JLCPCB's calculator)
+fab = []
+
+# --- rails (G10, G11) -------------------------------------------------------------------------
+# Currents are ESTIMATES (no Power Design Manager run exists for the pilot). Sources are the
+# load-side pads of each monitor shunt (section 3.7); loads are the FPGA balls of the rail.
+[rails.VCCINT]
+net = "VCCINT"
+regulator = "U11"
+v = 0.85
+tol_pct = 3.0
+current_a = 3.0
+source = "R14"          # shunt: the pad on this net is the source
+sense = "CORE_SNS"      # remote sense: R11 joins CORE_SNS to the VCCINT plane after the shunt (R12 DNP = local)
+loads = ["U1"]
+ripple_pct = 3.0
+step_a = 1.5
+
+[rails.VCCBRAM]
+net = "VCCBRAM"
+regulator = "U11"
+v = 0.85
+tol_pct = 3.0
+current_a = 0.3
+source = "R15"
+loads = ["U1"]
+ripple_pct = 3.0
+step_a = 0.15
+
+[rails.VCCAUX]
+net = "VCCAUX"
+regulator = "U12"
+v = 1.8
+tol_pct = 3.0
+current_a = 0.4
+source = "R19"
+loads = ["U1"]
+ripple_pct = 3.0
+step_a = 0.2
+
+[rails.VCCO_0]
+net = "VCCO_0"
+regulator = "U12"
+v = 1.8
+tol_pct = 5.0
+current_a = 0.03
+source = "R20"
+loads = ["U1"]
+
+[rails.VCCADC]
+net = "VCCADC"
+regulator = "U12"
+v = 1.8
+tol_pct = 3.0
+current_a = 0.02
+source = "R21"
+loads = ["U1"]
+
+[rails.VCCO_65]
+net = "VCCO_65"
+regulator = "U13"
+v = 1.8
+tol_pct = 5.0
+current_a = 0.3
+source = "R26"
+loads = ["U1"]
+
+[rails.VCCO_66]
+net = "VCCO_66"
+regulator = "U13"
+v = 1.8
+tol_pct = 5.0
+current_a = 0.3
+source = "R27"
+loads = ["U1"]
+
+[rails.VCCO_HD]
+net = "VCCO_HD"
+regulator = "U14"
+v = 3.3
+tol_pct = 5.0
+current_a = 0.2
+source = "R28"
+loads = ["U1"]
+
+[rails.MGTAVCC]
+net = "MGTAVCC"
+regulator = "U15"
+v = 0.9
+tol_pct = 3.0
+current_a = 0.5
+source = "R39"
+sense = "FB_U15"        # the LDO senses after the shunt (3.9)
+loads = ["U1"]
+ripple_pct = 1.1        # 10 mVpp of 0.9 V (UG576)
+step_a = 0.25
+
+[rails.MGTAVTT]
+net = "MGTAVTT"
+regulator = "U16"
+v = 1.2
+tol_pct = 3.0
+current_a = 0.4
+source = "R40"
+sense = "FB_U16"
+loads = ["U1"]
+ripple_pct = 0.8        # 10 mVpp of 1.2 V
+step_a = 0.2
+
+[rails.MGTVCCAUX]
+net = "MGTVCCAUX"
+regulator = "U12"
+v = 1.8
+tol_pct = 3.0
+current_a = 0.03
+source = "R41"
+loads = ["U1"]
+
+# --- engines: G10 and G11 run in KiPI (deps/, pinned in deps/kipi.lock); openlynx's own
+# solver runs beside it as a cross-check when cross_check = true
+[engines]
+dc = "kipi"
+pdn = "kipi"
+cross_check = true
+
+[kipi]
+ferrite_dcr_ohm = 0.15       # FB1, FB2 (600R@100MHz): DC resistance assumed, not from a datasheet
+max_series_ohm = 1.0         # series parts up to this value are followed upstream as links
+max_edge_mm = 0.5            # DC FEM mesh
+ac_max_edge_mm = 1.0
+ac_points_per_decade = 25
+bandwidth_khz = 50.0         # regulator loop bandwidth: the target applies above it
+
+[kipi.input]                 # the 12 V input (3.6): jack J4 -> fuse F1 -> P-FET Q1 -> VIN shunt R2 -> +12V
+net = "+12V"
+chain = ["R2", "Q1", "F1"]
+source = "J4"
+v = 12.0
+resistances = { Q1 = 0.06, F1 = 0.01 }   # AO3407A Rds(on) at -10 V (datasheet max ~ 52 mOhm), fuse estimate
+
+[pdn]
+cell_mm = 0.5
+fmin_hz = 1e5
+fmax_hz = 1e9
+points = 100
+target_fmax_hz = 1e8   # above this the package and die capacitance take over (board PDN not judged)
+
+[dc]
+cell_mm = 0.1
+
+# --- thermal (G13): dissipations are estimates ------------------------------------------------
+[thermal]
+cell_mm = 1.0
+ambient_c = 25.0
+h_top = 10.0
+h_bot = 10.0
+[thermal.parts]
+U1 = { power_w = 4.0, theta_jb = 4.0 }
+U11 = { power_w = 0.5, theta_jb = 15.0 }
+U12 = { power_w = 0.3, theta_jb = 15.0 }
+U13 = { power_w = 0.4, theta_jb = 15.0 }
+U14 = { power_w = 1.2, theta_jb = 15.0 }
+U15 = { power_w = 0.45, theta_jb = 20.0 }
+U16 = { power_w = 0.24, theta_jb = 20.0 }
+U10 = { power_w = 0.1, theta_jb = 15.0 }
+
+[crosstalk]
+classes = ["GTH", "LVDS"]
+max_spacing_mm = 0.6
+top = 30
+
+# --- G2/G3 classes need driver/termination; G7 channels -------------------------------------
+[si]
+fmax_ghz = 40.0
+
+[channels.DP0_M2C]           # mezzanine -> FPGA RX0: connector pads, 100 nF pair, ball pads (EM3)
+path = ["FMC_DP0_M2C_P", "cap:100n", "GTH_RX0_P"]
+bitrate_gbps = 12.5
+rise_ps = 35
+masks = { sdd11_db = -10.0, sdd11_fmax_ghz = 6.25, ild_db = 1.0, ild_fmax_ghz = 12.5 }
+
+[channels.DP0_C2M]           # FPGA TX0 -> connector (no series caps on the carrier)
+path = ["FMC_DP0_C2M_P"]
+bitrate_gbps = 12.5
+rise_ps = 35
+masks = { sdd11_db = -10.0, sdd11_fmax_ghz = 6.25, ild_db = 1.0, ild_fmax_ghz = 12.5 }

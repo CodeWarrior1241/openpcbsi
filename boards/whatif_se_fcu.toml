@@ -1,0 +1,12 @@
+# G5 what-if: an unterminated single-ended line on F.Cu (pilot stackup), CMOS-like driver into 3 pF,
+# swept over length and series termination.
+[whatif]
+layer = "F.Cu"
+w = 0.15
+length_mm = 50
+driver_r_ohm = 15
+rise_ps = 500
+load_pf = 3.0
+[whatif.sweep]
+length_mm = [25, 50, 100]
+series_r_ohm = [0, 20, 40]
