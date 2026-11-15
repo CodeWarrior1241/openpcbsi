@@ -1,7 +1,7 @@
 """G8 runner, executed with the openEMS venv's python:  python -I em_runner.py <job dir>
 
 Builds the CSXCAD model from job.json, runs openEMS at each grid resolution, writes Touchstone
-files and result.json with the convergence record. Kept free of openlynx imports (isolated mode)."""
+files and result.json with the convergence record. Kept free of openpcbsi imports (isolated mode)."""
 import json
 import math
 import os
@@ -96,7 +96,7 @@ def main(od):
         np.save(os.path.join(od, f"s_{res:g}.npy"), s)
         # Touchstone (first column of the S-matrix, port 1 excited)
         with open(os.path.join(od, f"port1_{res:g}.s{len(ports)}p"), "w") as fh:
-            fh.write(f"! openlynx G8, port 1 excited only (column 1), res {res} mm\n# HZ S RI R 50\n")
+            fh.write(f"! openpcbsi G8, port 1 excited only (column 1), res {res} mm\n# HZ S RI R 50\n")
             for i in range(len(f)):
                 vals = []
                 for k in range(len(ports)):

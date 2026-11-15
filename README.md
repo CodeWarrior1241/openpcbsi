@@ -1,4 +1,4 @@
-# openlynx
+# openpcbsi
 
 Electrical checks for KiCad 10 boards of the kind a commercial SI/PI suite makes and KiCad's DRC
 does not: return paths, impedance, crosstalk, channel loss, supply drop and noise, heat. It
@@ -23,7 +23,7 @@ cd /media/fpgadev/Dev_Tools/Work/Open_Source_Hyperlynx
    (EV5) and runs every built check plus KiCad's DRC:
 
    ```
-   python3 -m openlynx evaluate PATH/TO/BOARD.kicad_pcb
+   python3 -m openpcbsi evaluate PATH/TO/BOARD.kicad_pcb
    ```
 
    The scorecard is printed and written to `runs/<board>_<sha8>/evaluation.html` and
@@ -33,7 +33,7 @@ cd /media/fpgadev/Dev_Tools/Work/Open_Source_Hyperlynx
 2. **Draft a config and review it.**
 
    ```
-   python3 -m openlynx init PATH/TO/BOARD.kicad_pcb        # writes boards/<board>.toml
+   python3 -m openpcbsi init PATH/TO/BOARD.kicad_pcb        # writes boards/<board>.toml
    ```
 
    The draft has every detected class, field and rail, with the assumptions as comments. What the
@@ -51,7 +51,7 @@ cd /media/fpgadev/Dev_Tools/Work/Open_Source_Hyperlynx
 3. **Evaluate against the reviewed config**, with waivers once findings have been reviewed:
 
    ```
-   python3 -m openlynx evaluate BOARD.kicad_pcb -c boards/<board>.toml [--waivers waivers.toml]
+   python3 -m openpcbsi evaluate BOARD.kicad_pcb -c boards/<board>.toml [--waivers waivers.toml]
    ```
 
    Findings carry stable IDs (G19), so a waiver keeps matching while its cause is unchanged, and
@@ -62,16 +62,16 @@ cd /media/fpgadev/Dev_Tools/Work/Open_Source_Hyperlynx
 ### Commands
 
 ```
-python3 -m openlynx evaluate BOARD [-c CFG] [--waivers FILE] [--families g1,rp,sd,si,th,emc,ev]
+python3 -m openpcbsi evaluate BOARD [-c CFG] [--waivers FILE] [--families g1,rp,sd,si,th,emc,ev]
                                    [--checks ...] [--json OUT] [-o DIR] [--no-drc] [--no-markers]
-python3 -m openlynx init     BOARD [-o boards/NAME.toml] [--force]          # EV5 draft config
-python3 -m openlynx check    BOARD [-c CFG] [--checks drc,impedance] [--rules ref_plane,...] [-o DIR] [--no-markers]
-python3 -m openlynx compare  A.kicad_pcb B.kicad_pcb -c CFG [--config-b CFG_B] [--checks ...]   # G15 A/B
-python3 -m openlynx rediff   RUN_DIR_A RUN_DIR_B                            # A/B from two finished runs
-python3 -m openlynx validate                                                # G17 cases
-python3 -m openlynx whatif   BOARD -c CFG boards/whatif_se_fcu.toml         # G5
-python3 -m openlynx region   BOARD -c CFG boards/regions/em1_fcu_line.toml  # G8 (openEMS)
-python3 -m openlynx snapshot BOARD                                          # re-read the board
+python3 -m openpcbsi init     BOARD [-o boards/NAME.toml] [--force]          # EV5 draft config
+python3 -m openpcbsi check    BOARD [-c CFG] [--checks drc,impedance] [--rules ref_plane,...] [-o DIR] [--no-markers]
+python3 -m openpcbsi compare  A.kicad_pcb B.kicad_pcb -c CFG [--config-b CFG_B] [--checks ...]   # G15 A/B
+python3 -m openpcbsi rediff   RUN_DIR_A RUN_DIR_B                            # A/B from two finished runs
+python3 -m openpcbsi validate                                                # G17 cases
+python3 -m openpcbsi whatif   BOARD -c CFG boards/whatif_se_fcu.toml         # G5
+python3 -m openpcbsi region   BOARD -c CFG boards/regions/em1_fcu_line.toml  # G8 (openEMS)
+python3 -m openpcbsi snapshot BOARD                                          # re-read the board
 ```
 
 `check` runs the checks and writes the report without the scorecard, DRC or exit code. Without
@@ -103,7 +103,7 @@ A run writes the following to `runs/<board>_<sha8>/` (or `-o DIR`):
 - `nets/`: a SPICE subcircuit and a Touchstone file per net (characters other than letters, digits
   and `_.+-` in a net name, such as the `/` of hierarchical names, become `_`).
 - `kipi/`: KiPI's setup, job and result, when KiPI ran.
-- `<board>_openlynx.kicad_pcb`: a copy of the board with the errors and warnings as markers on
+- `<board>_openpcbsi.kicad_pcb`: a copy of the board with the errors and warnings as markers on
   User.9.
 
 `compare` writes `runs/compare_<A>_vs_<B>/compare.html` and `compare.json`.
@@ -149,8 +149,8 @@ report records the converted copy (`downgraded`).
 | G7a | not started | | Not needed for the pilot. |
 | G8 | runs, not yet trustworthy | `region.py`, `em_runner.py` | Region cut from the snapshot, PEC copper sheets, via cylinders, lossy slabs, lumped ports at pads or points (nets under a port are clipped at the ports), two grid resolutions with a dB agreement test, cache by job hash, line impedance against G6. Pilot smoke test (`boards/regions/em1_fcu_line.toml`, 4 mm of 0.15 mm F.Cu): S21 -0.05 dB at 1 GHz, grids agree to 0.60 dB (limit 0.5: not accepted), extracted Z 80 ohm against 55 ohm from G6. The vertical lumped ports are not de-embedded, which dominates the extraction. Next: MSL/waveguide ports or port de-embedding (two line lengths), mixed mode, TDR. |
 | G9 | done (closed form) | `vias.py` | Coaxial barrel model per via geometry, antipads measured on the plane rasters, nearest return via. Cached library `cache/via_library.json`. Not field-solved. |
-| G10 | done: KiPI engine, openlynx cross-check | `kipi_bridge.py` + `deps/` (KiPI v1.0.1); `pdn.py dc_drop` | KiPI (FEM, `[engines] dc = "kipi"`) solves the whole power tree from the 12 V input: regulators, shunts and ferrites as series links, remote sense, and the ground net. The tree is derived from the rail config. Reported per rail: regulator-to-ball drop (shunts and ground included) against the window, PASS/FAIL, via currents, current density. openlynx's own raster solver runs beside it as a cross-check on a like-for-like figure (from the shunt or sense point, supply side): on the pilot the two agree within 0.64 mV on every rail, -0.4 to +13.7 % (board `d454fef3`; the larger percentages are on the 3-4 mV drops of the GTH rails), and within 1.2 mV, -5.8 to +8.7 % (board `e6b71042`). |
-| G11 | done: KiPI engine, openlynx optimiser | `kipi_bridge.py`; `pdn.py pdn_impedance` | KiPI field-solves rail and ground per regulator and gives Z(f) at the load balls against V·ripple/ΔI up to `target_fmax_hz`. openlynx's own network (plane-pair cavity cells, track and via L, C-ESR-ESL capacitors) runs beside it for the cross-check and carries the greedy decoupling optimiser, which KiPI does not have. The report overlays both curves. KiPI AC is slow: about 19 min for the pilot's 4 regulators (tune `[kipi] ac_*`). |
+| G10 | done: KiPI engine, openpcbsi cross-check | `kipi_bridge.py` + `deps/` (KiPI v1.0.1); `pdn.py dc_drop` | KiPI (FEM, `[engines] dc = "kipi"`) solves the whole power tree from the 12 V input: regulators, shunts and ferrites as series links, remote sense, and the ground net. The tree is derived from the rail config. Reported per rail: regulator-to-ball drop (shunts and ground included) against the window, PASS/FAIL, via currents, current density. openpcbsi's own raster solver runs beside it as a cross-check on a like-for-like figure (from the shunt or sense point, supply side): on the pilot the two agree within 0.64 mV on every rail, -0.4 to +13.7 % (board `d454fef3`; the larger percentages are on the 3-4 mV drops of the GTH rails), and within 1.2 mV, -5.8 to +8.7 % (board `e6b71042`). |
+| G11 | done: KiPI engine, openpcbsi optimiser | `kipi_bridge.py`; `pdn.py pdn_impedance` | KiPI field-solves rail and ground per regulator and gives Z(f) at the load balls against V·ripple/ΔI up to `target_fmax_hz`. openpcbsi's own network (plane-pair cavity cells, track and via L, C-ESR-ESL capacitors) runs beside it for the cross-check and carries the greedy decoupling optimiser, which KiPI does not have. The report overlays both curves. KiPI AC is slow: about 19 min for the pilot's 4 regulators (tune `[kipi] ac_*`). |
 | G12 | partial | `pdn.py` | Resonances (peaks of Z at the load, place of the largest response) and Z21 from the source within one rail. Coupling between different nets (e.g. +12V switcher to the GTH supplies) needs a multi-net cavity model, not built. |
 | G13 | done | `thermal.py` | 2.5-D finite volumes, copper fraction per cell and layer, vias, convection both sides, I²R from G10. Tj = T_board + P θjb. Runs only when `[thermal.parts]` lists dissipations. |
 | G14 | rule-based | `emc.py` | Ranked radiators from G12 resonances near the edge, PC9 edge stitching, pair skew/uncoupled length, PC2 crossings. Rule of thumb for review. |
@@ -161,10 +161,10 @@ report records the converted copy (`downgraded`).
 | G19 | done | `evaluate.py` | Severities `info` / `pass` / `warn` / `fail`. Stable ID: check plus a hash of nets, references and position rounded to 0.1 mm. Value, limit, unit, nets, references, layer, position, reason, evidence (layer image, plot, KiCad report). Findings in exclusion areas are counted separately. "Best achievable" is filled only where a check computes one (none yet: it comes with PL1). |
 | G20 | done | `evaluate.py` | TOML waivers by finding ID, or by check with net / reference / area globs; reason and reviewer required. Waived findings stay in the report as waived; unused waivers are reported as stale. |
 | G21 | done, without `--claims` and `--em` | `__main__.py`, `evaluate.py` | `evaluate BOARD [-c] [--waivers] [--families] [--json]`, exit codes 0 / 1 / 2 / 3, `[evaluate] warnings_exit` for CI. The claims file (EV3) and region jobs (FS9) are not built, so their options are not offered. |
-| G22 | partial | `snapshot.py`, `evaluate.py` | KiCad 10 files read directly; newer files downgraded automatically and recorded in the report. The schematic is used for DRC parity when it sits next to the board; the project's `.kicad_pro` / `.kicad_dru` are used by KiCad's DRC, not yet by openlynx's own rules. |
-| G23 | partial | `docs/evaluation.md` | `evaluation.json` is versioned (`openlynx-evaluation/1`) and documented. Marker output is the board copy only; plain JSON marker shapes for a viewer are not built. |
+| G22 | partial | `snapshot.py`, `evaluate.py` | KiCad 10 files read directly; newer files downgraded automatically and recorded in the report. The schematic is used for DRC parity when it sits next to the board; the project's `.kicad_pro` / `.kicad_dru` are used by KiCad's DRC, not yet by openpcbsi's own rules. |
+| G23 | partial | `docs/evaluation.md` | `evaluation.json` is versioned (`openpcbsi-evaluation/1`) and documented. Marker output is the board copy only; plain JSON marker shapes for a viewer are not built. |
 | G24 | not started | | Library API on a snapshot, kipy adapter, incremental runs. |
-| G25 | done | `evaluate.py` | The evaluation records openlynx version, config hash, waiver hash, solver versions, KiPI pin and the KiCad DRC version. Caches are keyed by content hash. |
+| G25 | done | `evaluate.py` | The evaluation records openpcbsi version, config hash, waiver hash, solver versions, KiPI pin and the KiCad DRC version. Caches are keyed by content hash. |
 | PL1-PL10 | not started | | Placement family. Shown as `not built` in the scorecard. |
 | SD1 | done | `evaluate.py` | Drop as a share of the window from either engine: `fail` above 100 %, `warn` above `[evaluate] dc_warn_pct` (50 %); engines disagreeing by more than 20 % is a `warn`. |
 | SD2-SD9 | not started | | BGA supply entry, hot copper, current per via, shunt isolation, Kelvin sense, sense side, PDN target band, necks. |
@@ -177,7 +177,7 @@ report records the converted copy (`downgraded`).
 
 ## Limits to know
 
-- With KiPI (default for the pilot) the ground net is solved; openlynx's own G10/G11 solvers still
+- With KiPI (default for the pilot) the ground net is solved; openpcbsi's own G10/G11 solvers still
   assume ideal ground. The PDN sees the board up to the balls (no package, no die).
 - KiPI's input chain, regulators and ferrite DCRs come from the board config (`[kipi]`,
   `[kipi.input]`, `regulator =` per rail); the FET and fuse resistances there are estimates.
@@ -199,8 +199,8 @@ report records the converted copy (`downgraded`).
 ## Decisions open
 
 - KiPI is wrapped for G10/G11 (research use, licence not a concern); see `deps/README.md` for the
-  pin and the linkage. Still open: whether KiPI's electro-thermal mode should replace openlynx's G13,
+  pin and the linkage. Still open: whether KiPI's electro-thermal mode should replace openpcbsi's G13,
   and whether padne is worth adding as a second independent DC check.
-- Package location (REQUIREMENTS section 7): openlynx lives here as one package, run from this
+- Package location (REQUIREMENTS section 7): openpcbsi lives here as one package, run from this
   folder against any board path; board configs are in `boards/`. REQUIREMENTS still lists this as
   open.

@@ -36,12 +36,12 @@ def run_checks(board_path, cfg_path=None, checks=None, out_dir=None, label=None,
     label = label or f"{b.name}_{b.sha[:8]}"
     out_dir = out_dir or os.path.join(RUNS, label)
     os.makedirs(out_dir, exist_ok=True)
-    log(f"openlynx: {b.path}")
+    log(f"openpcbsi: {b.path}")
     log(f"  sha256 {b.sha[:16]}  {len(b.layers)} layers  {len(b.net_names) - 1} nets  "
         f"{len(b.tracks['x1'])} tracks  {len(b.vias['x'])} vias  {len(b.zones)} zone fills")
     _ensure_validation(log, ctx)
     report = {
-        "tool": "openlynx", "version": "0.1.0",
+        "tool": "openpcbsi", "version": "0.1.0",
         "date": datetime.datetime.now().isoformat(timespec="seconds"),
         "board": b.path, "board_sha256": b.sha, "label": label, "config": cfg.path or "detected from the board",
         "detected": getattr(cfg, "detected", None), "downgraded": b.snap.get("downgraded"),
@@ -65,14 +65,14 @@ def run_checks(board_path, cfg_path=None, checks=None, out_dir=None, label=None,
     if use_kipi_dc or use_kipi_pdn:
         from . import kipi_bridge
         if not kipi_bridge.available():
-            log("KiPI is not set up (deps/setup_kipi.sh); falling back to openlynx's own solvers")
+            log("KiPI is not set up (deps/setup_kipi.sh); falling back to openpcbsi's own solvers")
             use_kipi_dc = use_kipi_pdn = False
         else:
             mode = "+".join(m for m, on in (("dc", True), ("ac", use_kipi_pdn)) if on)
             try:
                 kres, ktree, krail_vrm, ksetup = kipi_bridge.run(ctx, mode, os.path.join(out_dir, "kipi"), CACHE, log=log)
             except Exception as e:
-                log(f"KiPI run failed: {e}; falling back to openlynx's own solvers")
+                log(f"KiPI run failed: {e}; falling back to openpcbsi's own solvers")
                 use_kipi_dc = use_kipi_pdn = False
     cross = eng.get("cross_check", False)
     if "dc" in checks and cfg["rails"]:
@@ -82,7 +82,7 @@ def run_checks(board_path, cfg_path=None, checks=None, out_dir=None, label=None,
         if not use_kipi_dc or cross:
             for name, rail in cfg["rails"].items():
                 r, _ = pdn.dc_drop(ctx, name, rail)
-                r["engine"] = "openlynx"
+                r["engine"] = "openpcbsi"
                 own.append(r)
         if use_kipi_dc:
             rows = kipi_bridge.dc_rows(ctx, kres, ktree)
@@ -97,16 +97,16 @@ def run_checks(board_path, cfg_path=None, checks=None, out_dir=None, label=None,
                 for r in rows:
                     o = ob.get(r["rail"], {})
                     a_, b2 = r.get("drop_from_source_mv"), o.get("drop_mv")
-                    xc.append({"rail": r["rail"], "kipi_mv": a_, "openlynx_mv": b2,
+                    xc.append({"rail": r["rail"], "kipi_mv": a_, "openpcbsi_mv": b2,
                                "diff_pct": round(100 * (b2 - a_) / a_, 1) if (a_ and b2 is not None) else None,
-                               "kipi_via_a": r.get("max_via_current_a"), "openlynx_via_a": o.get("max_via_current_a")})
+                               "kipi_via_a": r.get("max_via_current_a"), "openpcbsi_via_a": o.get("max_via_current_a")})
                 log("  cross-check, drop from the shunt (or the sense point) to the worst ball, supply side:")
                 for x in xc:
                     log(f"    {x['rail']:10s} KiPI {x['kipi_mv'] if x['kipi_mv'] is not None else float('nan'):7.2f} mV"
-                        f"   openlynx {x['openlynx_mv'] if x['openlynx_mv'] is not None else float('nan'):7.2f} mV"
+                        f"   openpcbsi {x['openpcbsi_mv'] if x['openpcbsi_mv'] is not None else float('nan'):7.2f} mV"
                         f"   diff {x['diff_pct'] if x['diff_pct'] is not None else float('nan'):+6.1f} %")
             report["checks"]["dc"] = {"spec": "G10", "engine": "kipi", "rails": rows, "cross_check": xc,
-                                      "openlynx_rails": own, "kipi_warnings": (kres.get("dc") or {}).get("warnings", []),
+                                      "openpcbsi_rails": own, "kipi_warnings": (kres.get("dc") or {}).get("warnings", []),
                                       "kipi_vrms": (kres.get("dc") or {}).get("vrms", []),
                                       "validation": "KiPI accuracy suite (upstream)"}
         else:
@@ -116,7 +116,7 @@ def run_checks(board_path, cfg_path=None, checks=None, out_dir=None, label=None,
                     f"{r.get('drop_pct_of_window', float('nan')):6.1f} % of +/-{rail.get('tol_pct', 3)} % window at {rail['current_a']} A"
                     f"  worst {r.get('worst_ball', '-')}  max via {r.get('max_via_current_a', 0):.2f} A"
                     + (f"  PROBLEM: {r['problems']}" if r["problems"] else ""))
-            report["checks"]["dc"] = {"spec": "G10", "engine": "openlynx", "rails": own, "validation": validate.status(CACHE, "dc")}
+            report["checks"]["dc"] = {"spec": "G10", "engine": "openpcbsi", "rails": own, "validation": validate.status(CACHE, "dc")}
     if "pdn" in checks and cfg["rails"]:
         from . import pdn
         log("G11/G12 PDN impedance" + (" (KiPI)" if use_kipi_pdn else "") + ", resonances, decoupling optimiser:")
@@ -126,7 +126,7 @@ def run_checks(board_path, cfg_path=None, checks=None, out_dir=None, label=None,
                 if "ripple_pct" not in rail:
                     continue
                 r = pdn.pdn_impedance(ctx, name, rail)
-                r["engine"] = "openlynx"
+                r["engine"] = "openpcbsi"
                 own.append(r)
         ob = {r["rail"]: r for r in own}
         if use_kipi_pdn:
@@ -134,14 +134,14 @@ def run_checks(board_path, cfg_path=None, checks=None, out_dir=None, label=None,
             for r in rows:
                 o = ob.get(r["rail"], {})
                 if o.get("optimiser"):
-                    r["optimiser"] = dict(o["optimiser"], engine="openlynx network")
+                    r["optimiser"] = dict(o["optimiser"], engine="openpcbsi network")
                 if o.get("resonances"):
-                    r["resonances_openlynx"] = o["resonances"]
+                    r["resonances_openpcbsi"] = o["resonances"]
                 log(f"  {r['rail']:10s} Zt {r.get('target_ohm', 0)*1000:7.2f} mOhm  KiPI max |Z| {r.get('max_Z_ohm', 0)*1000:8.2f} mOhm "
                     f"({r.get('max_ratio', 0):.2f} x) at {r.get('f_at_max_hz', 0)/1e6:6.1f} MHz, {r.get('caps')} caps, "
                     f"plane C {r.get('plane_capacitance_nf')} nF"
-                    + (f";  openlynx {o['max_Z_ohm']*1000:.2f} mOhm ({o['max_ratio']:.2f} x)" if o.get("max_Z_ohm") else ""))
-            report["checks"]["pdn"] = {"spec": "G11/G12", "engine": "kipi", "rails": rows, "openlynx_rails": own,
+                    + (f";  openpcbsi {o['max_Z_ohm']*1000:.2f} mOhm ({o['max_ratio']:.2f} x)" if o.get("max_Z_ohm") else ""))
+            report["checks"]["pdn"] = {"spec": "G11/G12", "engine": "kipi", "rails": rows, "openpcbsi_rails": own,
                                        "validation": "KiPI accuracy suite (upstream)"}
         else:
             for r in own:
@@ -150,7 +150,7 @@ def run_checks(board_path, cfg_path=None, checks=None, out_dir=None, label=None,
                     f"({r.get('max_ratio', 0):.2f} x) at {r.get('f_at_max_hz', 0)/1e6:6.1f} MHz;  optimiser: "
                     f"{'meets' if opt.get('met') else 'does not meet'} target with +{opt.get('add')}"
                     + (f", could drop {opt.get('removable')}" if opt.get("removable") else ""))
-            report["checks"]["pdn"] = {"spec": "G11/G12", "engine": "openlynx", "rails": own, "validation": validate.status(CACHE, "pdn")}
+            report["checks"]["pdn"] = {"spec": "G11/G12", "engine": "openpcbsi", "rails": own, "validation": validate.status(CACHE, "pdn")}
     if kres is not None:
         report["kipi"] = {"lock": kipi_bridge.lock(), "setup": ksetup, "seconds": kres.get("seconds"),
                           "errors": [e.splitlines()[0] for e in kres.get("errors", [])],

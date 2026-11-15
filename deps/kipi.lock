@@ -1,4 +1,4 @@
-# KiPI pin for openlynx. Change only together with a re-check of kipi_driver.py (it uses
+# KiPI pin for openpcbsi. Change only together with a re-check of kipi_driver.py (it uses
 # KiPI's internal API: solve_tree, solve_ac, KiCadFileSource, snapshot_io, PISetup).
 repo = "https://github.com/drewsum/KiPI.git"
 tag = "v1.0.1"

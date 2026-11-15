@@ -1,19 +1,19 @@
-"""openlynx command line.
+"""openpcbsi command line.
 
-  python3 -m openlynx evaluate BOARD [-c CONFIG] [--waivers FILE] [--families g1,rp,sd,si,th,emc,ev]
+  python3 -m openpcbsi evaluate BOARD [-c CONFIG] [--waivers FILE] [--families g1,rp,sd,si,th,emc,ev]
                                      [--checks ...] [--json OUT] [-o OUT] [--no-drc] [--no-markers]
                                      (G18/G21: scorecard and exit code 0 ok / 1 warn / 2 fail / 3 error)
-  python3 -m openlynx init    BOARD [-o boards/NAME.toml] [--force]   (EV5: draft a config from the board)
-  python3 -m openlynx check   BOARD [-c CONFIG] [--checks drc,impedance,...] [--rules ref_plane,...] [-o OUT]
-  python3 -m openlynx compare BOARD_A BOARD_B -c CONFIG [--checks ...]
-  python3 -m openlynx rediff  RUN_DIR_A RUN_DIR_B            (A/B from two finished runs)
-  python3 -m openlynx validate
-  python3 -m openlynx whatif  BOARD -c CONFIG SPEC.toml
-  python3 -m openlynx region  BOARD -c CONFIG REGION.toml       (G8, openEMS)
-  python3 -m openlynx snapshot BOARD
+  python3 -m openpcbsi init    BOARD [-o boards/NAME.toml] [--force]   (EV5: draft a config from the board)
+  python3 -m openpcbsi check   BOARD [-c CONFIG] [--checks drc,impedance,...] [--rules ref_plane,...] [-o OUT]
+  python3 -m openpcbsi compare BOARD_A BOARD_B -c CONFIG [--checks ...]
+  python3 -m openpcbsi rediff  RUN_DIR_A RUN_DIR_B            (A/B from two finished runs)
+  python3 -m openpcbsi validate
+  python3 -m openpcbsi whatif  BOARD -c CONFIG SPEC.toml
+  python3 -m openpcbsi region  BOARD -c CONFIG REGION.toml       (G8, openEMS)
+  python3 -m openpcbsi snapshot BOARD
 
 Checks: drc (G1), impedance (G6), dc (G10), pdn (G11/G12), crosstalk (G4), thermal (G13),
-vias (G9), si (G2/G3/G7), emc (G14). Outputs go to runs/<board>_<sha8>/ under the openlynx folder.
+vias (G9), si (G2/G3/G7), emc (G14). Outputs go to runs/<board>_<sha8>/ under the openpcbsi folder.
 Without -c, the config is detected from the board (detect.py) and the report says what was assumed.
 """
 import argparse
@@ -28,7 +28,7 @@ os.environ.setdefault("MPLCONFIGDIR", os.path.join(_root, "cache", "mpl"))
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="openlynx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="openpcbsi", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("evaluate", help="G18 design evaluation: every built check, KiCad DRC, scorecard, exit code")
     e.add_argument("board")
@@ -82,7 +82,7 @@ def main(argv=None):
         except Exception as ex:  # G21: 3 = could not evaluate
             import traceback
             traceback.print_exc()
-            print(f"openlynx evaluate: could not evaluate {a.board}: {ex}", file=sys.stderr)
+            print(f"openpcbsi evaluate: could not evaluate {a.board}: {ex}", file=sys.stderr)
             return 3
         return code
     if a.cmd == "init":

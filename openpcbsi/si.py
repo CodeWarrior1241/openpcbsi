@@ -315,7 +315,7 @@ def run(ctx, cache_dir, out_dir, log=print, vias=None):
         fn = safe_name(name)  # hierarchical KiCad nets: "/sheet/NET"
         row["files"] = f"nets/{fn}.sp, nets/{fn}.s2p"
         with open(os.path.join(sdir, f"{fn}.sp"), "w") as fh:
-            fh.write(f"* openlynx G2: {name}{' (differential, odd-mode equivalent)' if diff else ''} {path['from']} -> {path['to']}\n")
+            fh.write(f"* openpcbsi G2: {name}{' (differential, odd-mode equivalent)' if diff else ''} {path['from']} -> {path['to']}\n")
             fh.write(f".subckt {fn} n0 n{nn}\n" + "\n".join(spice) + "\n.ends\n")
         write_touchstone(os.path.join(sdir, f"{fn}.s2p"), f, S, z_ref)
     for r in rows[:6]:
@@ -360,7 +360,7 @@ def ctx_gap(ctx, net):
 
 def write_touchstone(path, f, S, z0):
     with open(path, "w") as fh:
-        fh.write(f"! openlynx G2\n# HZ S DB R {z0:g}\n")
+        fh.write(f"! openpcbsi G2\n# HZ S DB R {z0:g}\n")
         for i in range(0, len(f), 8):
             vals = []
             for k in ("S11", "S21", "S12", "S22"):

@@ -1,6 +1,6 @@
 """G8: region solver run manager (openEMS).
 
-  python3 -m openlynx region BOARD -c CONFIG REGION.toml
+  python3 -m openpcbsi region BOARD -c CONFIG REGION.toml
 
 REGION.toml:
   [region]

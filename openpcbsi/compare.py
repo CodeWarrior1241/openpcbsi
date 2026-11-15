@@ -164,8 +164,8 @@ def run_compare(board_a, board_b, cfg_path, cfg_b=None, checks=None, label=None,
 
 def write_html(out, od, charts):
     H = [f"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-         f"<title>openlynx A/B</title><style>{rep.CSS}</style></head><body>"]
-    H.append("<h1>openlynx A/B comparison</h1>")
+         f"<title>openpcbsi A/B</title><style>{rep.CSS}</style></head><body>"]
+    H.append("<h1>openpcbsi A/B comparison</h1>")
     H.append(f"<p class=muted>A: {html.escape(out['A']['board'])} ({out['A']['sha'][:12]})<br>"
              f"B: {html.escape(out['B']['board'])} ({out['B']['sha'][:12]})<br>config {html.escape(str(out['config']))} "
              f"({out['config_hash']}), identical for both runs</p>")

@@ -1,10 +1,10 @@
 """Design evaluation run (REQUIREMENTS 5.10-5.16): G18 scorecard, G19 finding model, G20 waivers,
 G21 exit codes, EV1 KiCad DRC in the run, SD1 DC drop judged.
 
-    python3 -m openlynx evaluate BOARD [-c CONFIG] [--waivers FILE] [--families g1,rp,sd,si,th,emc,ev]
+    python3 -m openpcbsi evaluate BOARD [-c CONFIG] [--waivers FILE] [--families g1,rp,sd,si,th,emc,ev]
                                        [--checks ...] [--json OUT] [-o OUT_DIR] [--no-markers]
 
-Writes <run>/evaluation.json (schema `openlynx-evaluation/1`, docs/evaluation.md) and
+Writes <run>/evaluation.json (schema `openpcbsi-evaluation/1`, docs/evaluation.md) and
 <run>/evaluation.html next to the usual report.json / report.html / marker board.
 
 Exit codes: 0 nothing fails or warns; 1 warnings only (0 if `[evaluate] warnings_exit = false`);
@@ -24,7 +24,7 @@ import re
 import subprocess
 import tomllib
 
-SCHEMA = "openlynx-evaluation/1"
+SCHEMA = "openpcbsi-evaluation/1"
 SEV = {"error": "fail", "warning": "warn", "info": "info", "fail": "fail", "warn": "warn", "pass": "pass"}
 ORDER = {"fail": 5, "warn": 4, "unvalidated": 3, "assumed inputs": 2, "not run": 1, "not built": 1, "pass": 0}
 FAMILY_ORDER = ["G1", "RP", "SD", "SI", "TH", "EMC", "EV", "PL", "FS"]
@@ -120,8 +120,8 @@ def judge_dc(rep, cfg):
                       limit=100.0, unit="% of window", evidence="report.html#dc", extra="drop"))
     for x in d.get("cross_check", []):
         if x.get("diff_pct") is not None and abs(x["diff_pct"]) > dis:
-            out.append(_f("dc", "SD", "SD1", "warn", f"{x['rail']}: KiPI {x['kipi_mv']:.2f} mV and openlynx "
-                          f"{x['openlynx_mv']:.2f} mV differ by {x['diff_pct']:+.1f} % (> {dis:g} %)",
+            out.append(_f("dc", "SD", "SD1", "warn", f"{x['rail']}: KiPI {x['kipi_mv']:.2f} mV and openpcbsi "
+                          f"{x['openpcbsi_mv']:.2f} mV differ by {x['diff_pct']:+.1f} % (> {dis:g} %)",
                           [cfg['rails'].get(x['rail'], {}).get('net')], value=x["diff_pct"], limit=dis, unit="%",
                           evidence="report.html#dc", extra="engines"))
     return out, d.get("validation")
@@ -378,7 +378,7 @@ def run(board, cfg_path=None, waivers=None, families=None, checks=None, out_dir=
     per, famcard = scorecard(findings, val, skipped, assumed)
     code = exit_code(findings, cfg)
     ev = {
-        "schema": SCHEMA, "tool": "openlynx", "version": rep.get("version"),
+        "schema": SCHEMA, "tool": "openpcbsi", "version": rep.get("version"),
         "date": datetime.datetime.now().isoformat(timespec="seconds"),
         "board": rep["board"], "board_sha256": rep["board_sha256"], "downgraded": rep.get("downgraded"),
         "config": rep["config"], "config_hash": rep["config_hash"], "detected": rep.get("detected"),
@@ -429,8 +429,8 @@ def write_html(ev, path):
     e = html.escape
     st = lambda s: f'<span class="{s.replace(" ", "")}">{e(s)}</span>'
     H = [f"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-         f"<title>openlynx evaluation</title><style>{CSS}</style></head><body>"]
-    H.append(f"<h1>openlynx evaluation: {e(os.path.basename(ev['board']))}</h1>")
+         f"<title>openpcbsi evaluation</title><style>{CSS}</style></head><body>"]
+    H.append(f"<h1>openpcbsi evaluation: {e(os.path.basename(ev['board']))}</h1>")
     H.append(f"<p class=mut>{e(ev['board'])}<br>sha256 {e(ev['board_sha256'][:16])} · config {e(str(ev['config']))} "
              f"(hash {e(ev['config_hash'])}) · {e(ev['date'])} · exit code {ev['exit_code']} · "
              f"<a href='report.html'>full report</a></p>")

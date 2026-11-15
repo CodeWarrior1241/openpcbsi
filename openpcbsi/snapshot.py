@@ -1,4 +1,4 @@
-"""Board snapshot: everything openlynx needs from a KiCad 10 board, read once through pcbnew.
+"""Board snapshot: everything openpcbsi needs from a KiCad 10 board, read once through pcbnew.
 
 The snapshot is plain JSON (gzip), cached by the SHA-256 of the board file, so that every later
 step (and the openEMS venv, which has no pcbnew) works from the same frozen data. Units: mm,
@@ -261,7 +261,7 @@ def maybe_downgrade(board_path, workdir):
     os.makedirs(workdir, exist_ok=True)
     out = os.path.join(workdir, "downgraded_" + os.path.basename(board_path))
     subprocess.run(["kicad-cli", "pcb", "downgrade", "--target", "10.0", "-o", out, board_path], check=True)
-    print(f"openlynx: board version {ver} downgraded to KiCad 10 -> {out}", file=sys.stderr)
+    print(f"openpcbsi: board version {ver} downgraded to KiCad 10 -> {out}", file=sys.stderr)
     return out
 
 

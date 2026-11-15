@@ -1,4 +1,4 @@
-# openlynx configuration for the AU7P FMC pilot board
+# openpcbsi configuration for the AU7P FMC pilot board
 # (Work/Sandbox/Minimalist_AU7P_Board, REQUIREMENTS.md sections 3, 4 and 7).
 # Limits are the proposals of the pilot's section 7; they are to be fixed at review.
 
@@ -217,7 +217,7 @@ current_a = 0.03
 source = "R41"
 loads = ["U1"]
 
-# --- engines: G10 and G11 run in KiPI (deps/, pinned in deps/kipi.lock); openlynx's own
+# --- engines: G10 and G11 run in KiPI (deps/, pinned in deps/kipi.lock); openpcbsi's own
 # solver runs beside it as a cross-check when cross_check = true
 [engines]
 dc = "kipi"

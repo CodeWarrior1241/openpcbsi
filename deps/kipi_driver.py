@@ -1,13 +1,13 @@
-"""openlynx -> KiPI driver. Runs inside KiPI's own environment, never in openlynx's:
+"""openpcbsi -> KiPI driver. Runs inside KiPI's own environment, never in openpcbsi's:
 
     deps/kipi-venv/bin/python -I deps/kipi_driver.py JOB.json
 
-JOB.json (written by openlynx/kipi_bridge.py):
+JOB.json (written by openpcbsi/kipi_bridge.py):
     {"board": ".../board.kicad_pcb", "board_sha256": "...", "setup": ".../x.kipi-setup.json",
      "mode": "dc" | "ac" | "dc+ac", "ac_rails": ["U11", ...], "ground": "GND",
      "cache_dir": ".../cache/kipi", "out": ".../kipi_result.json"}
 
-Writes plain JSON (numbers, lists, strings only) so openlynx never imports KiPI. KiPI is
+Writes plain JSON (numbers, lists, strings only) so openpcbsi never imports KiPI. KiPI is
 pinned in kipi.lock; its headless entry points (solve_tree, solve_ac) are internal API, so a
 version change must be re-checked against this file.
 """

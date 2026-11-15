@@ -1,17 +1,17 @@
 """KiPI as the G10 (DC drop) and G11/G12 (PDN impedance) engine.
 
 KiPI lives in deps/ (pinned in deps/kipi.lock, set up by deps/setup_kipi.sh) and runs in its own
-environment; openlynx never imports it. This module:
+environment; openpcbsi never imports it. This module:
 
-  1. derives KiPI's power tree from the openlynx rail config and the board: each rail's shunt
+  1. derives KiPI's power tree from the openpcbsi rail config and the board: each rail's shunt
      (`source`) is a series link, and the walk continues upstream through low-value series parts
      (resistors <= 1 ohm, ferrites, inductors) to the regulator that drives the net (`regulator`
      in the rail, or the U part with the most pad area on that net),
   2. writes the setup as JSON (KiPI reads JSON setups), plus a job file,
   3. runs deps/kipi_driver.py with deps/kipi-venv/bin/python, and
-  4. turns KiPI's results into openlynx's dc / pdn rows (same keys as pdn.py, plus KiPI's own).
+  4. turns KiPI's results into openpcbsi's dc / pdn rows (same keys as pdn.py, plus KiPI's own).
 
-Differences from openlynx's own solver, by design: KiPI solves the ground net as well (loads and
+Differences from openpcbsi's own solver, by design: KiPI solves the ground net as well (loads and
 regulators have ground pins), and its meshes are FEM triangles rather than raster cells.
 """
 import json
@@ -367,13 +367,13 @@ def _vrm_for(tree, net):
 
 
 # ----------------------------------------------------------------------------------------------
-# results -> openlynx rows
+# results -> openpcbsi rows
 
 def dc_rows(ctx, res, tree=None):
     """G10 rows from KiPI. drop_mv: regulator target to the worst ball, supply minus ground (what
     the part sees: shunts, shared upstream copper and the ground return included).
     drop_from_source_mv: from the rail's own shunt (local sense) or the target (remote sense) to the
-    worst ball, supply side only, the same definition as openlynx's own solver (the cross-check)."""
+    worst ball, supply side only, the same definition as openpcbsi's own solver (the cross-check)."""
     rows = []
     if not res.get("dc"):
         return rows

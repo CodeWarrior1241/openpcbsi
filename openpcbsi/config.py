@@ -1,7 +1,7 @@
 """Per-board configuration (TOML). Every key has a default (DEFAULTS below).
 
 A run without a config file does not use DEFAULTS alone: run.load() detects classes, fields and
-rails from the board (detect.py, EV5) and `python3 -m openlynx init BOARD` writes that detection out
+rails from the board (detect.py, EV5) and `python3 -m openpcbsi init BOARD` writes that detection out
 as a starting config. boards/au7p-fmc.toml is the reviewed, commented example.
 """
 import copy

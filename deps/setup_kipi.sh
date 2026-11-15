@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# (Re)create openlynx's KiPI dependency in this folder, idempotently.
+# (Re)create openpcbsi's KiPI dependency in this folder, idempotently.
 #   ./setup_kipi.sh            clone (if missing) at the pinned commit, build the venv, smoke test
 #   ./setup_kipi.sh --check    only verify the pin and the venv
 # Everything stays in this folder: the clone, the venv, pip's cache and its temp files

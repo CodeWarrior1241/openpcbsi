@@ -158,7 +158,7 @@ def marker_board(report, board_path, out_dir, layer="User.9"):
         t.SetHorizJustify(pcbnew.GR_TEXT_H_ALIGN_LEFT)
         b.Add(t)
         n += 1
-    name = os.path.splitext(os.path.basename(board_path))[0] + "_openlynx.kicad_pcb"
+    name = os.path.splitext(os.path.basename(board_path))[0] + "_openpcbsi.kicad_pcb"
     out = os.path.join(out_dir, name)
     pcbnew.SaveBoard(out, b)
     return os.path.basename(out), n
@@ -211,8 +211,8 @@ def sev_label(sev):
 def write_html(report, out_dir, images, zcharts):
     c = report["checks"]
     H = [f"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-         f"<title>openlynx report</title><style>{CSS}</style></head><body>"]
-    H.append(f"<h1>openlynx: {html.escape(os.path.basename(report['board']))}</h1>")
+         f"<title>openpcbsi report</title><style>{CSS}</style></head><body>"]
+    H.append(f"<h1>openpcbsi: {html.escape(os.path.basename(report['board']))}</h1>")
     H.append(f"<p class=muted>{html.escape(report['board'])}<br>sha256 {report['board_sha256'][:16]} · {report['date']} · "
              f"KiCad {html.escape(str(report.get('kicad')))} · config {html.escape(str(report.get('config')))} "
              f"({report['config_hash']}) · {report['seconds']} s</p>")
@@ -261,7 +261,7 @@ def write_html(report, out_dir, images, zcharts):
                     num=("w", "gap", "length_mm", "Z0", "Zdiff", "Zcm", "eeff", "delay_ps_mm", "target", "delta_target")))
     if c.get("dc"):
         r = c["dc"]
-        H.append(f"<h2>G10 DC drop <span class=chip>engine: {r.get('engine', 'openlynx')}</span> <span class=chip>{r['validation']}</span></h2>")
+        H.append(f"<h2>G10 DC drop <span class=chip>engine: {r.get('engine', 'openpcbsi')}</span> <span class=chip>{r['validation']}</span></h2>")
         if r.get("engine") == "kipi":
             H.append("<p class=muted>KiPI (deps/, pinned). drop_mv: regulator target to the worst ball, supply minus ground: "
                      "shunts, shared upstream copper and the ground return included. drop_from_source_mv: from the rail's "
@@ -271,9 +271,9 @@ def write_html(report, out_dir, images, zcharts):
                         num=("current_a", "v_nom", "drop_mv", "drop_pct_of_window", "drop_from_source_mv", "v_ground_mv",
                              "max_via_current_a", "max_J_A_mm2", "loss_w")))
             if r.get("cross_check"):
-                H.append("<h3>Cross-check: KiPI against openlynx's own solver (same definition: from the shunt or sense point, supply side)</h3>")
-                H.append(_t(r["cross_check"], ["rail", "kipi_mv", "openlynx_mv", "diff_pct", "kipi_via_a", "openlynx_via_a"],
-                            num=("kipi_mv", "openlynx_mv", "diff_pct", "kipi_via_a", "openlynx_via_a")))
+                H.append("<h3>Cross-check: KiPI against openpcbsi's own solver (same definition: from the shunt or sense point, supply side)</h3>")
+                H.append(_t(r["cross_check"], ["rail", "kipi_mv", "openpcbsi_mv", "diff_pct", "kipi_via_a", "openpcbsi_via_a"],
+                            num=("kipi_mv", "openpcbsi_mv", "diff_pct", "kipi_via_a", "openpcbsi_via_a")))
         else:
             H.append("<p class=muted>Supply net only (ground ideal). Currents from the config (estimates unless stated).</p>")
             H.append(_t(r["rails"], ["rail", "net", "regulation", "current_a", "v_nom", "drop_mv", "drop_pct_of_window",
@@ -281,10 +281,10 @@ def write_html(report, out_dir, images, zcharts):
                         num=("current_a", "v_nom", "drop_mv", "drop_pct_of_window", "max_via_current_a", "max_track_J_A_mm2", "max_track_dT_C")))
     if c.get("pdn"):
         r = c["pdn"]
-        H.append(f"<h2>G11/G12 PDN impedance <span class=chip>engine: {r.get('engine', 'openlynx')}</span> <span class=chip>{r['validation']}</span></h2>")
+        H.append(f"<h2>G11/G12 PDN impedance <span class=chip>engine: {r.get('engine', 'openpcbsi')}</span> <span class=chip>{r['validation']}</span></h2>")
         if r.get("engine") == "kipi":
-            H.append("<p class=muted>|Z| from KiPI's field solve of rail and ground. The decoupling optimiser runs on openlynx's own "
-                     "network. The charts overlay KiPI (A) and openlynx (B).</p>")
+            H.append("<p class=muted>|Z| from KiPI's field solve of rail and ground. The decoupling optimiser runs on openpcbsi's own "
+                     "network. The charts overlay KiPI (A) and openpcbsi (B).</p>")
         rows = [dict(x, add=(x.get("optimiser") or {}).get("add"), met=(x.get("optimiser") or {}).get("met"),
                      removable=(x.get("optimiser") or {}).get("removable"),
                      resonances_mhz=[round(q["f_hz"] / 1e6, 1) for q in x.get("resonances", [])]) for x in r["rails"]]
@@ -324,11 +324,11 @@ def write_all(report, ctx_tuple, out_dir, markers=True, log=print):
     images = layer_images(report, b, ctx, out_dir)
     zc = {}
     pchk = report["checks"].get("pdn", {})
-    own = {r["rail"]: r for r in pchk.get("openlynx_rails", [])}
+    own = {r["rail"]: r for r in pchk.get("openpcbsi_rails", [])}
     for r in pchk.get("rails", []):
         if r.get("Z_ohm"):
             o = own.get(r["rail"]) if pchk.get("engine") == "kipi" else None
-            zc[r["rail"]] = z_chart(r, out_dir, o if (o and o.get("Z_ohm")) else None, ("KiPI", "openlynx"))
+            zc[r["rail"]] = z_chart(r, out_dir, o if (o and o.get("Z_ohm")) else None, ("KiPI", "openpcbsi"))
     if markers:
         try:
             name, n = marker_board(report, b.path, out_dir)

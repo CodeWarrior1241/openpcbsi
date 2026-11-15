@@ -404,7 +404,7 @@ def detect(snap, suffixes=None):
     regs = sorted(r for r in B.fps if is_regulator(B, r, set(gnd)))
     if regs:
         cfg["rules"]["thermal_vias"] = {"parts": regs}
-    cfg["engines"] = {"dc": "openlynx", "pdn": "openlynx", "cross_check": False}
+    cfg["engines"] = {"dc": "openpcbsi", "pdn": "openpcbsi", "cross_check": False}
     for k, v in rl.items():
         notes["assumptions"].append(f"rail {k}: {v['v']:g} V +/-{v['tol_pct']:g} % from {v['source_kind']} {v['source']} "
                                     f"to {', '.join(v['loads'])}, current assumed {DEFAULT_CURRENT_A} A")
@@ -451,7 +451,7 @@ def _tk(k):
 
 def to_toml(cfg, notes, board_path):
     """The detected config as a TOML file to review: every assumption is commented."""
-    L = [f"# openlynx board config drafted by `python3 -m openlynx init` from",
+    L = [f"# openpcbsi board config drafted by `python3 -m openpcbsi init` from",
          f"#   {board_path}",
          "# Everything below was detected from the board (detect.py). Review it before trusting a",
          "# result: edge rates, rail currents, tolerances and ripple targets are not on the board.",
@@ -488,8 +488,8 @@ def to_toml(cfg, notes, board_path):
         L.append("# ripple_pct = 3.0   # PDN target: V * ripple_pct / step_a")
         L.append("# step_a = 0.5")
         L.append("")
-    L += ["[engines]", 'dc = "openlynx"     # "kipi" needs [kipi] and [kipi.input] (see boards/au7p-fmc.toml)',
-          'pdn = "openlynx"', "cross_check = false", "",
+    L += ["[engines]", 'dc = "openpcbsi"     # "kipi" needs [kipi] and [kipi.input] (see boards/au7p-fmc.toml)',
+          'pdn = "openpcbsi"', "cross_check = false", "",
           "[crosstalk]", f"classes = {_tv(cfg['crosstalk']['classes'])}", "",
           "[evaluate]", "warnings_exit = true      # exit code 1 when there are warnings and no fails",
           'drc_warning = "warn"      # KiCad DRC warnings as "warn" or "fail"', "dc_warn_pct = 50.0", ""]

@@ -17,7 +17,7 @@ def run(ctx, report, log=print):
     edge_gap = (chk.get("stitching", {}).get("metrics", {}).get("_board_edge", {}) or {}).get("max_edge_gap_mm")
     x0, y0, x1, y1 = b.bbox
     for r in report["checks"].get("pdn", {}).get("rails", []):
-        for res in r.get("resonances_openlynx", []) or r.get("resonances", []):
+        for res in r.get("resonances_openpcbsi", []) or r.get("resonances", []):
             if res.get("x") is None:
                 continue
             if res["f_hz"] < 50e6:      # regulator / bulk-capacitor anti-resonances do not radiate

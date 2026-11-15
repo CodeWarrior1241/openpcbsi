@@ -1,6 +1,6 @@
 # Design evaluation: files and schema
 
-`python3 -m openlynx evaluate` (REQUIREMENTS G18 to G21) writes `evaluation.json` and
+`python3 -m openpcbsi evaluate` (REQUIREMENTS G18 to G21) writes `evaluation.json` and
 `evaluation.html` into the run directory, beside `report.json`. This page describes the JSON, the
 waiver file and the exit codes. The schema is versioned: a change that removes or renames a field
 raises the version in `schema`.
@@ -16,11 +16,11 @@ raises the version in `schema`.
 
 Findings inside exclusion areas, waived findings and `unvalidated` checks do not change the code.
 
-## `evaluation.json`, schema `openlynx-evaluation/1`
+## `evaluation.json`, schema `openpcbsi-evaluation/1`
 
 | Field | Content |
 |-------|---------|
-| `schema`, `tool`, `version`, `date` | Schema id, `openlynx`, openlynx version, ISO time of the run. |
+| `schema`, `tool`, `version`, `date` | Schema id, `openpcbsi`, openpcbsi version, ISO time of the run. |
 | `board`, `board_sha256`, `downgraded` | Board path and hash; path of the KiCad 10 copy if the board was downgraded, else null. |
 | `config`, `config_hash` | Config file, or `"detected from the board"`; hash of the effective config. |
 | `detected` | Without a config: `assumptions` and `left_out` (lists of sentences), `fields`, `reference_nets`. Else null. |
@@ -87,7 +87,7 @@ reported as `invalid` and not applied. A waiver that matches nothing in the run 
 warnings_exit = true          # exit code 1 for warnings only
 drc_warning = "warn"          # KiCad DRC warnings as "warn" or "fail" (EV1 literally: "fail")
 dc_warn_pct = 50.0            # SD1: warn above this share of the window
-engine_disagree_pct = 20.0    # SD1: KiPI and openlynx differing by more is a warn
+engine_disagree_pct = 20.0    # SD1: KiPI and openpcbsi differing by more is a warn
 drc_timeout_s = 900
 
 [rules.pad_plane]
