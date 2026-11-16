@@ -110,7 +110,12 @@ def _partner(net, names, suffixes):
 
 
 def ground_nets(B):
-    g = [n for n in B.snap["nets"] if GND_RE.match(n) and len(B.pads_by_net.get(n, [])) >= 2]
+    vias = defaultdict(int)
+    for v in B.snap["vias"]:
+        vias[v["net"]] += 1
+    # a ground net may be zones and vias only (no pads): count every kind of copper
+    g = [n for n in B.snap["nets"] if GND_RE.match(n)
+         and len(B.pads_by_net.get(n, [])) + 2 * B.zone_nets.get(n, 0) + vias[n] >= 2]
     return sorted(g, key=lambda n: (-B.zone_nets.get(n, 0), -len(B.pads_by_net.get(n, []))))
 
 
@@ -123,6 +128,9 @@ def is_power(B, n, gnd):
     if CONTROL_RE.search(base) or base.upper().startswith("VREF"):
         return False
     return bool(POWER_RE.match(n)) and len(B.pads_by_net.get(n, [])) >= 2
+
+
+TIER = {}          # class -> edge-rate tier ("serdes" or "diff") of the nets in it
 
 
 def pair_classes(B, suffixes, gnd, power):
@@ -139,12 +147,14 @@ def pair_classes(B, suffixes, gnd, power):
         seen |= {n, q}
         nc = B.netclass.get(n, "Default")
         zm = re.search(r"(\d+(?:\.\d+)?)\s*(?:ohm|r|Ω)", nc, re.I)
-        if SERDES_RE.search(n.split("/")[-1]) or SERDES_RE.search(n):
+        serdes = bool(SERDES_RE.search(n.split("/")[-1]) or SERDES_RE.search(n))
+        if nc not in ("Default", "") and nc.upper() not in ("POWER", "PWR"):
+            cname = re.sub(r"\W+", "_", nc)            # the designer's own netclass comes first (#2)
+        elif serdes:
             cname = "serdes" + (f"_{zm.group(1)}ohm" if zm else "")
-        elif nc not in ("Default", "") and nc.upper() not in ("POWER", "PWR"):
-            cname = re.sub(r"\W+", "_", nc)
         else:
             cname = "diff"
+        TIER[cname] = "serdes" if (serdes or TIER.get(cname) == "serdes") else "diff"
         classes[cname] += [n, q]
         if zm:
             zdiff.setdefault(cname, float(zm.group(1)))
@@ -337,9 +347,33 @@ def rails(B, power, gnd):
         key = re.sub(r"\W+", "_", net.split("/")[-1]).strip("_") or net
         out[key] = {"net": net, "v": v, "tol_pct": 3.0 if v <= 1.2 else 5.0, "current_a": DEFAULT_CURRENT_A,
                     "current_assumed": True, "source": src, "source_kind": kind, "loads": loads}
+        # #4: currents from the loads' footprint fields (Current = 1.5A / 1500mA) are sourced, not assumed
+        cur, srcs = 0.0, []
+        for ref in loads:
+            fv = B.fps.get(ref, {}).get("fields", {})
+            for k in CURRENT_FIELDS:
+                if k in fv and current_value(fv[k]) is not None:
+                    cur += current_value(fv[k])
+                    srcs.append(f"{ref}.{k}")
+                    break
+        if srcs:
+            out[key].update(current_a=round(cur, 6), current_assumed=False, current_source=", ".join(srcs))
         if voltage_from_name(net) is None:
             out[key]["v_from"] = "supply side of " + src
     return out, left
+
+
+CURRENT_FIELDS = ("Current", "current", "I", "Iload", "I_load", "Current_A", "Imax")
+
+
+def current_value(s):
+    """'1.5A', '1500mA', '1.5', '2 A' -> amperes; None if not a current."""
+    m = re.fullmatch(r"\s*([\d.]+)\s*(mA|uA|A)?\s*", str(s), re.I)
+    if not m:
+        return None
+    v = float(m.group(1))
+    u = (m.group(2) or "A").lower()
+    return v * {"a": 1.0, "ma": 1e-3, "ua": 1e-6}[u]
 
 
 def _loads(B, net, src, edges, parent):
@@ -363,16 +397,23 @@ def detect(snap, suffixes=None):
     from .config import DEFAULTS
     suffixes = suffixes or DEFAULTS["pairs"]["suffixes"]
     B = _Board(snap)
+    TIER.clear()
     gnd = ground_nets(B)
     power = {n for n in B.snap["nets"] if is_power(B, n, gnd)}
     classes, zdiff, pair_nets = pair_classes(B, suffixes, gnd, power)
     cfg = {"board": {"reference_nets": gnd[:3] or ["GND"]}, "classes": {}, "rules": {}, "rails": {}, "areas": {}}
     notes = {"detected": True, "assumptions": [], "left_out": []}
     for cname, nets in sorted(classes.items()):
-        d = dict(CLASS_DEFAULTS["serdes" if cname.startswith("serdes") else cname if cname in CLASS_DEFAULTS else "diff"])
+        d = dict(CLASS_DEFAULTS["serdes" if TIER.get(cname) == "serdes" or cname.startswith("serdes") else
+                               cname if cname in CLASS_DEFAULTS else "diff"])
         note = d.pop("note")
         if cname in zdiff:
             d["z_diff"] = zdiff[cname]
+        from . import standards
+        std = standards.of_net(nets[0])
+        if std and cname not in zdiff:         # #6: the interface standard of the class's nets
+            d.update({k: std[1][k] for k in ("z_diff", "z_tol", "rise_ps", "nyquist_ghz")})
+            note = f"standard {std[0]}: {std[1]['source']}"
         d["patterns"] = sorted(_glob_escape(n) for n in nets)
         cfg["classes"][cname] = d
         notes["assumptions"].append(f"class {cname}: {len(nets) // 2} pairs, rise {d['rise_ps']:g} ps, "
@@ -391,7 +432,7 @@ def detect(snap, suffixes=None):
     for rule in ("ref_plane", "split_crossing", "return_via", "via_stub", "edge_distance", "pair_coupling",
                  "parallel", "pad_plane", "stubs"):
         cfg["rules"][rule] = {"classes": sig if rule in ("ref_plane", "split_crossing", "return_via", "stubs") else fast}
-    cfg["rules"]["stitching"] = {"classes": [c for c in fast if c.startswith("serdes")] or fast}
+    cfg["rules"]["stitching"] = {"classes": [c for c in fast if TIER.get(c) == "serdes" or c.startswith("serdes")] or fast}
     cfg["crosstalk"] = {"classes": sig}
     ar = fields(B, pair_nets)
     cfg["areas"] = {k: {"footprints": v["footprints"], "margin": v["margin"]} for k, v in ar.items()}
@@ -406,8 +447,10 @@ def detect(snap, suffixes=None):
         cfg["rules"]["thermal_vias"] = {"parts": regs}
     cfg["engines"] = {"dc": "openpcbsi", "pdn": "openpcbsi", "cross_check": False}
     for k, v in rl.items():
+        cur = (f"current {v['current_a']:g} A from {v['current_source']}" if not v["current_assumed"]
+               else f"current assumed {DEFAULT_CURRENT_A} A")
         notes["assumptions"].append(f"rail {k}: {v['v']:g} V +/-{v['tol_pct']:g} % from {v['source_kind']} {v['source']} "
-                                    f"to {', '.join(v['loads'])}, current assumed {DEFAULT_CURRENT_A} A")
+                                    f"to {', '.join(v['loads'])}, {cur}")
     for e in no_v:
         why = e.get("skip") or "no voltage in the net name"
         notes["left_out"].append(f"power net {e['net']}: {why} (source {e['source'] or '-'}, loads {', '.join(e['loads']) or '-'})")

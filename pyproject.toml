@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openpcbsi"
+version = "0.2.0"
+description = "Signal- and power-integrity evaluation of KiCad 10 boards"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+# pcbnew comes with KiCad 10 (its system python3); numpy, scipy and matplotlib are KiCad's as well
+dependencies = ["numpy", "scipy", "matplotlib"]
+
+[project.scripts]
+openpcbsi = "openpcbsi.__main__:main"
+
+[tool.setuptools]
+packages = ["openpcbsi"]

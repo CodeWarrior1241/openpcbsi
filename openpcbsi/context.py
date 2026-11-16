@@ -112,6 +112,20 @@ class Context:
     def net_class(self, net):
         return self.cfg.class_of(net)
 
+    def limit(self, rule, param, net):
+        """(value, source): a .kicad_dru constraint covering the net, else the config's rule parameter."""
+        proj = getattr(self.cfg, "project", None)
+        if proj is not None:
+            hit = proj.limit(rule, param, net, self.b.kicad_class.get(net))
+            if hit:
+                return hit
+        if not self.cfg.path:                  # no reviewed config: the interface standard's figure (#6)
+            from . import standards
+            hit = standards.limit(rule, param, net)
+            if hit:
+                return hit
+        return self.cfg["rules"][rule][param], f"[rules.{rule}] {param}"
+
     def cparam(self, net, key, default=None):
         c = self.cfg.class_of(net)
         return self.cfg.class_param(c, key, default) if c else default

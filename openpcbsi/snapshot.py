@@ -16,7 +16,8 @@ import shutil
 import subprocess
 import sys
 
-SNAPSHOT_VERSION = 3
+SNAPSHOT_VERSION = 6   # 4: zones refilled in memory, every footprint field, pin types, file version; 5: back-drill;
+                       # 6: DNP also from a "DNP" field (KiCad 6 designs mark it that way)
 NM = 1e-6  # nm -> mm
 
 
@@ -103,6 +104,13 @@ def extract(board_path):
     with open(board_path, encoding="utf-8") as f:
         text = f.read()
     b = pcbnew.LoadBoard(board_path)
+    # #3: the fills saved in the file may be stale (or missing) after an edit; refill in memory, as
+    # KiCad's DRC does with --refill-zones. The file itself is never written.
+    refilled = False
+    if os.environ.get("OPENPCBSI_NO_REFILL") != "1":
+        zones = [z for z in b.Zones() if not z.GetIsRuleArea()]
+        if zones:
+            refilled = bool(pcbnew.ZONE_FILLER(b).Fill(b.Zones())) or True
     cu_ids = list(b.GetEnabledLayers().CuStack())
     cu_names = [pcbnew.LayerName(l) for l in cu_ids]
     lid2name = dict(zip(cu_ids, cu_names))
@@ -115,6 +123,7 @@ def extract(board_path):
         "copper_layers": cu_names,
         "stackup": parse_stackup(text),
         "board_thickness": b.GetDesignSettings().GetBoardThickness() * NM,
+        "zones_refilled": refilled,
     }
 
     ps = pcbnew.SHAPE_POLY_SET()
@@ -141,6 +150,7 @@ def extract(board_path):
                 "x": t.GetPosition().x * NM, "y": t.GetPosition().y * NM,
                 "d": t.GetWidth(cu_ids[0]) * NM, "drill": t.GetDrillValue() * NM,
                 "net": net, "span": span, "flashed": flashed, "type": int(t.GetViaType()),
+                "backdrill": _backdrill(pcbnew, t, lid2name),
             })
         elif ty == pcbnew.PCB_ARC_T:
             # approximate arcs by chords of at most 10 degrees
@@ -177,9 +187,10 @@ def extract(board_path):
     for f in b.GetFootprints():
         ref = f.GetReference()
         fields = {}
-        for k in ("MPN", "Manufacturer", "LCSC"):
-            if f.HasField(k):
-                fields[k] = f.GetFieldText(k)
+        for fld in f.GetFields():           # every user field: design data lives here (#4)
+            k, v = fld.GetName(), fld.GetText()
+            if k not in ("Reference", "Value", "Footprint") and v:
+                fields[k] = v
         crt = []
         for side in (pcbnew.F_CrtYd, pcbnew.B_CrtYd):
             try:
@@ -192,7 +203,7 @@ def extract(board_path):
             "ref": ref, "value": f.GetValue(), "fpid": f.GetFPIDAsString(),
             "x": f.GetPosition().x * NM, "y": f.GetPosition().y * NM,
             "rot": f.GetOrientationDegrees(), "side": "B" if f.IsFlipped() else "F",
-            "dnp": bool(f.IsDNP()), "fields": fields, "courtyard": crt,
+            "dnp": bool(f.IsDNP()) or _dnp_field(fields), "fields": fields, "courtyard": crt,
             "bbox": [bb.GetX() * NM, bb.GetY() * NM, bb.GetRight() * NM, bb.GetBottom() * NM],
         })
         for p in f.Pads():
@@ -213,11 +224,38 @@ def extract(board_path):
                 "x": p.GetPosition().x * NM, "y": p.GetPosition().y * NM,
                 "sx": sz.x * NM, "sy": sz.y * NM, "rot": p.GetOrientationDegrees(),
                 "drill": p.GetDrillSize().x * NM if kind in ("pth", "npth") else 0.0,
-                "layers": layers, "poly": polys, "pinfunc": p.GetPinFunction(),
+                "layers": layers, "poly": polys, "pinfunc": p.GetPinFunction(), "pintype": p.GetPinType(),
             })
     snap["footprints"] = fps
     snap["pads"] = pads
     return snap
+
+
+def _dnp_field(fields):
+    """A 'DNP' / 'Do not populate' field with a true-ish value (the KiCad 6 convention, before the
+    attribute existed); 'Populate = No' counts too."""
+    for k, v in fields.items():
+        kk, vv = k.strip().lower(), str(v).strip().lower()
+        if kk in ("dnp", "do not populate", "do_not_populate", "nopop", "no_populate") and vv not in ("", "0", "no", "false", "~"):
+            return True
+        if kk in ("populate", "fitted", "mount") and vv in ("no", "0", "false", "n"):
+            return True
+    return False
+
+
+def _backdrill(pcbnew, v, lid2name):
+    """#26: back-drill of a via (KiCad 10): the layers up to which the barrel is drilled out, or None."""
+    try:
+        mode = int(v.GetBackdrillMode())
+    except Exception:
+        return None
+    if mode == int(getattr(pcbnew, "BACKDRILL_MODE_NO_BACKDRILL", 0)):
+        return None
+    bot = lid2name.get(v.GetBottomBackdrillLayer()) if mode in (int(pcbnew.BACKDRILL_MODE_BACKDRILL_BOTTOM),
+                                                                int(pcbnew.BACKDRILL_MODE_BACKDRILL_BOTH)) else None
+    top = lid2name.get(v.GetTopBackdrillLayer()) if mode in (int(pcbnew.BACKDRILL_MODE_BACKDRILL_TOP),
+                                                             int(pcbnew.BACKDRILL_MODE_BACKDRILL_BOTH)) else None
+    return {"mode": mode, "bottom_to": bot, "top_to": top}
 
 
 def _lid(pcbnew, board, name):
@@ -245,48 +283,88 @@ def _arc_points(s, m, e, max_deg=10.0):
 
 # ----------------------------------------------------------------------------------------------
 
-def maybe_downgrade(board_path, workdir):
-    """Boards saved by a newer KiCad (Backplane) go through `kicad-cli pcb downgrade` first."""
-    with open(board_path, encoding="utf-8") as f:
-        head = f.read(200)
+class InputError(Exception):
+    """The input is not something openpcbsi reads (reported without a traceback, exit code 3)."""
+
+
+def file_version(board_path):
+    """The `(version N)` of a .kicad_pcb file header, or None."""
+    with open(board_path, encoding="utf-8", errors="replace") as f:
+        head = f.read(400)
     m = re.search(r"\(version (\d+)\)", head)
-    ver = int(m.group(1)) if m else 0
+    return int(m.group(1)) if m else None
+
+
+def _cli_has_downgrade():
     try:
-        import pcbnew
-        b = pcbnew.LoadBoard(board_path)
-        if b is not None:
-            return board_path
-    except Exception:
-        pass
-    os.makedirs(workdir, exist_ok=True)
-    out = os.path.join(workdir, "downgraded_" + os.path.basename(board_path))
-    subprocess.run(["kicad-cli", "pcb", "downgrade", "--target", "10.0", "-o", out, board_path], check=True)
-    print(f"openpcbsi: board version {ver} downgraded to KiCad 10 -> {out}", file=sys.stderr)
-    return out
+        p = subprocess.run(["kicad-cli", "pcb", "--help"], capture_output=True, text=True, timeout=60)
+        return "downgrade" in (p.stdout + p.stderr)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def maybe_downgrade(board_path, workdir):
+    """Input contract (#1): a KiCad 10.0 board file. A file from a newer KiCad is converted only when the
+    `kicad-cli` on the PATH can downgrade it; otherwise a clear InputError says what to do."""
+    import pcbnew
+    if not os.path.exists(board_path):
+        raise InputError(f"{board_path}: no such file")
+    ver = file_version(board_path)
+    if ver is None:
+        raise InputError(f"{board_path} is not a KiCad board file (no '(version N)' header)")
+    mine = int(getattr(pcbnew, "SEXPR_BOARD_FILE_VERSION", 0)) or None
+    if mine is None or ver <= mine:
+        try:
+            if pcbnew.LoadBoard(board_path) is not None:
+                return board_path
+        except Exception as e:
+            raise InputError(f"KiCad {pcbnew.Version()} could not read {board_path} (file version {ver}): {e}")
+    if _cli_has_downgrade():
+        os.makedirs(workdir, exist_ok=True)
+        out = os.path.join(workdir, "downgraded_" + os.path.basename(board_path))
+        p = subprocess.run(["kicad-cli", "pcb", "downgrade", "--target", "10.0", "-o", out, board_path],
+                           capture_output=True, text=True)
+        if p.returncode == 0 and os.path.exists(out):
+            print(f"openpcbsi: board file version {ver} downgraded to KiCad 10.0 -> {out}", file=sys.stderr)
+            return out
+    raise InputError(
+        f"{board_path} has file version {ver}, newer than KiCad {pcbnew.Version()} reads (file version {mine}). "
+        f"openpcbsi reads KiCad 10.0 boards: save the board as KiCad 10.0 in the tool that made it "
+        f"(for example `kicad-cli pcb downgrade --target 10.0` of that KiCad) and run again.")
 
 
 def load_or_extract(board_path, cache_dir, refresh=False):
-    """Return the snapshot dict, extracting through pcbnew only if the cache is stale."""
+    """Return the snapshot dict, extracting through pcbnew only if the cache is stale. Parallel runs on
+    one board take a per-board lock, so the board is extracted once and the others reuse it (#33)."""
+    import fcntl
     board_path = os.path.abspath(board_path)
+    if not os.path.exists(board_path):
+        raise InputError(f"{board_path}: no such file")
     sha = file_sha256(board_path)
     os.makedirs(cache_dir, exist_ok=True)
     cpath = os.path.join(cache_dir, f"snapshot_{sha[:16]}.json.gz")
-    if os.path.exists(cpath) and not refresh:
-        with gzip.open(cpath, "rt") as f:
-            snap = json.load(f)
-        if snap.get("version") == SNAPSHOT_VERSION:
+    with open(cpath + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            if os.path.exists(cpath) and not refresh:
+                with gzip.open(cpath, "rt") as f:
+                    snap = json.load(f)
+                if snap.get("version") == SNAPSHOT_VERSION:
+                    snap["board"] = board_path
+                    return snap
+            src = maybe_downgrade(board_path, os.path.join(cache_dir, "downgrade"))
+            snap = extract(src)
             snap["board"] = board_path
+            snap["sha256"] = sha
+            snap["downgraded"] = src if src != board_path else None   # G22: the report records it
+            snap["kicad_file_version"] = file_version(board_path)
+            tmp = f"{cpath}.{os.getpid()}.tmp"
+            with gzip.open(tmp, "wt") as f:
+                json.dump(snap, f)
+            os.replace(tmp, cpath)
             return snap
-    src = maybe_downgrade(board_path, os.path.join(cache_dir, "downgrade"))
-    snap = extract(src)
-    snap["board"] = board_path
-    snap["sha256"] = sha
-    snap["downgraded"] = src if src != board_path else None   # G22: the report records it
-    tmp = cpath + ".tmp"
-    with gzip.open(tmp, "wt") as f:
-        json.dump(snap, f)
-    shutil.move(tmp, cpath)
-    return snap
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
 
 
 if __name__ == "__main__":

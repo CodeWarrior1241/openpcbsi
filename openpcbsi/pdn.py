@@ -468,13 +468,121 @@ def dc_drop(ctx, rail_name, rail, log=print):
     vl = sorted(vias.items(), key=lambda kv: -kv[1])
     out["max_via_current_a"] = round(vl[0][1], 4) if vl else 0.0
     out["vias_carrying"] = len(vl)
-    out["top_vias"] = [{"x": round(b.vias["x"][v], 3), "y": round(b.vias["y"][v], 3), "I": round(i, 4)} for v, i in vl[:5]]
-    out["top_tracks"] = tracks[:5]
+    out["top_vias"] = [{"x": round(b.vias["x"][v], 3), "y": round(b.vias["y"][v], 3), "I": round(i, 4),
+                        "drill_mm": round(float(b.vias["drill"][v]), 3)} for v, i in vl[:20]]
+    out["top_tracks"] = tracks[:20]
     out["max_track_J_A_mm2"] = tracks[0]["J_A_mm2"] if tracks else 0.0
     out["max_track_dT_C"] = max((t["dT_ipc2221_C"] for t in tracks), default=0.0)
     out["hot_spots"] = hot[:5]
     out["ball_voltages"] = {p["ref"] + "." + p["num"]: round(float(Vfull[n]), 6) for n, p in loads}
+    out["budget"], out["neck"] = drop_budget(net, Ib, fixed, loads[worst_i][0], b)
+    if ctx.cfg["dc"].get("solve_ground", True):
+        try:
+            out.update(ground_rise(ctx, rail, rail["current_a"]))
+            if "ground_rise_mv" in out:
+                out["drop_with_ground_mv"] = round(out["drop_mv"] + out["ground_rise_mv"], 4)
+        except Exception as e:
+            out["ground"] = f"not solved: {e}"
     return out, (net, Vfull)
+
+
+def ground_rise(ctx, rail, current):
+    """#27: the ground return, solved like the rail (not assumed ideal). The rail's current enters the
+    ground net at the loads' ground pads and leaves at the regulator's ground pads; the result is the
+    rise of the worst load's ground above the regulator's. Needs `regulator` in the rail (config or
+    detection); a coarse cell keeps whole-board ground planes affordable."""
+    reg = rail.get("regulator")
+    gnd = (ctx.cfg.reference_nets or ["GND"])[0]
+    b = ctx.b
+    if not reg or reg not in b.pads_by_ref or gnd not in b.net_id:
+        return {"ground": "not solved: the rail names no regulator" if not reg else f"not solved: no {gnd} on {reg}"}
+    cell = ctx.cfg["dc"].get("ground_cell_mm", 0.5)
+    net = Network(ctx, gnd, cell, ctx.cfg["dc"]["sigma"], ctx.cfg["dc"]["plating_um"])
+    node = lambda p: net.pad_node.get((p["ref"], p["num"], p["x"], p["y"]))
+    src = [node(p) for p in b.pads_by_ref[reg] if p["net"] == gnd]
+    snk = [node(p) for r in rail.get("loads", []) for p in b.pads_by_ref.get(r, []) if p["net"] == gnd]
+    src, snk = [n for n in src if n is not None], [n for n in snk if n is not None]
+    if not src or not snk:
+        return {"ground": "not solved: no ground pads reached"}
+    comp = net.components()
+    main = comp[src[0]]
+    snk = [n for n in snk if comp[n] == main]
+    if not snk:
+        return {"ground": "not solved: the loads' ground pads are not connected to the regulator's"}
+    keep = np.flatnonzero(comp == main)
+    remap = -np.ones(net.N, np.int64)
+    remap[keep] = np.arange(len(keep))
+    Y = net.matrix(0.0)[keep][:, keep].tocsc()
+    I = np.zeros(len(keep))
+    for n in snk:
+        I[remap[n]] += current / len(snk)
+    free = np.ones(len(keep), bool)
+    for n in src:                              # every ground pad of the regulator is the 0 V reference
+        if comp[n] == main:
+            free[remap[n]] = False
+    fidx = np.flatnonzero(free)
+    V = np.zeros(len(keep))
+    V[fidx] = spla.spsolve(Y[fidx][:, fidx].tocsc(), I[fidx])
+    rise = max(V[remap[n]] for n in snk)
+    return {"ground": "solved", "ground_rise_mv": round(float(rise) * 1000, 4), "ground_net": gnd, "ground_cell_mm": cell}
+
+
+def drop_budget(net, Ib, src, dst, b):
+    """#31: where the drop is spent. Along any path from the regulated node to the worst load the
+    branch drops sum to the total drop exactly; the path taken is the one carrying the most current
+    (widest-path search). Drops are grouped by element (track / via / plane per layer) in path order;
+    `neck` is the track on that path with the highest current per mm of width."""
+    import heapq
+    adj = defaultdict(list)
+    for e, i in Ib:
+        if i > 0:
+            adj[e["a"]].append((e["b"], e, i))
+        elif i < 0:
+            adj[e["b"]].append((e["a"], e, -i))
+    best = {src: math.inf}
+    prev = {}
+    h = [(-math.inf, src)]
+    while h:
+        negw, u = heapq.heappop(h)
+        if u == dst:
+            break
+        if -negw < best.get(u, 0):
+            continue
+        for v, e, i in adj[u]:
+            w = min(-negw, i)
+            if w > best.get(v, 0):
+                best[v] = w
+                prev[v] = (u, e, i)
+                heapq.heappush(h, (-w, v))
+    if dst not in prev:
+        return [], None
+    path = []
+    v = dst
+    while v != src:
+        u, e, i = prev[v]
+        path.append((e, i))
+        v = u
+    path.reverse()
+    groups, neck = [], None
+    for e, i in path:
+        li = net.nodes[e["a"]][1]
+        what = e["kind"] if e["kind"] == "via" else f"{e['kind']} {b.layers[li] if li is not None and li >= 0 else ''}".strip()
+        mv = 1000 * i * e["R"]
+        if groups and groups[-1]["what"] == what:
+            groups[-1]["mv"] += mv
+            groups[-1]["elements"] += 1
+        else:
+            groups.append({"what": what, "mv": mv, "elements": 1})
+        if e["kind"] == "track":
+            t = e["info"]["track"]
+            w = float(b.tracks["w"][t])
+            if neck is None or i / w > neck["A_per_mm"]:
+                neck = {"layer": b.layers[int(b.tracks["layer"][t])], "w_mm": round(w, 3), "I_a": round(i, 4),
+                        "A_per_mm": round(i / w, 3), "x": round(float((b.tracks["x1"][t] + b.tracks["x2"][t]) / 2), 3),
+                        "y": round(float((b.tracks["y1"][t] + b.tracks["y2"][t]) / 2), 3)}
+    for g in groups:
+        g["mv"] = round(g["mv"], 4)
+    return groups, neck
 
 
 # ==============================================================================================
@@ -517,6 +625,27 @@ def cap_models(ctx, rail_net):
 
 def zcap(cap, w):
     return cap["ESR"] + 1j * w * cap["ESL"] + 1.0 / (1j * w * cap["C"])
+
+
+def load_step(freqs, Z, step_a, rise_ns=1.0, n=1 << 15):
+    """Voltage droop for a current step: v(t) = IFFT(Z(f) I(f)) on a uniform grid; Z between the log
+    samples by interpolation of magnitude and phase, below the first sample held at its value (the
+    regulator's DC regulation is not modelled, so the droop is the transient part)."""
+    fmax = freqs[-1]
+    fu = np.linspace(0, fmax, n)
+    lm = np.interp(np.log(np.maximum(fu, freqs[0])), np.log(freqs), np.log(np.abs(Z)))
+    ph = np.interp(np.log(np.maximum(fu, freqs[0])), np.log(freqs), np.unwrap(np.angle(Z)))
+    Zu = np.exp(lm) * np.exp(1j * ph)
+    dt = 1 / (2 * fmax)
+    t = np.arange(2 * (n - 1)) * dt
+    sig = rise_ns * 1e-9 / 2.563                     # Gaussian edge with the given 10-90 % rise time
+    th = t[-1] / 2                                   # step up, then back down half way: a periodic record
+    i_t = step_a * ((t >= 0) & (t < th)).astype(float)
+    fr = np.fft.rfftfreq(len(t), dt)
+    I = np.fft.rfft(i_t) * np.exp(-0.5 * (2 * np.pi * fr * sig) ** 2) * np.exp(-2j * np.pi * fr * 4 * sig)
+    v = np.fft.irfft(Zu * I, n=len(t))
+    m = t < t[-1] / 2
+    return {"load_step_mv": round(float(np.max(np.abs(v[m]))) * 1000, 3), "step_a": step_a, "step_rise_ns": rise_ns}
 
 
 def pdn_impedance(ctx, rail_name, rail, log=print, optimise=True):
@@ -593,10 +722,29 @@ def pdn_impedance(ctx, rail_name, rail, log=print, optimise=True):
                               "ESL": cfg["esl_nh"].get(pkg, 0.5) * 1e-9 + 0.25e-9, "node": n})
         return extra
 
-    band = freqs <= fmax_t
+    # #22: the rail's own band (vendor noise spec), else from fmin to target_fmax_hz
+    bh = rail.get("band_hz") or [freqs[0], fmax_t]
+    band = (freqs >= bh[0] * 0.999) & (freqs <= bh[1] * 1.001)
+    if not band.any():
+        band = freqs <= fmax_t
     Z, Z21 = port_z(caps_on)
     mag = np.abs(Z)
     viol = (mag > zt) & band
+    out["band_hz"] = [float(bh[0]), float(bh[1])]
+    out["band_source"] = "rail band_hz" if rail.get("band_hz") else "default (fmin to target_fmax_hz)"
+    # package and die (#22): Z at the die = (Z_board + R_pkg + jw L_pkg) || 1/(jw C_die)
+    pk = rail.get("package")
+    if pk:
+        w = 2 * np.pi * freqs
+        zpk = Z + pk.get("r_mohm", 0.0) * 1e-3 + 1j * w * pk.get("l_nh", 0.0) * 1e-9
+        cd = pk.get("c_die_nf", 0.0) * 1e-9
+        zdie = zpk / (1 + 1j * w * cd * zpk) if cd > 0 else zpk
+        out["package"] = {**pk, "Z_die_ohm": np.abs(zdie).tolist(), "max_Z_die_ohm": round(float(np.abs(zdie)[band].max()), 5)}
+    # load step (#22): droop of the rail voltage at the loads for a step of step_a with rise step_rise_ns
+    try:
+        out.update(load_step(freqs, Z, rail.get("step_a", rail["current_a"] / 2), rail.get("step_rise_ns", 1.0)))
+    except Exception as e:
+        out["load_step_error"] = str(e)
     out.update({"target_ohm": round(zt, 5), "target_fmax_hz": fmax_t, "caps": len(caps_on), "shunt_ohm": shunt_r,
                 "freqs_hz": freqs.tolist(), "Z_ohm": mag.tolist(), "Z21_ohm": np.abs(Z21).tolist(),
                 "max_Z_ohm": round(float(mag[band].max()), 5), "f_at_max_hz": float(freqs[band][int(np.argmax(mag[band]))]),

@@ -220,8 +220,10 @@ class Board:
             if li in self.via_flashed[k]:
                 geom.raster_capsule(g, r, V["x"][k], V["y"][k], V["x"][k], V["y"][k], V["d"][k] / 2, V["net"][k])
         self._rasters[li] = r
-        if cpath:
-            np.save(cpath, r)
+        if cpath:                      # atomic: parallel runs never read a half-written cache (#33)
+            tmp = f"{cpath}.{os.getpid()}.tmp.npy"
+            np.save(tmp, r)
+            os.replace(tmp, cpath)
         return r
 
     def outline_rings(self):

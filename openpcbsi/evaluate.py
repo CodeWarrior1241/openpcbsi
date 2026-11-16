@@ -26,23 +26,26 @@ import tomllib
 
 SCHEMA = "openpcbsi-evaluation/1"
 SEV = {"error": "fail", "warning": "warn", "info": "info", "fail": "fail", "warn": "warn", "pass": "pass"}
-ORDER = {"fail": 5, "warn": 4, "unvalidated": 3, "assumed inputs": 2, "not run": 1, "not built": 1, "pass": 0}
+ORDER = {"fail": 6, "warn": 5, "pending": 4.5, "unvalidated": 4, "not judged": 3, "assumed inputs": 2, "nothing to check": 1,
+         "not run": 1, "not built": 1, "pass": 0}
+NOT_REAL = ("not built", "not run", "nothing to check")
 FAMILY_ORDER = ["G1", "RP", "SD", "SI", "TH", "EMC", "EV", "PL", "FS"]
 
 # G1 rule key -> (family, requirement) as REQUIREMENTS 5.13 names them; the rest stay G1
 RULE_FAMILY = {
     "pad_plane": ("RP", "RP1"), "return_via": ("RP", "RP2"), "stitching": ("RP", "RP4/RP5"),
     "ref_plane": ("RP", "RP6"), "split_crossing": ("RP", "RP6"), "pair_coupling": ("RP", "RP7"),
-    "parallel": ("RP", "RP8"), "via_stub": ("RP", "RP9"),
+    "parallel": ("RP", "RP8"), "via_stub": ("RP", "RP9"), "stitching_map": ("RP", "RP3"),
+    "return_proximity": ("RP", "RP (no plane)"), "breakout": ("SI", "breakout"),
     "unreferenced": ("G1", "G1"), "edge_distance": ("G1", "PC8"), "decap": ("G1", "PC11"),
     "thermal_vias": ("G1", "PC13"), "power_overlap": ("G1", "G1"), "stubs": ("G1", "G1"),
 }
 CHECK_FAMILY = {
     "impedance": ("SI", "G6"), "crosstalk": ("SI", "G4"), "si": ("SI", "G2/G3/G7"), "vias": ("SI", "G9"),
     "dc": ("SD", "SD1"), "pdn": ("SD", "G11"), "thermal": ("TH", "G13"), "emc": ("EMC", "G14"),
-    "kicad_drc": ("EV", "EV1"),
+    "kicad_drc": ("EV", "EV1"), "em_region": ("FS", "FS9"), "trace_heating": ("SD", "SD3"), "via_current": ("SD", "SD4"), "timing": ("SI", "timing"),
 }
-FAMILY_CHECKS = {"g1": ["drc"], "rp": ["drc"], "sd": ["dc", "pdn"], "si": ["impedance", "crosstalk", "si", "vias"],
+FAMILY_CHECKS = {"g1": ["drc"], "rp": ["drc"], "sd": ["dc", "pdn"], "si": ["impedance", "crosstalk", "si", "vias", "timing"],
                  "th": ["thermal"], "emc": ["pdn", "emc"], "ev": []}
 NOT_BUILT = [
     ("PL", "PL1-PL10", "placement evaluation"),
@@ -71,6 +74,35 @@ def _f(check, family, req, sev, reason, nets=(), refs=(), layer=None, x=None, y=
             "reason": reason, "evidence": evidence, "area": area or "", "waived": None}
 
 
+HINTS = {   # #31: a first fix for each geometric finding (advice, not a constraint)
+    "split_crossing": "route over unbroken reference copper on {ref_layer}, or bridge the gap with a stitching capacitor next to the crossing",
+    "ref_plane": "restore solid {ref_layer} copper under the track, or move the track over solid copper",
+    "return_via": "add a ground via within 1 mm of the layer change, joining the two reference planes",
+    "pad_plane": "void the reference under the pad (pad + 0.15 mm) so the pad references the next ground layer",
+    "pair_coupling": "keep P and N at the pair gap through the fan-out; match skew with small bumps close to the mismatch",
+    "stitching": "add stitching vias at no more than {limit} mm spacing along this stretch",
+    "parallel": "space the other net at least {limit} mm away, or shorten the parallel run",
+    "edge_distance": "keep the track at least {limit} mm inside its reference copper and the board edge",
+    "decap": "move the capacitor's via within {limit} mm of its pad",
+    "via_stub": "back-drill the via, or change to the layer that uses the whole via length",
+    "unreferenced": "route the segment over a plane, or add reference copper on the adjacent layer",
+    "stubs": "remove the dangling end or complete the connection",
+    "impedance": "adjust width/gap for {target} ohm: `openpcbsi plan BOARD --layer {layer} --zdiff {target}`",
+    "thermal": "spread the heat: thermal vias and copper under the part, airflow or a heatsink; check the dissipation",
+    "vias": "change the antipad or the return-via spacing; model it in 3D before relying on the closed form",
+}
+
+
+class _Safe(dict):
+    def __missing__(self, k):
+        return "?"
+
+
+def hint(rule, f):
+    t = HINTS.get(rule)
+    return t.format_map(_Safe({k: v for k, v in f.items() if v is not None})) if t else None
+
+
 def _layer_png(layer):
     return f"layer_{layer.replace('.', '_')}.png" if layer and "/" not in layer else None
 
@@ -84,6 +116,8 @@ def from_rule_findings(check, family, req, fs):
                       f.get("layer"), f.get("x"), f.get("y"), f.get("value"), f.get("limit"), f.get("unit"),
                       f.get("area", ""), evidence=_layer_png(f.get("layer")) or "marker board User.9",
                       extra=f.get("kind") or f.get("rule")))
+        if out[-1]["severity"] in ("fail", "warn"):
+            out[-1]["hint"] = hint(check, f)
     return out
 
 
@@ -118,6 +152,27 @@ def judge_dc(rep, cfg):
             msg += f", worst {r['worst_ball']}"
         out.append(_f("dc", "SD", "SD1", sev, msg, [r.get("net")], refs, value=round(pct, 1),
                       limit=100.0, unit="% of window", evidence="report.html#dc", extra="drop"))
+    # SD3 / SD4: copper heating and via current from the solved currents (openpcbsi's own solution)
+    th = ev.get("trace_warn_c", 10.0), ev.get("trace_fail_c", 30.0)
+    va = ev.get("via_amps_per_0p2mm", 0.5)
+    own = {r["rail"]: r for r in (d.get("openpcbsi_rails") or [])} or {r["rail"]: r for r in d.get("rails", [])}
+    for name, r in own.items():
+        rail = cfg["rails"].get(name, {})
+        assumed = rail.get("current_assumed", False)
+        for t in r.get("top_tracks", []):
+            dT = t.get("dT_ipc2221_C", 0)
+            if dT > th[0]:
+                sev = "fail" if dT > th[1] and not assumed else "warn"
+                out.append(_f("trace_heating", "SD", "SD3", sev, f"{name}: {t['I']:.2f} A in a {t['w']} mm track on {t['layer']} "
+                              f"rises ~{dT:.0f} C (IPC-2221; warn {th[0]:g}, fail {th[1]:g} C)" + (" at an assumed current" if assumed else ""),
+                              [rail.get("net")], layer=t["layer"], x=t.get("x"), y=t.get("y"), value=round(dT, 1),
+                              limit=th[1], unit="C", evidence="report.html#dc", extra="heat"))
+        for v in r.get("top_vias", []):
+            lim = va * max(v.get("drill_mm", 0.2), 0.05) / 0.2
+            if v["I"] > lim:
+                out.append(_f("via_current", "SD", "SD4", "warn", f"{name}: {v['I']:.2f} A in one via of {v.get('drill_mm', '?')} mm drill "
+                              f"(limit {lim:.2f} A: {va:g} A per 0.2 mm, proposed)", [rail.get("net")], x=v["x"], y=v["y"],
+                              value=round(v["I"], 3), limit=round(lim, 3), unit="A", extra="via"))
     for x in d.get("cross_check", []):
         if x.get("diff_pct") is not None and abs(x["diff_pct"]) > dis:
             out.append(_f("dc", "SD", "SD1", "warn", f"{x['rail']}: KiPI {x['kipi_mv']:.2f} mV and openpcbsi "
@@ -247,14 +302,20 @@ def collect(rep, cfg, checks):
     for rule in rep["checks"].get("drc", []):
         fam, req = RULE_FAMILY.get(rule["rule"], ("G1", rule.get("spec", "G1")))
         fs += from_rule_findings(rule["rule"], fam, req, rule.get("findings", []))
-        val[rule["rule"]] = "geometry"
-    for c in ("impedance", "crosstalk", "si", "vias", "thermal", "emc"):
+        # a rule that found no item in scope checked nothing: never a pass (#5)
+        val[rule["rule"]] = "geometry" if (rule.get("metrics") or rule.get("findings")) else "nothing to check"
+    for c in ("impedance", "crosstalk", "si", "vias", "timing", "thermal", "emc"):
         d = rep["checks"].get(c)
         if d is None:
             continue
         fam, req = CHECK_FAMILY[c]
         fs += from_rule_findings(c, fam, req, d.get("findings", []))
         val[c] = d.get("validation") or ("rule of thumb" if c == "emc" else "unvalidated")
+        n_items = len(d.get("rows") or d.get("parts") or []) + len(d.get("channels") or [])
+        if not n_items and not d.get("findings"):
+            val[c] = "nothing to check"
+        elif c == "impedance" and d.get("judged") == 0:
+            val[c] = "not judged"           # impedances computed, but no class gives a target
     if "dc" in rep["checks"]:
         f2, v = judge_dc(rep, cfg)
         fs += f2
@@ -282,7 +343,7 @@ def scorecard(findings, val, skipped, assumed=()):
     per = {}
     for f in findings:
         c = per.setdefault(f["check"], {"check": f["check"], "family": f["family"], "requirement": f["requirement"],
-                                        "fail": 0, "warn": 0, "info": 0, "pass": 0, "in_area": 0, "waived": 0})
+                                        "fail": 0, "warn": 0, "info": 0, "pass": 0, "in_area": 0, "waived": 0, "pending": 0})
         if f["waived"]:
             c["waived"] += 1
         elif f["area"]:
@@ -296,7 +357,8 @@ def scorecard(findings, val, skipped, assumed=()):
     for c in per.values():
         v = val.get(c["check"])
         c["validation"] = v
-        c["status"] = ("fail" if c["fail"] else "warn" if c["warn"] else
+        c["status"] = ("fail" if c["fail"] else "warn" if c["warn"] else "pending" if c.get("pending") else
+                       v if v in ("nothing to check", "not judged") else
                        "unvalidated" if not _validated(v) else
                        "assumed inputs" if c["check"] in assumed else "pass")
         if c["check"] in assumed:
@@ -313,11 +375,12 @@ def scorecard(findings, val, skipped, assumed=()):
         fams.setdefault(c["family"], []).append(c)
     card = []
     for fam, cs in fams.items():
-        real = [c for c in cs if c["status"] not in ("not built", "not run")]
+        real = [c for c in cs if c["status"] not in NOT_REAL]
         if real:
             status = max((c["status"] for c in real), key=ORDER.get)
         else:
-            status = "not built" if all(c["status"] == "not built" for c in cs) else "not run"
+            sts = {c["status"] for c in cs}
+            status = "not built" if sts == {"not built"} else "nothing to check" if "nothing to check" in sts else "not run"
         card.append({"family": fam, "title": FAMILY_TITLE.get(fam, fam), "status": status,
                      "partial": bool(real) and len(real) < len(cs), "checks": len(cs),
                      "fail": sum(c["fail"] for c in cs), "warn": sum(c["warn"] for c in cs)})
@@ -337,8 +400,45 @@ def exit_code(findings, cfg):
 
 
 # ------------------------------------------------------------------------------------------------
+def since_report(prev_path, findings):
+    """#35: findings against an earlier evaluation, by stable ID (fail, warn and pending outside areas)."""
+    prev = json.load(open(prev_path))
+    live = lambda fs: {f["id"]: f for f in fs if f["severity"] in ("fail", "warn", "pending") and not f.get("area")
+                       and not f.get("waived")}
+    a, b = live(prev.get("findings", [])), live(findings)
+    changed = [{"id": i, "was": a[i]["severity"], "now": b[i]["severity"], "value_was": a[i].get("value"),
+                "value_now": b[i].get("value")} for i in sorted(set(a) & set(b))
+               if a[i]["severity"] != b[i]["severity"] or a[i].get("value") != b[i].get("value")]
+    pw = {f["id"]: f["waived"] for f in prev.get("findings", []) if f.get("waived")}
+    now_ids = {f["id"] for f in findings}
+    return {"against": os.path.abspath(prev_path), "against_board_sha256": prev.get("board_sha256"),
+            "against_date": prev.get("date"),
+            "new": [{"id": i, "check": b[i]["check"], "severity": b[i]["severity"], "reason": b[i]["reason"]} for i in sorted(set(b) - set(a))],
+            "resolved": [{"id": i, "check": a[i]["check"], "severity": a[i]["severity"], "reason": a[i]["reason"]} for i in sorted(set(a) - set(b))],
+            "changed": changed,
+            "waived_before": {"still_present": sorted(i for i in pw if i in now_ids), "gone": sorted(i for i in pw if i not in now_ids)}}
+
+
+def apply_stage(findings, st):
+    """#29: before the final stage, 'not connected yet' is pending, not a failure."""
+    if st["stage"] == "final":
+        return 0
+    inc = set(st["incomplete_nets"])
+    n = 0
+    for f in findings:
+        if f["severity"] not in ("fail", "warn"):
+            continue
+        r = f["reason"]
+        if (f["check"] == "kicad_drc" and r.startswith("unconnected_items")) or \
+           (f["check"] in ("dc", "pdn") and ("not connected" in r or "no load pad" in r)) or \
+           (f["check"] in ("stubs",) and set(f["nets"]) & inc):
+            f["severity"], f["pending_reason"] = "pending", f"layout stage '{st['stage']}': not routed yet"
+            n += 1
+    return n
+
+
 def run(board, cfg_path=None, waivers=None, families=None, checks=None, out_dir=None, json_out=None,
-        markers=True, drc=True, log=print):
+        markers=True, drc=True, log=print, stage=None, since=None, em="none"):
     from . import report as report_mod
     from . import run as runmod
     from . import validate
@@ -373,6 +473,28 @@ def run(board, cfg_path=None, waivers=None, families=None, checks=None, out_dir=
             val["kicad_drc"] = "geometry"
     elif not drc:
         skipped["kicad_drc"] = "--no-drc"
+    em_jobs = None
+    if em in ("plan", "run"):                    # #19: automatic 3D regions with fix variants
+        from . import emplan, region3d
+        em_jobs = emplan.plan(ctx, rep, cfg.data.get("em", {}).get("fast_ghz", 3.0))
+        os.makedirs(os.path.join(od, "em_jobs"), exist_ok=True)
+        for j in em_jobs:
+            json.dump(j, open(os.path.join(od, "em_jobs", j["name"] + ".json"), "w"), indent=1)
+        log(f"3D regions: {len(em_jobs)} planned" + (" (running: minutes each)" if em == "run" else ""))
+        if em == "run":
+            for j in em_jobs:
+                base = region3d.run(ctx, {k: v for k, v in j.items() if k != "variant"}, runmod.CACHE, runmod.RUNS, log)
+                j["result"] = {k: base.get(k) for k in ("dir", "ran", "convergence", "calibration", "z_line_ohm", "preflight")}
+                if j.get("variant"):
+                    var = region3d.run(ctx, j, runmod.CACHE, runmod.RUNS, log)
+                    j["variant_result"] = {k: var.get(k) for k in ("dir", "ran", "convergence", "z_line_ohm")}
+                for sev, msg in emplan.judge(j, base):
+                    findings.append(_f("em_region", "FS", "FS9", sev, msg, j["nets"], j.get("parts", []), extra=j["name"]))
+    from . import stage as stage_mod
+    st = stage_mod.analyse(b.snap)
+    if stage:
+        st["stage"], st["stage_set_by"] = stage, "--stage"
+    st["pending"] = apply_stage(findings, st)
     ws, whash = load_waivers(waivers)
     wstat = apply_waivers(findings, ws)
     per, famcard = scorecard(findings, val, skipped, assumed)
@@ -381,12 +503,16 @@ def run(board, cfg_path=None, waivers=None, families=None, checks=None, out_dir=
         "schema": SCHEMA, "tool": "openpcbsi", "version": rep.get("version"),
         "date": datetime.datetime.now().isoformat(timespec="seconds"),
         "board": rep["board"], "board_sha256": rep["board_sha256"], "downgraded": rep.get("downgraded"),
+        "kicad_file_version": rep.get("kicad_file_version"), "kicad": rep.get("kicad"),
         "config": rep["config"], "config_hash": rep["config_hash"], "detected": rep.get("detected"),
         "waivers_file": os.path.abspath(waivers) if waivers else None, "waivers_hash": whash,
         "solver_versions": dict(validate.SOLVER_VERSIONS), "kipi": (rep.get("kipi") or {}).get("lock"),
         "kicad_drc": drc_meta, "exit_code": code, "families": famcard, "checks": per, "waivers": wstat,
+        "stage": st["stage"], "incomplete_nets": st["incomplete_nets"][:200], "unrouted_pads": st["unrouted_pads"],
+        "since": since_report(since, findings) if since else None,
+        "em_jobs": em_jobs,
         "counts": {s: sum(1 for f in findings if f["severity"] == s and not f["waived"] and not f["area"])
-                   for s in ("fail", "warn", "info", "pass")} | {
+                   for s in ("fail", "warn", "info", "pass", "pending")} | {
                       "in_area": sum(1 for f in findings if f["area"] and not f["waived"]),
                       "waived": sum(1 for f in findings if f["waived"])},
         "findings": findings, "report": os.path.join(od, "report.json"),

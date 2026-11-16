@@ -49,6 +49,11 @@ def model(geom_, er):
     return out
 
 
+def _judge(rows, ctx):
+    from . import judge
+    return judge.vias(rows, ctx.cfg)
+
+
 def run(ctx, cache_dir, log=print):
     b, cfg = ctx.b, ctx.cfg
     st = b.stack
@@ -97,7 +102,7 @@ def run(ctx, cache_dir, log=print):
             f"  C {r['C_pF']} pF  L {r['L_nH']} nH  Z {r.get('Z_ohm')} ohm  x{r['instances']}")
     return {"rule": "vias", "spec": "G9", "title": "Via model library (closed form)", "validation": "closed-form",
             "rows": rows, "metrics": {f"{r['layers']} d{r['drill_mm']} ap{r['antipad_mm']}": {"C_pF": r["C_pF"], "L_nH": r["L_nH"]} for r in rows},
-            "findings": [], "summary": {"geometries": len(rows)},
+            "findings": _judge(rows, ctx), "summary": {"geometries": len(rows)},
             "note": "Johnson & Graham closed forms; G8 (openEMS) is the route to S-parameter via models."}
 
 

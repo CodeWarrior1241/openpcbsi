@@ -1,0 +1,35 @@
+# Characterised reference boards: fabricated KiCad boards with published measurements (#8).
+# openpcbsi fetches these files at the pinned commits into its cache (`python3 -m openpcbsi correlate --fetch`)
+# and checks every file against its SHA-256 below; nothing here is copied into the repository.
+
+[antmicro_si]
+title = "Antmicro Signal Integrity Test Board (rev 1.0.1), measured with a VNA"
+license = "Apache-2.0 (board and measurements); (c) Antmicro"
+board_repo = "https://github.com/antmicro/signal-integrity-test-board"
+board_commit = "de0b5922c372481bb146cbd1d0a9f3b7e97c124a"
+data_repo = "https://github.com/antmicro/gerber2ems"
+data_commit = "5001f1a95c1b06493027208bc1fc6e9c9a1946cf"
+
+[antmicro_si.files]
+"si-simulation-test-board.kicad_pcb" = { repo = "board", path = "si-simulation-test-board.kicad_pcb", sha256 = "ad22910fb65d87b9506a860a2fc9a6ad8ddb0af7743be3a9df40e4edd2c2a318" }
+"si-simulation-test-board.kicad_pro" = { repo = "board", path = "si-simulation-test-board.kicad_pro", sha256 = "f309d6a9f5a0555fc0ad1d05388b3b4b309863cbff8b0976b562579bd705b209" }
+"stub_short/vna.csv" = { repo = "data", path = "examples/stub_short/vna.csv", sha256 = "826e5d711f6c2038058f3b79bae321d8d31b93d49d3cc879767bdb981f11c6dd" }
+"stub_long/vna.csv" = { repo = "data", path = "examples/stub_long/vna.csv", sha256 = "d66d639bec028b04496ae4c53071b41db03cf58ed379029992480a6896bf7158" }
+
+# Each case: the net on the board, the connector the VNA measured from, the far connector (terminated
+# in 50 ohm by the second VNA port), the stub's end part (DNP on the measured board: the stub is open).
+[[antmicro_si.cases]]
+name = "stub_short"
+measured = "stub_short/vna.csv"
+net = "Net-(J10-Pad1)"
+driver = "J9"
+far = "J10"
+stub_end = "R4"
+
+[[antmicro_si.cases]]
+name = "stub_long"
+measured = "stub_long/vna.csv"
+net = "Net-(J7-Pad1)"
+driver = "J7"
+far = "J8"
+stub_end = "R3"

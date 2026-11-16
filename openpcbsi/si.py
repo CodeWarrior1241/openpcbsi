@@ -169,6 +169,173 @@ def net_path(ctx, net):
             "pads": [term[0][0], term[1][0]], "elements": els, "length_mm": round(dist[min(ends, key=lambda e: dist[e])], 3)}, None
 
 
+def net_paths(ctx, net):
+    """#21: multi-terminal nets. One path per receiver from the driver along the shortest-path tree, with
+    the branches to the other receivers as stubs: [{from, to, pads, elements, stubs: [(node, elements, pad)]}].
+    Driver: a pad of a part listed in [si] drivers, else the pad with the largest total path length to the
+    others (the end of a fly-by, the root of a T)."""
+    b = ctx.b
+    T, V = b.tracks, b.vias
+    ks = b.tracks_of(net)
+    pads = [p for p in b.pads_of(net) if p["kind"] in ("smd", "conn", "pth")]
+    if len(pads) < 2 or not len(ks):
+        return None, "fewer than two pads" if len(pads) < 2 else "no tracks"
+    tol = 0.002
+    from .geom import cluster
+    n_ = len(ks)
+    lab = cluster(np.r_[T["x1"][ks], T["x2"][ks]] + 1000.0 * np.r_[T["layer"][ks], T["layer"][ks]],
+                  np.r_[T["y1"][ks], T["y2"][ks]], 0.005)
+    rep = {}
+
+    def key_of(i, e, li, x, y):
+        c = lab[i + e * n_]
+        if c not in rep:
+            rep[c] = (li, round(x / tol), round(y / tol))
+        return rep[c]
+    adj = defaultdict(list)
+    for i, k in enumerate(ks):
+        li = int(T["layer"][k])
+        x1, y1, x2, y2 = T["x1"][k], T["y1"][k], T["x2"][k], T["y2"][k]
+        L = float(T["len"][k])
+        # pads the track runs through (not only at its ends) split it: a fly-by bus taps each pad
+        cuts = []
+        L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2
+        for p in pads:
+            if p["layer_ids"] and li not in p["layer_ids"]:
+                continue
+            if L2 <= 0:
+                continue
+            u = ((p["x"] - x1) * (x2 - x1) + (p["y"] - y1) * (y2 - y1)) / L2
+            if 1e-3 < u < 1 - 1e-3 and math.hypot(x1 + u * (x2 - x1) - p["x"], y1 + u * (y2 - y1) - p["y"]) <= max(p["sx"], p["sy"]) / 2:
+                cuts.append((u, None))
+        # T junctions: another track of the net ending on this one, part way along it
+        for i2, k2 in enumerate(ks):
+            if k2 == k or int(T["layer"][k2]) != li or L2 <= 0:
+                continue
+            for e2, (ex, ey) in enumerate(((T["x1"][k2], T["y1"][k2]), (T["x2"][k2], T["y2"][k2]))):
+                u = ((ex - x1) * (x2 - x1) + (ey - y1) * (y2 - y1)) / L2
+                if 1e-3 < u < 1 - 1e-3 and math.hypot(x1 + u * (x2 - x1) - ex, y1 + u * (y2 - y1) - ey) <= float(T["w"][k]) / 2:
+                    cuts.append((u, key_of(i2, e2, li, ex, ey)))      # the other track's own end node
+        cuts.sort(key=lambda c: c[0])
+        us = [0.0] + [c[0] for c in cuts] + [1.0]
+        keys = [None] + [c[1] for c in cuts] + [None]
+        a_ = key_of(i, 0, li, x1, y1)
+        for m_, (ua, ub) in enumerate(zip(us, us[1:])):
+            kk = keys[m_ + 1]
+            c_ = key_of(i, 1, li, x2, y2) if ub == 1.0 else (kk or (li, round((x1 + ub * (x2 - x1)) / tol), round((y1 + ub * (y2 - y1)) / tol)))
+            el = ("line", li, float(T["w"][k]), L * (ub - ua), int(k))
+            adj[a_].append((c_, L * (ub - ua), el))
+            adj[c_].append((a_, L * (ub - ua), el))
+            a_ = c_
+    nodes = list(adj.keys())
+    for v in b.vias_of(net):
+        x, y = V["x"][v], V["y"][v]
+        at = [n for n in nodes if math.hypot(n[1] * tol - x, n[2] * tol - y) <= V["d"][v] / 2 + 0.06]
+        for n1 in at:
+            for n2 in at:
+                if n1[0] != n2[0]:
+                    adj[n1].append((n2, 0.0, ("via", n1[0], n2[0], int(v))))
+    from .pdn import _pad_dist
+    term = []
+    for p in pads:
+        tn = [n for n in nodes if n[0] in p["layer_ids"] and _pad_dist(p, n[1] * tol, n[2] * tol) <= 0.07]
+        if not tn:
+            tn = [n for n in nodes if _pad_dist(p, n[1] * tol, n[2] * tol) <= 0.07]
+        if tn:
+            term.append((p, tn))
+    if len(term) < 2:
+        return None, "pads not reached by tracks"
+
+    def tree(src_nodes):
+        dist, prev = {n: 0.0 for n in src_nodes}, {}
+        pq = [(0.0, n) for n in src_nodes]
+        heapq.heapify(pq)
+        seen = set()
+        while pq:
+            d, n = heapq.heappop(pq)
+            if n in seen:
+                continue
+            seen.add(n)
+            for m, w, el in adj[n]:
+                nd = d + w + (1e-6 if el[0] == "via" else 0)
+                if nd < dist.get(m, math.inf):
+                    dist[m], prev[m] = nd, (n, el)
+                    heapq.heappush(pq, (nd, m))
+        return dist, prev
+    drivers = [str(x) for x in (ctx.cfg["si"].get("drivers") or [])]
+    cand = [t for t in term if t[0]["ref"] in drivers]
+    if not cand:
+        best = None
+        for t in term:
+            d, _ = tree(t[1])
+            tot = sum(min((d.get(n, math.inf) for n in o[1]), default=math.inf) for o in term if o is not t)
+            key = (tot, t[0]["ref"])
+            if math.isfinite(tot) and (best is None or tot > best[0][0] or (tot == best[0][0] and t[0]["ref"] < best[0][1])):
+                best = (key, t)
+        cand = [best[1]] if best else [term[0]]
+    drv = cand[0]
+    dist, prev = tree(drv[1])
+    srcs = set(drv[1])
+
+    def walk(end):
+        ns, els = [end], []
+        n = end
+        while n not in srcs and n in prev:
+            p_, el = prev[n]
+            els.append(el)
+            ns.append(p_)
+            n = p_
+        return ns[::-1], els[::-1]
+    rx = []
+    for p, tn in term:
+        if p is drv[0]:
+            continue
+        ends = [n for n in tn if n in dist]
+        if not ends:
+            continue
+        e = min(ends, key=lambda n: dist[n])
+        ns, els = walk(e)
+        rx.append((p, e, ns, els))
+    out = []
+    for p, e, ns, els in rx:
+        stubs = []
+        pos = {n: i for i, n in enumerate(ns)}
+        for q, eq, nq, elq in rx:
+            if q is p:
+                continue
+            k = 0
+            while k < len(nq) and nq[k] in pos:
+                k += 1
+            bn = nq[k - 1] if k else nq[0]
+            stubs.append((pos.get(bn, 0), elq[k - 1:] if k else elq, q))
+        out.append({"from": f"{drv[0]['ref']}.{drv[0]['num']}", "to": f"{p['ref']}.{p['num']}", "pads": [drv[0], p],
+                    "elements": els, "stubs": stubs, "length_mm": round(dist[e], 3)})
+    return out, None
+
+
+def stub_admittance(ctx, lib, els, pad, f, load_pf, vias_rep=None):
+    """Input admittance of a stub (lines and vias from the branch point) loaded by its pad and receiver."""
+    from . import vias as vmod
+    b = ctx.b
+    w0 = next((e[2] for e in els if e[0] == "line"), 0.12)
+    YL = 1j * 2 * np.pi * f * (pad_cap(ctx, pad, w0) + load_pf * 1e-12)
+    mats = []
+    for e in els:
+        if e[0] == "line":
+            mats.append(line_abcd(lib.get(e[1], e[2], None), e[3], f))
+        else:
+            layers = f"{b.layers[min(e[1], e[2])]}-{b.layers[max(e[1], e[2])]}"
+            vm = vmod.lookup(vias_rep, layers) or {"C_pF": 0.3, "L_nH": 0.6}
+            C, L = vm["C_pF"] * 1e-12, vm["L_nH"] * 1e-9
+            mats += [shunt_abcd(1j * 2 * np.pi * f * C / 2), series_abcd(1j * 2 * np.pi * f * L), shunt_abcd(1j * 2 * np.pi * f * C / 2)]
+    if not mats:
+        return YL
+    M = cascade(mats)
+    ZL = 1.0 / YL
+    Zin = (M[0, 0] * ZL + M[0, 1]) / (M[1, 0] * ZL + M[1, 1])
+    return 1.0 / Zin
+
+
 def merge_lines(els):
     out = []
     for e in els:
@@ -180,25 +347,64 @@ def merge_lines(els):
 
 
 def pad_cap(ctx, pad, w_track):
-    """Excess capacitance of a pad wider than its track over the plane below it."""
+    """Excess capacitance of a pad wider than its track. Every part of the pad (its real shape, inside
+    the board outline) counts against the nearest reference copper that is actually under it: a void
+    under a launch pad moves that part to the next plane down, as on a board built for measurement."""
     b = ctx.b
     if not pad["layer_ids"]:
         return 0.0
     li = pad["layer_ids"][0]
-    refs = ctx.ref_layers(li)
+    refs = sorted(ctx.ref_layers(li) + [r for r in range(len(b.layers)) if r != li and r not in ctx.ref_layers(li)],
+                  key=lambda r: b.stack.gap(b.layers[li], b.layers[r]))
     if not refs:
         return 0.0
-    h = min(b.stack.gap(b.layers[li], b.layers[r]) for r in refs) * 1e-3
-    er = b.stack.er_between(b.layers[li], b.layers[refs[0]])
-    A = max(pad["sx"] * pad["sy"] - w_track * min(pad["sx"], pad["sy"]), 0) * 1e-6
-    return EPS0 * er * A / h
+    from . import geom
+    g = b.grid()
+    poly = pad.get("poly") or []
+    if not poly:
+        A = max(pad["sx"] * pad["sy"] - w_track * min(pad["sx"], pad["sy"]), 0) * 1e-6
+        h = b.stack.gap(b.layers[li], b.layers[refs[0]]) * 1e-3
+        return EPS0 * b.stack.er_between(b.layers[li], b.layers[refs[0]]) * A / h
+    rings = [r for pl in poly for r in pl]
+    xs = [x for r in rings for x, _ in r]
+    ys = [y for r in rings for _, y in r]
+    i0, j0 = g.ij(min(xs), min(ys))
+    i1, j1 = g.ij(max(xs), max(ys))
+    i0, i1, j0, j1 = int(max(min(i0, i1) - 1, 0)), int(max(i0, i1) + 2), int(max(min(j0, j1) - 1, 0)), int(max(j0, j1) + 2)
+    sub = geom.Grid(g.x0 + j0 * g.res, g.y0 + i0 * g.res, g.x0 + j1 * g.res, g.y0 + i1 * g.res, g.res)
+    m = np.zeros(sub.shape, bool)
+    geom.raster_rings(sub, rings, m)
+    ob = np.zeros(sub.shape, bool)
+    geom.raster_rings(sub, b.outline_rings(), ob)
+    m &= ob
+    ny, nx = m.shape
+    left = m.copy()
+    C = 0.0
+    px = g.res * g.res * 1e-6                    # m^2 per pixel
+    for r in refs:
+        rm = ctx.refmask(r)[i0:i0 + ny, j0:j0 + nx]
+        if rm.shape != left.shape:
+            continue
+        cov = left & rm
+        if cov.any():
+            h = b.stack.gap(b.layers[li], b.layers[r]) * 1e-3
+            C += EPS0 * b.stack.er_between(b.layers[li], b.layers[r]) * cov.sum() * px / h
+        left &= ~rm
+        if not left.any():
+            break
+    frac_track = min(1.0, w_track / max(min(pad["sx"], pad["sy"]), 1e-6))   # the track's own share of the pad
+    return C * (1.0 - frac_track)
 
 
 def net_abcd(ctx, lib, path, f, gap=None, vias_rep=None):
     from . import vias as vmod
     b = ctx.b
     mats, spice = [], []
-    els = merge_lines(path["elements"])
+    stubs = path.get("stubs") or []
+    els = list(path["elements"]) if stubs else merge_lines(path["elements"])
+    at = defaultdict(list)
+    for node_i, sels, spad in stubs:
+        at[node_i].append((sels, spad))
     w0 = next((e[2] for e in els if e[0] == "line"), 0.12)
     cp = [pad_cap(ctx, p, w0) for p in path["pads"]]
     diff = gap is not None
@@ -206,7 +412,11 @@ def net_abcd(ctx, lib, path, f, gap=None, vias_rep=None):
     mats.append(shunt_abcd(1j * 2 * np.pi * f * cp[0] * k))
     spice.append(f"C_pad1 n0 0 {cp[0] * k:.4e}")
     node = 0
-    for e in els:
+    for idx, e in enumerate(els):
+        for sels, spad in at.get(idx, []):              # #21: branches to other receivers
+            Ys = stub_admittance(ctx, lib, sels, spad, f, ctx.cfg["si"]["load_pf"], vias_rep)
+            mats.append(shunt_abcd(Ys))
+            spice.append(f"* stub at n{node} to {spad['ref']}.{spad['num']} ({sum(x[3] for x in sels if x[0] == 'line'):.2f} mm)")
         if e[0] == "line":
             lp = lib.get(e[1], e[2], gap)
             mats.append(line_abcd(lp, e[3], f))
@@ -220,6 +430,8 @@ def net_abcd(ctx, lib, path, f, gap=None, vias_rep=None):
             mats += [shunt_abcd(1j * 2 * np.pi * f * C / 2), series_abcd(1j * 2 * np.pi * f * L), shunt_abcd(1j * 2 * np.pi * f * C / 2)]
             spice += [f"C_v{node}a n{node} 0 {C / 2:.4e}", f"L_v{node} n{node} n{node + 1} {L:.4e}", f"C_v{node}b n{node + 1} 0 {C / 2:.4e}"]
             node += 1
+    for sels, spad in at.get(len(els), []):
+        mats.append(shunt_abcd(stub_admittance(ctx, lib, sels, spad, f, ctx.cfg["si"]["load_pf"], vias_rep)))
     mats.append(shunt_abcd(1j * 2 * np.pi * f * cp[1] * k))
     spice.append(f"C_pad2 n{node} 0 {cp[1] * k:.4e}")
     return cascade(mats), spice, node
@@ -288,36 +500,16 @@ def run(ctx, cache_dir, out_dir, log=print, vias=None):
         else:
             gap, name = None, net
             done.add(net)
-        path, err = net_path(ctx, name)
-        if path is None:
+        if not diff and len([q for q in b.pads_of(name) if q["kind"] in ("smd", "conn", "pth")]) > 2:
+            paths, err = net_paths(ctx, name)
+        else:
+            path, err = net_path(ctx, name)
+            paths = [path] if path else None
+        if not paths:
             rows.append({"net": name, "problem": err})
             continue
-        M, spice, nn = net_abcd(ctx, lib, path, f, gap, vias)
-        cls = cfg.class_of(name)
-        rise = cfg.class_param(cls, "rise_ps", p["driver"]["rise_ps"])
-        z_ref = 100.0 if diff else 50.0
-        term = cfg.class_param(cls, "term_ohm", z_ref)       # LVDS / GTH: internal 100 ohm diff / 50 ohm
-        rs = cfg.class_param(cls, "driver_r_ohm", z_ref if diff else p["driver"]["r_ohm"])
-        zl = term if term else 1.0 / (1j * 2 * np.pi * f * p["load_pf"] * 1e-12)
-        t, v, dt = step_response(M, f, rs, zl, rise, 5.0)
-        vfin = term / (rs + term) if term else 1.0
-        m = metrics(t, v, rise, vfin)
-        S = abcd_to_s(M, z_ref)
-        nyq = cfg.class_param(cls, "nyquist_ghz", 1.0) * 1e9
-        iq = int(np.argmin(abs(f - nyq)))
-        row = {"net": name + ("/" + neg if diff else ""), "from": path["from"], "to": path["to"], "length_mm": path["length_mm"],
-               "elements": len(merge_lines(path["elements"])), "vias": sum(1 for e in path["elements"] if e[0] == "via"),
-               "rise_ps": rise, "driver_ohm": rs, "term_ohm": term, **m,
-               "IL_nyq_db": round(20 * math.log10(abs(S["S21"][iq])), 3), "RL_nyq_db": round(20 * math.log10(abs(S["S11"][iq]) + 1e-12), 2)}
-        if m["overshoot_pct"] > 10 and not term:
-            row["suggest"] = f"series R ~ {max(0, lib.get(*first_line(path), gap)['Z'] - rs):.0f} ohm at the driver"
-        rows.append(row)
-        fn = safe_name(name)  # hierarchical KiCad nets: "/sheet/NET"
-        row["files"] = f"nets/{fn}.sp, nets/{fn}.s2p"
-        with open(os.path.join(sdir, f"{fn}.sp"), "w") as fh:
-            fh.write(f"* openpcbsi G2: {name}{' (differential, odd-mode equivalent)' if diff else ''} {path['from']} -> {path['to']}\n")
-            fh.write(f".subckt {fn} n0 n{nn}\n" + "\n".join(spice) + "\n.ends\n")
-        write_touchstone(os.path.join(sdir, f"{fn}.s2p"), f, S, z_ref)
+        for path in paths:
+            _one(ctx, lib, cfg, p, path, f, gap, vias, diff, name, neg if diff else None, rows, sdir, len(paths) > 1)
     for r in rows[:6]:
         if "problem" in r:
             continue
@@ -333,7 +525,40 @@ def run(ctx, cache_dir, out_dir, log=print, vias=None):
     # G7 channels
     if cfg["channels"]:
         out["channels"] = [channel(ctx, lib, name, ch, vias, log) for name, ch in cfg["channels"].items()]
+    from . import judge
+    out["findings"] = judge.si(out, cfg)
     return out
+
+
+def _one(ctx, lib, cfg, p, path, f, gap, vias, diff, name, neg, rows, sdir, multi):
+    """Linear SI and files for one driver-receiver path."""
+    b = ctx.b
+    M, spice, nn = net_abcd(ctx, lib, path, f, gap, vias)
+    cls = cfg.class_of(name)
+    rise = cfg.class_param(cls, "rise_ps", p["driver"]["rise_ps"])
+    z_ref = 100.0 if diff else 50.0
+    term = cfg.class_param(cls, "term_ohm", z_ref)       # LVDS / GTH: internal 100 ohm diff / 50 ohm
+    rs = cfg.class_param(cls, "driver_r_ohm", z_ref if diff else p["driver"]["r_ohm"])
+    zl = term if term else 1.0 / (1j * 2 * np.pi * f * p["load_pf"] * 1e-12)
+    t, v, dt = step_response(M, f, rs, zl, rise, 5.0)
+    vfin = term / (rs + term) if term else 1.0
+    m = metrics(t, v, rise, vfin)
+    S = abcd_to_s(M, z_ref)
+    nyq = cfg.class_param(cls, "nyquist_ghz", 1.0) * 1e9
+    iq = int(np.argmin(abs(f - nyq)))
+    row = {"net": name + ("/" + neg if diff else ""), "from": path["from"], "to": path["to"], "length_mm": path["length_mm"],
+           "elements": len(merge_lines(path["elements"])), "vias": sum(1 for e in path["elements"] if e[0] == "via"),
+           "rise_ps": rise, "driver_ohm": rs, "term_ohm": term, **m,
+           "IL_nyq_db": round(20 * math.log10(abs(S["S21"][iq])), 3), "RL_nyq_db": round(20 * math.log10(abs(S["S11"][iq]) + 1e-12), 2)}
+    if m["overshoot_pct"] > 10 and not term:
+        row["suggest"] = f"series R ~ {max(0, lib.get(*first_line(path), gap)['Z'] - rs):.0f} ohm at the driver"
+    rows.append(row)
+    fn = safe_name(name) + (f"_to_{safe_name(path['to'])}" if multi else "")  # hierarchical KiCad nets: "/sheet/NET"
+    row["files"] = f"nets/{fn}.sp, nets/{fn}.s2p"
+    with open(os.path.join(sdir, f"{fn}.sp"), "w") as fh:
+        fh.write(f"* openpcbsi G2: {name}{' (differential, odd-mode equivalent)' if diff else ''} {path['from']} -> {path['to']}\n")
+        fh.write(f".subckt {fn} n0 n{nn}\n" + "\n".join(spice) + "\n.ends\n")
+    write_touchstone(os.path.join(sdir, f"{fn}.s2p"), f, S, z_ref)
 
 
 def first_line(path):
@@ -401,7 +626,7 @@ def channel(ctx, lib, name, ch, vias_rep, log=print):
     rl = 20 * np.log10(np.abs(S["S11"]) + 1e-15)
     br = ch["bitrate_gbps"] * 1e9
     nyq = br / 2
-    res = {"channel": name, "path": descr, "bitrate_gbps": ch["bitrate_gbps"],
+    res = {"channel": name, "nets": [x for x in ch["path"] if not str(x).startswith("cap:")], "path": descr, "bitrate_gbps": ch["bitrate_gbps"],
            "IL_nyq_db": round(float(np.interp(nyq, f, il)), 3), "masks": []}
     m = ch.get("masks", {})
     if "sdd11_db" in m:

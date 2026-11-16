@@ -44,6 +44,10 @@ DEFAULTS = {
         "power_overlap": {"enabled": True, "max_dielectric_mm": 0.2, "min_area_mm2": 1.0},
         "stubs": {"enabled": True, "classes": [], "max_stub_mm": 2.0, "dangling_min_mm": 0.05},
         "thermal_vias": {"enabled": True, "parts": []},
+        # #23 board-wide stitching map; #27 return path where there is no plane
+        "stitching_map": {"enabled": True, "cell_mm": 0.25, "p90_mm": 5.0, "void_mm": 2.0, "void_warn_mm2": 100.0},
+        "return_proximity": {"enabled": True, "classes": [], "max_mm": 1.0, "min_len_mm": 1.0},
+        "breakout": {"enabled": True, "classes": [], "neck_min_mm": 0.5},       # #24
     },
     "xsec": {
         "res_um": 5.0,
@@ -53,6 +57,9 @@ DEFAULTS = {
         "freqs_ghz": [0.1, 1.0, 5.0, 10.0],
         "er_ref_ghz": 1.0,            # frequency at which the stackup er / tand are quoted
         "fab": [],                    # [{layer, w, gap, z}] fabricator figures for comparison
+        # #7: manufacturing corners for judged geometries: width +/- 2 x etch (gap the other way),
+        # dielectric thickness +/- %, er +/- %
+        "corners": {"etch_um": 20.0, "thickness_pct": 10.0, "er_pct": 5.0},
     },
     "rails": {},
     "pdn": {"cell_mm": 0.5, "fmin_hz": 1e5, "fmax_hz": 1e9, "points": 120,
@@ -80,6 +87,7 @@ class Config:
     def __init__(self, data=None, path=None):
         self.path = path
         self.detected = None
+        self.project = None
         self.data = deep_merge(DEFAULTS, data or {})
 
     @classmethod

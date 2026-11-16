@@ -26,7 +26,7 @@ import numpy as np
 from .pdn import esr_default, package_of, parse_value
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEPS = os.path.join(ROOT, "deps")
+DEPS = os.environ.get("OPENPCBSI_DEPS") or os.path.join(ROOT, "deps")
 VENV_PY = os.path.join(DEPS, "kipi-venv", "bin", "python")
 DRIVER = os.path.join(DEPS, "kipi_driver.py")
 
@@ -334,13 +334,32 @@ def run(ctx, mode, out_dir, cache_dir, log=print, ac_rails=None):
     jp = os.path.join(out_dir, "kipi_job.json")
     with open(jp, "w") as f:
         json.dump(job, f, indent=1)
-    env = dict(os.environ, KIPI_HOME=os.path.join(DEPS, "kipi-home"), MPLCONFIGDIR=os.path.join(DEPS, "kipi-home", "mpl"),
-               OPENBLAS_NUM_THREADS=os.environ.get("OPENBLAS_NUM_THREADS", "4"), QT_QPA_PLATFORM="offscreen")
-    p = subprocess.run([VENV_PY, "-I", DRIVER, jp], env=env, capture_output=True, text=True)
-    with open(os.path.join(out_dir, "kipi_driver.log"), "w") as f:
-        f.write(p.stdout + "\n" + p.stderr)
-    if p.returncode != 0 or not os.path.exists(job["out"]):
-        raise RuntimeError(f"KiPI driver failed (exit {p.returncode}); see {out_dir}/kipi_driver.log\n{p.stderr[-2000:]}")
+    # #30: a KiPI result is reused when the board, the setup and the job are unchanged
+    import hashlib
+    import shutil
+    key = hashlib.sha256(json.dumps({"sha": ctx.b.sha, "setup": setup, "mode": mode, "ac": job["ac_rails"],
+                                     "gnd": tree.gnd, "lock": lock()}, sort_keys=True, default=str).encode()).hexdigest()[:20]
+    rc_dir = os.path.join(cache_dir, "kipi_results")
+    os.makedirs(rc_dir, exist_ok=True)
+    cached = os.path.join(rc_dir, key + ".json")
+    if os.path.exists(cached):
+        shutil.copy(cached, job["out"])
+        log(f"  KiPI result reused from the cache ({key}): board, setup and job unchanged")
+    else:
+        from . import jobs
+        with jobs.slot("kipi", log) as threads:
+            env = dict(os.environ, KIPI_HOME=os.path.join(DEPS, "kipi-home"), MPLCONFIGDIR=os.path.join(DEPS, "kipi-home", "mpl"),
+                       OPENBLAS_NUM_THREADS=os.environ.get("OPENBLAS_NUM_THREADS", str(min(threads, 8))),
+                       OMP_NUM_THREADS=str(threads), QT_QPA_PLATFORM="offscreen")
+            p = subprocess.run([VENV_PY, "-I", DRIVER, jp], env=env, capture_output=True, text=True)
+        with open(os.path.join(out_dir, "kipi_driver.log"), "w") as f:
+            f.write(p.stdout + "\n" + p.stderr)
+        if p.returncode != 0 or not os.path.exists(job["out"]):
+            raise RuntimeError(f"KiPI driver failed (exit {p.returncode}); see {out_dir}/kipi_driver.log\n{p.stderr[-2000:]}")
+        r0 = json.load(open(job["out"]))
+        if not r0.get("errors"):
+            shutil.copy(job["out"], cached + f".{os.getpid()}.tmp")
+            os.replace(cached + f".{os.getpid()}.tmp", cached)
     res = json.load(open(job["out"]))
     for line in res["log"]:
         log(f"  {line}")

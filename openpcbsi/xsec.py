@@ -283,6 +283,42 @@ def build_section(stack, layer, ref_layers, widths, gaps, cfg_xsec, mask_er=3.8)
 
 
 def solve_lines(sec, res_um=5.0, freqs_hz=(1e9,), rough_um=0.0, sigma=SIGMA_CU):
+    """Line parameters for 1 or 2 conductors at each frequency. Results are cached on disk by a hash of
+    the section and the settings (#30: an unchanged geometry is never solved twice)."""
+    import hashlib
+    import json
+    import os
+    key = json.dumps({"v": SOLVER_CACHE_VERSION, "slabs": sec.slabs, "planes": sec.planes, "cond": sec.conductors,
+                      "mask": sec.mask, "air": sec.air_above, "res": res_um, "f": list(freqs_hz), "rough": rough_um,
+                      "sigma": sigma}, sort_keys=True, default=str)
+    h = hashlib.sha256(key.encode()).hexdigest()[:24]
+    try:
+        from .run import CACHE
+        cdir = os.path.join(CACHE, "xsec")
+    except Exception:
+        cdir = None
+    if cdir:
+        cp = os.path.join(cdir, h + ".json")
+        if os.path.exists(cp):
+            try:
+                return json.load(open(cp))
+            except ValueError:
+                pass
+    out = _solve_lines(sec, res_um, freqs_hz, rough_um, sigma)
+    if cdir:
+        os.makedirs(cdir, exist_ok=True)
+        tmp = f"{cp}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(out, f, default=lambda o: o.tolist() if hasattr(o, "tolist") else float(o))
+        os.replace(tmp, cp)
+        out = json.load(open(cp))           # the same types whether cached or not
+    return out
+
+
+SOLVER_CACHE_VERSION = 1
+
+
+def _solve_lines(sec, res_um=5.0, freqs_hz=(1e9,), rough_um=0.0, sigma=SIGMA_CU):
     """Line parameters for 1 or 2 conductors at each frequency."""
     solver = Solver(sec, res_um)
     C0m = solver.capacitance(None).real

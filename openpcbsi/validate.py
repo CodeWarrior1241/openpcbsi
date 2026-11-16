@@ -7,7 +7,7 @@ import time
 
 from . import xsec
 
-SOLVER_VERSIONS = {"xsec2d": "xsec-1", "pdn": "pdn-1", "dc": "dc-1", "thermal": "th-1", "si": "si-1"}
+SOLVER_VERSIONS = {"xsec2d": "xsec-1", "pdn": "pdn-1", "dc": "dc-1", "thermal": "th-1", "si": "si-1", "em3d": "em3d-1"}
 
 
 def _case(name, solver, value, ref, tol_pct, unit, source):
@@ -108,6 +108,69 @@ def register(cache_dir, solver, cases):
 
 def _save(path, db):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".tmp", "w") as f:
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(db, f, indent=1)
-    os.replace(path + ".tmp", path)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------------------------------------
+def run3d(cache_dir, runs_dir, log=print):
+    """#20: the openEMS cases that must pass before any 3D region counts (G8 / FS1-FS3):
+    calibration line (3D within 2 % of 2D), coupled pair (Zodd and Zeven within 2 % of 2D), and a
+    symmetric via transition (Scd21 below -40 dB: catches P/N sign errors and asymmetric meshes).
+    Minutes each; results are cached by model hash."""
+    import os
+    from . import boardgen, region3d, run as runmod
+    d = os.path.join(cache_dir, "validate3d")
+    os.makedirs(d, exist_ok=True)
+    cases = []
+    # calibration line
+    p = os.path.join(d, "line.kicad_pcb")
+    b = boardgen.Board(p, layers=4, size=(30, 16))
+    b.plane("In1.Cu", "GND"); b.plane("In2.Cu", "GND")
+    b.track("F.Cu", [(3, 8), (27, 8)], 0.22, "LINE0")
+    b.save()
+    _, _, ctx = runmod.load(p)
+    r = region3d.run(ctx, {"name": "val_line", "nets": ["LINE0"], "box": [8, 3, 22, 13], "fmax_ghz": 10}, cache_dir, runs_dir, log)
+    ag = r.get("calibration", {}).get("agree_pct")
+    cases.append({"case": "calibration line (0.22 mm microstrip, 3D vs 2D)", "pass": ag is not None and abs(ag) <= 2.0
+                  and r.get("convergence", {}).get("converged") is True, "value": r.get("z_line_ohm"), "reference": r.get("z_2d_ohm"),
+                  "note": r.get("convergence", {}).get("reason")})
+    # coupled pair, odd and even
+    p = os.path.join(d, "pair.kicad_pcb")
+    b = boardgen.Board(p, layers=4, size=(30, 16))
+    b.plane("In1.Cu", "GND"); b.plane("In2.Cu", "GND")
+    b.pair("F.Cu", "LANE0_TX", 3, 27, 8, ends=False)
+    b.save()
+    _, _, ctx = runmod.load(p)
+    ro = region3d.run(ctx, {"name": "val_pair_odd", "nets": ["LANE0_TX_P", "LANE0_TX_N"], "box": [8, 3, 22, 13], "fmax_ghz": 10}, cache_dir, runs_dir, log)
+    re_ = region3d.run(ctx, {"name": "val_pair_even", "nets": ["LANE0_TX_P", "LANE0_TX_N"], "box": [8, 3, 22, 13], "fmax_ghz": 10,
+                             "excite_mode": "common"}, cache_dir, runs_dir, log)
+    zo = (ro.get("z_line_ohm") or 0) / 2
+    ze = (re_.get("z_line_ohm") or 0) * 2
+    zo2, ze2 = ro.get("z_odd_2d"), ro.get("z_even_2d")
+    okp = bool(zo2 and ze2 and abs(zo - zo2) / zo2 <= 0.02 and abs(ze - ze2) / ze2 <= 0.02)
+    cases.append({"case": "coupled pair (Zodd, Zeven 3D vs 2D)", "pass": okp, "value": [round(zo, 2), round(ze, 2)],
+                  "reference": [zo2, ze2], "note": f"{ro.get('convergence', {}).get('reason')}; {re_.get('convergence', {}).get('reason')}"})
+    # symmetric via transition F.Cu -> B.Cu
+    p = os.path.join(d, "via.kicad_pcb")
+    b = boardgen.Board(p, layers=4, size=(30, 16))
+    b.plane("In1.Cu", "GND"); b.plane("In2.Cu", "GND")
+    for sfx, y in (("_P", 7.6), ("_N", 8.4)):
+        b.track("F.Cu", [(3, y), (15, y)], 0.12, "LANE0_TX" + sfx)
+        b.via(15, y, "LANE0_TX" + sfx, drill=0.2, size=0.4)
+        b.track("B.Cu", [(15, y), (27, y)], 0.12, "LANE0_TX" + sfx)
+    for y in (6.6, 9.4):
+        b.via(15, y, "GND", drill=0.2, size=0.4)
+    b.save()
+    _, _, ctx = runmod.load(p)
+    rv = region3d.run(ctx, {"name": "val_via", "nets": ["LANE0_TX_P", "LANE0_TX_N"], "box": [10, 3, 20, 13], "fmax_ghz": 10}, cache_dir, runs_dir, log)
+    sc = max(rv.get("Scd21_db") or [0.0])
+    cases.append({"case": "symmetric via (Scd21 below -40 dB)", "pass": sc < -40.0 and rv.get("convergence", {}).get("converged") is True,
+                  "value": round(sc, 1), "reference": -40.0, "note": rv.get("convergence", {}).get("reason")})
+    for c in cases:
+        log(f"  [{'PASS' if c['pass'] else 'FAIL'}] {c['case']:50s} {c['value']} vs {c['reference']}  ({c['note']})")
+    register(cache_dir, "em3d", [{"solver": "em3d", "case": c["case"], "pass": c["pass"], "value": 0.0, "reference": 0.0,
+                                  "error_pct": 0.0} for c in cases])
+    return cases

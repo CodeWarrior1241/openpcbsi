@@ -230,6 +230,11 @@ def rule_via_stub(ctx):
             if not conn:
                 continue
             top, bot = int(b.vias["top"][k]), int(b.vias["bot"][k])
+            bd = (b.snap["vias"][k].get("backdrill") or {}) if k < len(b.snap["vias"]) else {}
+            if bd.get("bottom_to") in b.L:          # #26: back-drilled from the bottom up to that layer
+                bot = min(bot, b.L[bd["bottom_to"]])
+            if bd.get("top_to") in b.L:
+                top = max(top, b.L[bd["top_to"]])
             lo, hi = min(conn), max(conn)
             stub_top = st.barrel(b.layers[top], b.layers[lo]) if lo > top else 0.0
             stub_bot = st.barrel(b.layers[hi], b.layers[bot]) if bot > hi else 0.0
@@ -238,6 +243,7 @@ def rule_via_stub(ctx):
             f = C0 / (4 * L * 1e-3 * math.sqrt(er)) / 1e9 if L > 0 else math.inf
             rows.append({"x": round(b.vias["x"][k], 3), "y": round(b.vias["y"][k], 3),
                          "layers": [b.layers[i] for i in sorted(conn)], "stub_mm": round(L, 4),
+                         "backdrilled": bool(bd),
                          "f_res_ghz": round(f, 2) if math.isfinite(f) else None})
             if nyq and f < p["factor"] * nyq:
                 area = ctx.area_name(ctx.area_at([b.vias["x"][k]], [b.vias["y"][k]])[0])
@@ -311,8 +317,8 @@ def rule_stitching(ctx):
                                  f"board edge: {gaps[j]:.1f} mm without a stitching via within {p['edge_band_mm']} mm",
                                  "", "edge", ex[i], ey[i], value=gaps[j], limit=p["board_edge_gap_mm"], unit="mm"))
         edge_gaps.append(float(gaps.max()))
-    metrics["_board_edge"] = {"max_edge_gap_mm": round(max(edge_gaps), 2) if edge_gaps else None,
-                              "stitching_vias": int(stitch.sum())}
+    if edge_gaps:                       # only when an edge stretch was measured (no planes: nothing to check)
+        metrics["_board_edge"] = {"max_edge_gap_mm": round(max(edge_gaps), 2), "stitching_vias": int(stitch.sum())}
     return result("stitching", "PC9", "Ground stitching along corridors and the board edge", p, metrics, finds)
 
 
@@ -406,6 +412,8 @@ def rule_pair_coupling(ctx):
             continue
         done |= {net, other}
         pos, neg = sorted([net, other])
+        lim, lim_src = ctx.limit("pair_coupling", "limit_mm", pos)
+        max_gap, _ = ctx.limit("pair_coupling", "max_gap_mm", pos)
         lp = float(T["len"][b.tracks_of(pos)].sum())
         ln = float(T["len"][b.tracks_of(neg)].sum())
         unc_out = unc_in = 0.0
@@ -426,7 +434,7 @@ def rule_pair_coupling(ctx):
                     d = edt[np.clip(ii - i0, 0, i1 - i0 - 1), np.clip(jj - j0, 0, j1 - j0 - 1)]
                 gap = d - w / 2 - g.res / 2     # cell centre to nearest partner cell centre
                 area = ctx.area_at(x, y)
-                bad = gap > p["max_gap_mm"]
+                bad = gap > max_gap
                 unc_out += float(dl[bad & (area == 0)].sum())
                 unc_in += float(dl[bad & (area != 0)].sum())
                 good = ~bad & (area == 0)
@@ -436,7 +444,7 @@ def rule_pair_coupling(ctx):
                 for a0, a1 in runs(bad & (area == 0)):
                     L = float(dl[a0:a1].sum())
                     if L >= 0.2:
-                        finds.append(finding("pair_coupling", "info", f"{L:.2f} mm uncoupled (gap > {p['max_gap_mm']} mm)",
+                        finds.append(finding("pair_coupling", "info", f"{L:.2f} mm uncoupled (gap > {max_gap} mm)",
                                              pos, b.layers[li], x[a0], y[a0], x[a1 - 1], y[a1 - 1], L, unit="mm"))
         gl = np.concatenate(gaps) if gaps else np.zeros(0)
         key = f"{pos}/{neg}"
@@ -444,9 +452,10 @@ def rule_pair_coupling(ctx):
                         "uncoupled_mm": round(unc_out, 3), "uncoupled_in_areas_mm": round(unc_in, 3),
                         "gap_median_mm": round(float(np.median(gl)), 4) if len(gl) else None,
                         "gap_by_layer": {k: round(float(np.median(np.concatenate(v))), 4) for k, v in per_layer.items()}}
-        if unc_out > p["limit_mm"]:
-            finds.append(finding("pair_coupling", "error", f"{unc_out:.2f} mm uncoupled outside the fields",
-                                 pos, "", value=unc_out, limit=p["limit_mm"], unit="mm"))
+        metrics[key]["limit_mm"], metrics[key]["limit_source"] = lim, lim_src
+        if unc_out > lim:
+            finds.append(finding("pair_coupling", "error", f"{unc_out:.2f} mm uncoupled outside the fields (limit {lim:g} mm, {lim_src})",
+                                 pos, "", value=unc_out, limit=lim, unit="mm", limit_source=lim_src))
     return result("pair_coupling", "PC6", "Pair coupling along the length (P-to-N gap)", p, metrics, finds)
 
 
@@ -844,10 +853,16 @@ RULES = [
 ]
 
 
+def _rules2():
+    from . import rules2
+    return [("stitching_map", rules2.stitching_map), ("return_proximity", rules2.return_proximity),
+            ("breakout", rules2.breakout)]
+
+
 def run(ctx, only=None, log=print):
     import time
     out = []
-    for name, fn in RULES:
+    for name, fn in RULES + _rules2():
         if only and name not in only:
             continue
         if not ctx.cfg["rules"][name].get("enabled", True):

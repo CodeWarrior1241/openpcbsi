@@ -49,4 +49,10 @@ def run(ctx, report, log=print):
         log(f"  board edge: longest stretch without a stitching via {edge_gap} mm")
     return {"rule": "emc", "spec": "G14", "title": "EMC estimate (ranked radiators, rule of thumb)", "validation": "rule-based",
             "rows": rows[:60], "metrics": {f"{i:02d} {r['source'][:40]}": {"score": r["score"]} for i, r in enumerate(rows[:30])},
-            "findings": [], "summary": {"radiators": len(rows)}, "note": __doc__.split("\n\n")[-1].strip()}
+            "edge_gap_mm": edge_gap,
+            "findings": _judge(rows, edge_gap, cfg), "summary": {"radiators": len(rows)}, "note": __doc__.split("\n\n")[-1].strip()}
+
+
+def _judge(rows, edge_gap, cfg):
+    from . import judge
+    return judge.emc({"rows": rows, "edge_gap_mm": edge_gap}, cfg)

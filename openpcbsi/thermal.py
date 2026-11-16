@@ -153,8 +153,9 @@ def run(ctx, cache_dir, out_dir, log=print, dc=None):
     for ref, spec, l, m in parts:
         tb = float(np.nanmax(T[l][m]))
         tj = tb + spec["power_w"] * spec.get("theta_jb", 0.0)
+        fp = b.fps.get(ref, {})
         rows.append({"ref": ref, "power_w": spec["power_w"], "T_board_c": round(tb, 1),
-                     "theta_jb": spec.get("theta_jb"), "Tj_est_c": round(tj, 1)})
+                     "theta_jb": spec.get("theta_jb"), "Tj_est_c": round(tj, 1), "x": fp.get("x"), "y": fp.get("y")})
         log(f"  {ref:5s} {spec['power_w']:5.2f} W  board under part {tb:6.1f} C  Tj ~ {tj:6.1f} C")
     tot = float(heat.sum())
     log(f"  total {tot:.2f} W (of which I^2R of the rails {joule:.3f} W); board max {np.nanmax(T):.1f} C, "
@@ -169,7 +170,12 @@ def run(ctx, cache_dir, out_dir, log=print, dc=None):
             "params": p, "parts": rows, "total_w": round(tot, 3), "joule_w": round(joule, 4),
             "T_max_c": round(float(np.nanmax(T)), 2), "T_mean_top_c": round(float(np.nanmean(T[0])), 2),
             "image": img, "metrics": {r["ref"]: {"Tj_est_c": r["Tj_est_c"], "T_board_c": r["T_board_c"]} for r in rows},
-            "findings": [], "summary": {"T_max_c": round(float(np.nanmax(T)), 1)}}
+            "findings": _judge(rows, ctx), "summary": {"T_max_c": round(float(np.nanmax(T)), 1)}}
+
+
+def _judge(rows, ctx):
+    from . import judge
+    return judge.thermal(rows, ctx.cfg, lambda ref: ctx.b.fps.get(ref, {}).get("fields", {}))
 
 
 def _status(cache_dir):
