@@ -1,4 +1,4 @@
-"""openpcbsi acceptance tests: one or more per gap item (#1-#36). Each test builds its own boards with a
+"""openpcbsi acceptance tests: one or more per gap item (#1-#36) and per manufacturing check (#37-#41). Each test builds its own boards with a
 known answer (tests/harness/boards.py), runs openpcbsi as a user would, and compares with an oracle:
 the planted defect, a closed-form result, an independent solver, or a physics invariant.
 
@@ -905,6 +905,145 @@ def t36_pkg():
     need(p.returncode == 0, f"installed command failed: {p.stderr[-300:]}")
     need(glob.glob(os.path.join(cache, "snapshot_*")), "OPENPCBSI_CACHE not used")
     return blocked("Linux install works; Windows and macOS need CI runners")
+
+
+# =================================================================================================
+# G. Manufacturing sign-off (`openpcbsi dfm`, REQUIREMENTS 5.17)
+# =================================================================================================
+def dfm(board, *args, out=None, timeout=1800):
+    out = out or os.path.join(os.path.dirname(board), "dfm")
+    if os.path.isdir(out):
+        shutil.rmtree(out)
+    rc, so, se, dt = run(["dfm", board, "-o", out, "--no-markers"] + list(args), timeout=timeout)
+    return {"rc": rc, "out": so, "err": se, "ev": _load(os.path.join(out, "dfm.json")), "dir": out, "seconds": dt}
+
+
+def _at(fs, x, y, tol=0.4):
+    return [f for f in fs if f["x"] is not None and math.hypot(f["x"] - x, f["y"] - y) <= tol]
+
+
+def _rule(ev, name):
+    return next(r for r in ev["rules"] if r["rule"] == name)
+
+
+@case(37, "Acid traps and same-net gaps: a planted 45 deg pad exit and a 0.15 mm gap are found and measured; waivers apply")
+def t37_etch():
+    d = out_dir("t37")
+    r = dfm(boards.acid_board(d, "planted"), "--checks", "etch")
+    need(r["ev"], f"no dfm.json: {r['err'][-300:]}")
+    need(r["rc"] == 1, f"exit code {r['rc']}, want 1 (warnings)")
+    trap = _at(ev_findings(r["ev"], "acid_trap", ("warn",)), 11.0, 10.14)
+    need(len(trap) == 1, f"{len(trap)} acid_trap warnings at the planted corner, want 1")
+    need(abs(trap[0]["value"] - 45.0) <= 6.0, f"angle {trap[0]['value']} deg, planted 45")
+    need(len(ev_findings(r["ev"], "acid_trap", ("warn",))) == 1, "acid_trap warnings away from the planted corner")
+    gap = ev_findings(r["ev"], "same_net_gap", ("warn",))
+    need(len(gap) == 1 and abs(gap[0]["value"] - 0.15) <= 0.015, f"same-net gap {[g['value'] for g in gap]}, planted one of 0.15 mm")
+    need(gap[0]["limit"] == 0.25, f"limit {gap[0]['limit']}, want the profile's 0.25 mm")
+    clean = dfm(boards.acid_board(d, "clean", planted=False), "--checks", "etch")
+    need(clean["rc"] == 0 and not ev_findings(clean["ev"], None, ("warn", "fail")),
+         f"clean board: exit {clean['rc']}, {len(ev_findings(clean['ev'], None, ('warn', 'fail')))} findings")
+    w = toml(os.path.join(d, "waivers.toml"), '[[waiver]]\ncheck = "acid_trap"\nnets = ["SIG"]\nreason = "teardrop added at the fab"\n'
+             'reviewer = "test"\n[[waiver]]\nid = "%s"\nreason = "accepted"\nreviewer = "test"\n' % gap[0]["id"])
+    wv = dfm(os.path.join(d, "planted", "planted.kicad_pcb"), "--checks", "etch", "--waivers", w)
+    need(wv["rc"] == 0 and wv["ev"]["counts"]["waived"] == 2, f"waived run: exit {wv['rc']}, {wv['ev']['counts']}")
+    return ok(f"corner {trap[0]['value']:.0f} deg (planted 45), gap {gap[0]['value'] * 1000:.0f} um (planted 150); clean board clean; 2 waived")
+
+
+@case(38, "Solder mask: pad spacing, thin web, merged openings, copper inside and beside an opening are each found")
+def t38_mask():
+    d = out_dir("t38")
+    r = dfm(boards.mask_board(d, "planted"), "--checks", "mask")
+    need(r["ev"] and r["rc"] == 2, f"exit code {r['rc']}, want 2: {r['err'][-300:]}")
+    web = ev_findings(r["ev"], "mask_web")
+    exp = ev_findings(r["ev"], "mask_exposed")
+    want = [("pad spacing", web, 8, "fail", 0.12), ("thin web", web, 16, "fail", 0.07), ("merged openings", web, 24, "warn", None),
+            ("copper inside an opening", exp, 34, "fail", None), ("copper beside an opening", exp, 42, "warn", 0.07)]
+    for what, fs, x, sev, val in want:
+        hit = [f for f in _at(fs, x, 10.0, 0.6) if f["severity"] == sev]
+        need(len(hit) == 1, f"{what}: {len(hit)} {sev} findings at x = {x}, want 1")
+        if val is not None:
+            need(abs(hit[0]["value"] - val) <= 0.012, f"{what}: {hit[0]['value']} mm, planted {val}")
+    need(len(web) == 3 and len(exp) == 2, f"{len(web)} web and {len(exp)} exposure findings, want 3 and 2")
+    clean = dfm(boards.mask_board(d, "clean", planted=False), "--checks", "mask")
+    need(clean["rc"] == 0 and not clean["ev"]["findings"], f"clean board: exit {clean['rc']}, {len(clean['ev']['findings'])} findings")
+    return ok("5 planted defects found with their values; clean board has none")
+
+
+@case(39, "Fabricator profile: limits by layer count, each marked published / assumed / config; another profile changes the verdict")
+def t39_fab():
+    d = out_dir("t39")
+    b4 = boards.fab_board(d, "four", layers=4, w=0.08)
+    r = dfm(b4, "--checks", "track")
+    f = ev_findings(r["ev"], "fab_track", ("fail",))
+    need(r["rc"] == 2 and len(f) == 1 and f[0]["limit"] == 0.09, f"4 layers, 0.08 mm: exit {r['rc']}, limits {[x['limit'] for x in f]}")
+    r2 = dfm(boards.fab_board(d, "two", layers=2, w=0.09), "--checks", "track")
+    f2 = ev_findings(r2["ev"], "fab_track", ("fail",))
+    need(len(f2) == 1 and f2[0]["limit"] == 0.1, f"2 layers, 0.09 mm: limits {[x['limit'] for x in f2]}, want 0.10")
+    r3 = dfm(boards.fab_board(d, "ok", layers=4, w=0.09), "--checks", "track")
+    need(r3["rc"] == 0, f"4 layers, 0.09 mm: exit {r3['rc']}")
+    lim = {x["key"]: x for x in r["ev"]["fab"]["limits"]}
+    need(lim["mask_web_mm"]["source"] == "published" and lim["etch_factor"]["source"] == "assumed",
+         "published / assumed marking is wrong")
+    prof = open(os.path.join(ROOT, "openpcbsi", "fabs", "jlcpcb.toml")).read()
+    other = toml(os.path.join(d, "finefab.toml"), prof.replace('name = "JLCPCB"', 'name = "FineFab"').replace("width_mm = 0.09", "width_mm = 0.075"))
+    r4 = dfm(b4, "--checks", "track", "--fab", other)
+    need(r4["rc"] == 0 and r4["ev"]["fab"]["name"] == "FineFab", f"other profile: exit {r4['rc']}, fab {r4['ev']['fab']['name']}")
+    cfg = toml(os.path.join(d, "cfg.toml"), "[dfm.fab_limits]\ntrack_width_mm = 0.07\n")
+    r5 = dfm(b4, "--checks", "track", "-c", cfg)
+    l5 = {x["key"]: x for x in r5["ev"]["fab"]["limits"]}
+    need(r5["rc"] == 0 and l5["track_width_mm"]["source"] == "config", "a limit set in the board config is not used or not marked")
+    r6 = dfm(b4, "--checks", "track", "--fab", "no_such_fab")
+    need(r6["rc"] == 3 and "Traceback" not in r6["err"], f"unknown profile: exit {r6['rc']}")
+    return ok("0.09 mm (4 layers) and 0.10 mm (2 layers) from the profile; FineFab profile and a config limit pass the same board")
+
+
+@case(40, "Tombstoning: the joint without a via into the planes melts first; a symmetric chip shows no difference; a pad in a pour is flagged")
+def t40_tombstone():
+    d = out_dir("t40")
+    r = dfm(boards.chip_board(d), "--checks", "mask,balance,tombstone")
+    need(r["ev"], f"no dfm.json: {r['err'][-300:]}")
+    t = {x["ref"]: x for x in _rule(r["ev"], "tombstone")["parts"]}
+    need(set(t) == {"C1", "C2", "C3"}, f"chips solved: {sorted(t)}")
+    need(t["C2"]["dt_s"] <= 0.01, f"symmetric chip: {t['C2']['dt_s']} s, want 0")
+    need(t["C1"]["dt_s"] >= 0.1 and t["C1"]["first_net"] == "SIG1", f"C1: {t['C1']['dt_s']} s, first {t['C1']['first_net']}")
+    need(t["C3"]["dt_s"] >= 0.05 and t["C3"]["first_net"] == "SIGC", f"C3: {t['C3']['dt_s']} s, first {t['C3']['first_net']}")
+    bal = {f["refs"][0]: f for f in ev_findings(r["ev"], "pad_balance")}
+    need("C3" in bal and bal["C3"]["severity"] == "warn" and "pour" in bal["C3"]["reason"], "C3 (pad in a pour) is not warned")
+    need("C1" in bal and "via" in bal["C1"]["reason"], "C1 (via into the planes at one pad) is not reported")
+    need("C2" not in bal, "the symmetric chip is reported")
+    cfg = toml(os.path.join(d, "cfg.toml"), "[dfm.tombstone]\ndt_warn_s = 0.1\n")
+    r2 = dfm(os.path.join(d, "chips", "chips.kicad_pcb"), "--checks", "tombstone", "-c", cfg)
+    hit = {f["refs"][0] for f in ev_findings(r2["ev"], "tombstone", ("warn",))}
+    need(hit == {"C1", "C3"}, f"with a 0.1 s limit: warned {sorted(hit)}, want C1 and C3")
+    return ok(f"C1 {t['C1']['dt_s']:.2f} s (track pad first), C3 {t['C3']['dt_s']:.2f} s (track pad first), symmetric C2 {t['C2']['dt_s']:.3f} s")
+
+
+@case(41, "Reflow: closed-form cases pass; a heavy part lags and peaks lower; the profile meets the assembler's reflow temperature")
+def t41_reflow():
+    sys.path.insert(0, ROOT)
+    from openpcbsi import etch, reflow
+    bad = [c["case"] for c in reflow.validation_cases() + etch.validation_cases() if not c["pass"]]
+    need(not bad, f"validation cases fail: {bad}")
+    d = out_dir("t41")
+    b = boards.reflow_board(d)
+    r = dfm(b, "--checks", "reflow")
+    need(r["ev"], f"no dfm.json: {r['err'][-300:]}")
+    rule = _rule(r["ev"], "reflow")
+    p = {x["ref"]: x for x in rule["parts"]}
+    need(abs(rule["summary"]["median_peak_c"] - 240.0) <= 0.6, f"median peak {rule['summary']['median_peak_c']} C, want 240 (standard service)")
+    need(p["U1"]["lag_s"] > p["R1"]["lag_s"] > p["R2"]["lag_s"], f"lag U1 {p['U1']['lag_s']}, R1 {p['R1']['lag_s']}, R2 {p['R2']['lag_s']} s")
+    need(p["U1"]["peak_c"] < p["R1"]["peak_c"] < p["R2"]["peak_c"], "the heavy part does not peak lowest")
+    need(p["U1"]["lag_s"] - p["R2"]["lag_s"] >= 10, "the 3 g part lags a far 0402 by less than 10 s")
+    kinds = {f["refs"][0] for f in ev_findings(r["ev"], "reflow", ("warn",))}
+    need("U1" in kinds and "R2" not in kinds, f"warned parts {sorted(kinds)}: want U1, not R2")
+    cfg = toml(os.path.join(d, "cfg.toml"), '[dfm]\nassembly_service = "economic"\n')
+    r2 = dfm(b, "--checks", "reflow", "-c", cfg)
+    m2 = _rule(r2["ev"], "reflow")["summary"]["median_peak_c"]
+    need(abs(m2 - 255.0) <= 0.6, f"economic service: median peak {m2} C, want 255")
+    chk = {c["check"]: c for c in r["ev"]["checks"]}
+    need(chk["reflow"]["validation"] == "validated", f"reflow validation state: {chk['reflow']['validation']}")
+    return ok(f"lag U1 {p['U1']['lag_s']:.0f} s, R1 {p['R1']['lag_s']:.0f} s, R2 {p['R2']['lag_s']:.0f} s; "
+              f"peak {p['U1']['peak_c']:.0f} / {p['R1']['peak_c']:.0f} / {p['R2']['peak_c']:.0f} C; median 240 and 255 C by service")
 
 
 # =================================================================================================

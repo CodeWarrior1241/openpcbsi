@@ -71,9 +71,9 @@ def raster_rings(grid, rings, out=None, value=True):
     return out
 
 
-def _raster_rings_full(grid, rings):
-    ny, nx = grid.shape
-    out = np.zeros((ny, nx), dtype=bool)
+def ring_segments(rings):
+    """(N, 4) array x1, y1, x2, y2 of the closed rings' edges (built once for polygons that are
+    rasterised into many windows)."""
     segs = []
     for r in rings:
         a = np.asarray(r, dtype=float)
@@ -81,9 +81,29 @@ def _raster_rings_full(grid, rings):
             continue
         b = np.roll(a, -1, axis=0)
         segs.append(np.hstack([a, b]))
-    if not segs:
+    return np.vstack(segs) if segs else np.zeros((0, 4))
+
+
+def raster_segs(grid, segs):
+    """Even-odd fill of the polygons whose edges are `segs` (ring_segments) on a grid that may cover
+    only a window of them: edges outside the window's rows are dropped, crossings left of it count."""
+    if not len(segs):
+        return np.zeros(grid.shape, dtype=bool)
+    ylo = np.minimum(segs[:, 1], segs[:, 3])
+    yhi = np.maximum(segs[:, 1], segs[:, 3])
+    keep = (yhi >= grid.y0) & (ylo <= grid.y0 + grid.ny * grid.res)
+    return _raster_segs_full(grid, segs[keep])
+
+
+def _raster_rings_full(grid, rings):
+    return _raster_segs_full(grid, ring_segments(rings))
+
+
+def _raster_segs_full(grid, s):
+    ny, nx = grid.shape
+    out = np.zeros((ny, nx), dtype=bool)
+    if not len(s):
         return out
-    s = np.vstack(segs)
     x1, y1, x2, y2 = s.T
     # rows whose centre lies in [min(y), max(y))
     fy1 = (y1 - grid.y0) / grid.res - 0.5
@@ -250,3 +270,33 @@ def cluster(xs, ys, tol=0.005):
             if ri != rj:
                 parent[ri] = rj
     return np.array([find(i) for i in range(n)])
+
+
+def window_grid(x0, y0, x1, y1, res):
+    """A grid over exactly [x0, x1] x [y0, y1] (not snapped to multiples of res, unlike Grid())."""
+    g = Grid.__new__(Grid)
+    g.res, g.x0, g.y0 = float(res), float(x0), float(y0)
+    g.nx = max(1, int(math.ceil((x1 - x0) / res)))
+    g.ny = max(1, int(math.ceil((y1 - y0) / res)))
+    return g
+
+
+def rings_distance(a_rings, b_rings):
+    """Distance between two polygons given as ring lists; 0 if they touch or overlap."""
+    A = [np.asarray(r, dtype=float) for r in a_rings if len(r) >= 3]
+    B = [np.asarray(r, dtype=float) for r in b_rings if len(r) >= 3]
+    if not A or not B:
+        return float("inf")
+    pa, pb = np.vstack(A), np.vstack(B)
+    if points_in_rings(pa[:, 0], pa[:, 1], B).any() or points_in_rings(pb[:, 0], pb[:, 1], A).any():
+        return 0.0
+    sa, sb = ring_segments(A), ring_segments(B)
+
+    def pts_to_segs(P, S):
+        px, py = P[:, 0][:, None], P[:, 1][:, None]
+        x1, y1, x2, y2 = S[:, 0][None], S[:, 1][None], S[:, 2][None], S[:, 3][None]
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        t = np.clip(((px - x1) * dx + (py - y1) * dy) / np.where(L2 == 0, 1, L2), 0, 1)
+        return float(np.hypot(px - (x1 + t * dx), py - (y1 + t * dy)).min())
+    return min(pts_to_segs(pa, sb), pts_to_segs(pb, sa))

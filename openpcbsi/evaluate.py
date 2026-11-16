@@ -29,7 +29,7 @@ SEV = {"error": "fail", "warning": "warn", "info": "info", "fail": "fail", "warn
 ORDER = {"fail": 6, "warn": 5, "pending": 4.5, "unvalidated": 4, "not judged": 3, "assumed inputs": 2, "nothing to check": 1,
          "not run": 1, "not built": 1, "pass": 0}
 NOT_REAL = ("not built", "not run", "nothing to check")
-FAMILY_ORDER = ["G1", "RP", "SD", "SI", "TH", "EMC", "EV", "PL", "FS"]
+FAMILY_ORDER = ["G1", "RP", "SD", "SI", "TH", "EMC", "EV", "PL", "FS", "MF"]
 
 # G1 rule key -> (family, requirement) as REQUIREMENTS 5.13 names them; the rest stay G1
 RULE_FAMILY = {
@@ -39,6 +39,9 @@ RULE_FAMILY = {
     "return_proximity": ("RP", "RP (no plane)"), "breakout": ("SI", "breakout"),
     "unreferenced": ("G1", "G1"), "edge_distance": ("G1", "PC8"), "decap": ("G1", "PC11"),
     "thermal_vias": ("G1", "PC13"), "power_overlap": ("G1", "G1"), "stubs": ("G1", "G1"),
+    # manufacturing family (5.17): run by `openpcbsi dfm`, scored with the same model
+    "acid_trap": ("MF", "MF1"), "same_net_gap": ("MF", "MF2"), "fab_track": ("MF", "MF3"), "mask_web": ("MF", "MF4"),
+    "mask_exposed": ("MF", "MF5"), "pad_balance": ("MF", "MF6"), "reflow": ("MF", "MF7"), "tombstone": ("MF", "MF8"),
 }
 CHECK_FAMILY = {
     "impedance": ("SI", "G6"), "crosstalk": ("SI", "G4"), "si": ("SI", "G2/G3/G7"), "vias": ("SI", "G9"),
@@ -55,7 +58,7 @@ NOT_BUILT = [
 ]
 FAMILY_TITLE = {"G1": "Electrical rules (G1)", "RP": "Return path and grounding (RP)", "SD": "Supply delivery (SD)",
                 "SI": "Signal integrity (G2-G9)", "TH": "Thermal (G13)", "EMC": "EMC (G14)", "EV": "Process (EV)",
-                "PL": "Placement (PL)", "FS": "Field-solver gates (FS)"}
+                "PL": "Placement (PL)", "FS": "Field-solver gates (FS)", "MF": "Manufacturing (MF)"}
 
 
 # ------------------------------------------------------------------------------------------------
@@ -90,6 +93,14 @@ HINTS = {   # #31: a first fix for each geometric finding (advice, not a constra
     "impedance": "adjust width/gap for {target} ohm: `openpcbsi plan BOARD --layer {layer} --zdiff {target}`",
     "thermal": "spread the heat: thermal vias and copper under the part, airflow or a heatsink; check the dissipation",
     "vias": "change the antipad or the return-via spacing; model it in 3D before relying on the closed form",
+    "acid_trap": "meet the copper at 90 degrees or more: enter the pad square-on, or add a teardrop or fillet at the corner",
+    "same_net_gap": "close the gap with copper or widen it to at least {limit} mm",
+    "fab_track": "widen the track to at least {limit} mm, or choose a process of the fabricator that makes this width",
+    "mask_web": "increase the pad spacing or reduce the mask expansion so that a web of the minimum width remains",
+    "mask_exposed": "move the neighbouring copper away from the mask opening, or reduce the mask expansion",
+    "pad_balance": "connect both pads with tracks of similar width; give a pad in a pour a thermal relief; move a via out of the pad",
+    "reflow": "check the part's mass in [reflow.parts]; a heavy part next to small ones needs a longer soak or a different position",
+    "tombstone": "balance the copper at the two pads (see pad_balance for this part), or move the part off the edge of the pour",
 }
 
 

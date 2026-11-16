@@ -17,3 +17,6 @@ openpcbsi = "openpcbsi.__main__:main"
 
 [tool.setuptools]
 packages = ["openpcbsi"]
+
+[tool.setuptools.package-data]
+openpcbsi = ["fabs/*.toml"]

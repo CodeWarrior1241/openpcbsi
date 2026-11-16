@@ -18,26 +18,74 @@ from .validate import register
 K_CU, K_FR4_IN, K_FR4_THRU = 390.0, 0.8, 0.3
 
 
-def build(ctx, cell_mm):
+RHOC_CU, RHOC_FR4 = 3.45e6, 2.1e6     # volumetric heat capacity, J/m3K (copper; FR-4 laminate)
+
+
+def _inside(ctx):
+    """Raster of the board area (inside the outline), cached on the context."""
+    m = getattr(ctx, "_board_inside", None)
+    if m is None:
+        m = np.zeros(ctx.b.grid().shape, bool)
+        geom.raster_rings(ctx.b.grid(), ctx.b.outline_rings(), m)
+        ctx._board_inside = m
+    return m
+
+
+def build(ctx, cell_mm, window=None):
+    """Mesh of the whole board, or of a window (x0, y0, x1, y1) of it: `g` is then the grid of the
+    window, so pads and parts are rasterised straight onto it."""
     b = ctx.b
     g = b.grid()
     k = max(1, int(round(cell_mm / g.res)))
     cs = k * g.res
+    i0 = j0 = 0
     ny, nx = g.shape[0] // k, g.shape[1] // k
-    inside = np.zeros(g.shape, bool)
-    geom.raster_rings(g, b.outline_rings(), inside)
-    board = inside[:ny * k, :nx * k].reshape(ny, k, nx, k).mean(axis=(1, 3)) > 0.5
+    sub = g
+    if window is not None:
+        x0, y0, x1, y1 = window
+        j0 = min(max(int(math.floor((x0 - g.x0) / g.res)), 0), g.nx - k)
+        i0 = min(max(int(math.floor((y0 - g.y0) / g.res)), 0), g.ny - k)
+        nx = max(1, min(int(math.ceil((x1 - g.x0) / g.res)), g.nx) - j0) // k
+        ny = max(1, min(int(math.ceil((y1 - g.y0) / g.res)), g.ny) - i0) // k
+        sub = geom.Grid.__new__(geom.Grid)
+        sub.res, sub.x0, sub.y0, sub.nx, sub.ny = g.res, g.x0 + j0 * g.res, g.y0 + i0 * g.res, nx * k, ny * k
+    sl = (slice(i0, i0 + ny * k), slice(j0, j0 + nx * k))
+    board = _inside(ctx)[sl].reshape(ny, k, nx, k).mean(axis=(1, 3)) > 0.5
     frac = []
     for li in range(len(b.layers)):
-        r = b.raster(li) != 0
-        frac.append(r[:ny * k, :nx * k].reshape(ny, k, nx, k).mean(axis=(1, 3)))
-    return {"k": k, "cs": cs, "ny": ny, "nx": nx, "board": board, "frac": np.array(frac), "g": g}
+        r = b.raster(li)[sl] != 0
+        frac.append(r.reshape(ny, k, nx, k).mean(axis=(1, 3)))
+    return {"k": k, "cs": cs, "ny": ny, "nx": nx, "board": board, "frac": np.array(frac), "g": sub,
+            "x0": sub.x0, "y0": sub.y0}
 
 
-def solve(ctx, mesh, heat, h_top, h_bot, ambient):
-    """heat: (L, ny, nx) watts per node. Returns T (L, ny, nx) in C."""
-    b = ctx.b
-    st = b.stack
+def _half_dielectric(st):
+    """Half of each dielectric's thickness belongs to the copper layer on either side (mm)."""
+    half = np.zeros(len(st.copper))
+    for d in st.dielectrics:
+        if d["above"] in st.index:
+            half[st.index[d["above"]]] += d["t"] / 2
+        if d.get("below") in st.index:
+            half[st.index[d["below"]]] += d["t"] / 2
+    return half
+
+
+def capacity(stack, mesh):
+    """Heat capacity of each node (J/K): its copper, the resin between the copper and the half
+    dielectrics that belong to its layer."""
+    cs = mesh["cs"] * 1e-3
+    half = _half_dielectric(stack)
+    C = np.zeros(mesh["frac"].shape)
+    for l in range(len(stack.copper)):
+        t = stack.copper[l]["t"] * 1e-3
+        C[l] = cs * cs * (RHOC_CU * t * mesh["frac"][l] + RHOC_FR4 * (half[l] * 1e-3 + t * (1 - mesh["frac"][l])))
+    return C
+
+
+def assemble(stack, vias, mesh, h_top, h_bot):
+    """Conduction matrix with the surface film conductances on its diagonal (CSC), the node index
+    (L, ny, nx; -1 outside the board) and the film conductance of each node (W/K)."""
+    st = stack
     L, ny, nx = mesh["frac"].shape
     cs = mesh["cs"] * 1e-3
     board = mesh["board"]
@@ -51,13 +99,7 @@ def solve(ctx, mesh, heat, h_top, h_bot, ambient):
     def add(a, c, G):
         rows.extend([a, c]); cols.extend([c, a]); vals.extend([-G, -G])
 
-    # half dielectric thickness belonging to each copper layer
-    half = np.zeros(L)
-    for d in st.dielectrics:
-        if d["above"] in st.index:
-            half[st.index[d["above"]]] += d["t"] / 2
-        if d.get("below") in st.index:
-            half[st.index[d["below"]]] += d["t"] / 2
+    half = _half_dielectric(st)
     for l in range(L):
         t = st.copper[l]["t"] * 1e-3
         Gs = K_CU * t * mesh["frac"][l] + K_FR4_IN * (half[l] * 1e-3 + t * (1 - mesh["frac"][l]))
@@ -68,16 +110,18 @@ def solve(ctx, mesh, heat, h_top, h_bot, ambient):
             Gab = 2 / (1 / Gs[: ny - di, : nx - dj][ok] + 1 / Gs[di:, dj:][ok])
             add(a[ok], c[ok], Gab)
     # vias per cell
-    V = b.vias
-    j = ((V["x"] - mesh["g"].x0) / mesh["cs"]).astype(int)
-    i = ((V["y"] - mesh["g"].y0) / mesh["cs"]).astype(int)
+    V = vias
+    if V is not None and len(V["x"]):
+        j = np.floor((V["x"] - mesh["g"].x0) / mesh["cs"]).astype(int)
+        i = np.floor((V["y"] - mesh["g"].y0) / mesh["cs"]).astype(int)
     for l in range(L - 1):
         dz = (st.copper[l + 1]["z_top"] - st.copper[l]["z_bot"]) * 1e-3
         G = np.full((ny, nx), K_FR4_THRU * cs * cs / dz)
-        span = (V["top"] <= l) & (V["bot"] >= l + 1)
-        ok = span & (i >= 0) & (i < ny) & (j >= 0) & (j < nx)
-        ann = math.pi * ((V["drill"] / 2 + 0.02) ** 2 - (V["drill"] / 2) ** 2) * 1e-6
-        np.add.at(G, (i[ok], j[ok]), K_CU * ann[ok] / dz)
+        if V is not None and len(V["x"]):
+            span = (V["top"] <= l) & (V["bot"] >= l + 1)
+            ok = span & (i >= 0) & (i < ny) & (j >= 0) & (j < nx)
+            ann = math.pi * ((V["drill"] / 2 + 0.02) ** 2 - (V["drill"] / 2) ** 2) * 1e-6
+            np.add.at(G, (i[ok], j[ok]), K_CU * ann[ok] / dz)
         a, c = idx[l][board], idx[l + 1][board]
         add(a, c, G[board])
     rows = np.concatenate([np.atleast_1d(r) for r in rows])
@@ -88,11 +132,19 @@ def solve(ctx, mesh, heat, h_top, h_bot, ambient):
     gconv = np.zeros(N)
     gconv[idx[0][board]] += h_top * cs * cs
     gconv[idx[L - 1][board]] += h_bot * cs * cs
-    A = A + sp.diags(diag + gconv)
-    q = np.zeros(N)
+    A = (A + sp.diags(diag + gconv)).tocsc()
+    return A, idx, gconv
+
+
+def solve(ctx, mesh, heat, h_top, h_bot, ambient):
+    """heat: (L, ny, nx) watts per node. Returns T (L, ny, nx) in C."""
+    L, ny, nx = mesh["frac"].shape
+    board = mesh["board"]
+    A, idx, gconv = assemble(ctx.b.stack, ctx.b.vias, mesh, h_top, h_bot)
+    q = np.zeros(A.shape[0])
     for l in range(L):
         q[idx[l][board]] += heat[l][board]
-    T = spla.spsolve(A.tocsc(), q + gconv * ambient)
+    T = spla.spsolve(A, q + gconv * ambient)
     out = np.full((L, ny, nx), np.nan)
     for l in range(L):
         out[l][board] = T[idx[l][board]]

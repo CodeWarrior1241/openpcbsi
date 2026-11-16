@@ -11,6 +11,9 @@
   python3 -m openpcbsi whatif  BOARD -c CONFIG SPEC.toml
   python3 -m openpcbsi region  BOARD -c CONFIG REGION.toml       (G8, openEMS)
   python3 -m openpcbsi snapshot BOARD
+  python3 -m openpcbsi dfm     BOARD [-c CONFIG] [--fab jlcpcb|FILE] [--checks track,etch,mask,balance,reflow,tombstone]
+                                     [--waivers FILE] [--json OUT] [-o OUT] [--no-markers]
+                                     (5.17: manufacturing sign-off against a fabricator profile; same exit codes)
 
 Checks: drc (G1), impedance (G6), dc (G10), pdn (G11/G12), crosstalk (G4), thermal (G13),
 vias (G9), si (G2/G3/G7), emc (G14). Outputs go to runs/<board>_<sha8>/ under the openpcbsi folder.
@@ -97,6 +100,15 @@ def main(argv=None):
     co.add_argument("--reference", default="antmicro_si")
     s = sub.add_parser("snapshot")
     s.add_argument("board")
+    dm = sub.add_parser("dfm", help="manufacturing sign-off: etching, solder mask and reflow checks against a fabricator profile")
+    dm.add_argument("board")
+    dm.add_argument("-c", "--config")
+    dm.add_argument("--fab", help="fabricator profile: a name (jlcpcb) or a TOML file; default from [dfm] fab")
+    dm.add_argument("--checks", default=None, help="track,etch,mask,balance,reflow,tombstone (default: all)")
+    dm.add_argument("--waivers")
+    dm.add_argument("--json", dest="json_out")
+    dm.add_argument("-o", "--out")
+    dm.add_argument("--no-markers", action="store_true")
     a = ap.parse_args(argv)
     from . import run as runmod
     if getattr(a, "live", False):                 # #32: the board open in KiCad
@@ -136,6 +148,19 @@ def main(argv=None):
                 import traceback
                 traceback.print_exc()
             print(f"openpcbsi evaluate: could not evaluate {a.board}: {ex}", file=sys.stderr)
+            return 3
+        return code
+    if a.cmd == "dfm":
+        from . import dfm
+        from .snapshot import InputError
+        try:
+            code, _ = dfm.run(a.board, a.config, a.fab, a.checks.split(",") if a.checks else None, a.out, a.waivers,
+                              a.json_out, markers=not a.no_markers)
+        except Exception as ex:  # 3 = could not evaluate
+            if not isinstance(ex, (InputError, FileNotFoundError, ValueError)):
+                import traceback
+                traceback.print_exc()
+            print(f"openpcbsi dfm: could not evaluate {a.board}: {ex}", file=sys.stderr)
             return 3
         return code
     if a.cmd == "init":
@@ -211,6 +236,12 @@ def main(argv=None):
         validate.run(runmod.CACHE, ("xsec2d",))
         for solver in ("dc", "pdn"):
             cs = [x for x in pdn.validation_cases() if x["solver"] == solver]
+            for x in cs:
+                print(f"  [{'PASS' if x['pass'] else 'FAIL'}] {x['case']:55s} {x['value']:.6g} vs {x['reference']:.6g} ({x['error_pct']:+.3f} %)")
+            validate.register(runmod.CACHE, solver, cs)
+        from . import etch, reflow
+        for solver, mod in (("etch", etch), ("reflow", reflow)):
+            cs = mod.validation_cases()
             for x in cs:
                 print(f"  [{'PASS' if x['pass'] else 'FAIL'}] {x['case']:55s} {x['value']:.6g} vs {x['reference']:.6g} ({x['error_pct']:+.3f} %)")
             validate.register(runmod.CACHE, solver, cs)

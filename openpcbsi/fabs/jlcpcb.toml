@@ -1,0 +1,98 @@
+# Fabricator profile: JLCPCB (exemplar for `openpcbsi dfm`).
+#
+# Every value under [published] is from JLCPCB's own capability pages, as read on the date below.
+# Values under [assumed] are NOT on those pages: they are typical figures, stated here so that a
+# check has a number to work with, and the report marks every finding that rests on one.
+# Copy this file to describe another fabricator; `dfm --fab FILE` reads it.
+
+[fab]
+name = "JLCPCB"
+retrieved = "2026-11-16"
+sources = [
+    "https://jlcpcb.com/capabilities/pcb-capabilities",
+    "https://jlcpcb.com/capabilities/pcb-assembly-capabilities",
+]
+
+# ---- track width / spacing by layer count and finished outer copper weight ----------------------
+# `layers` is [min, max] copper layers; `oz` the finished outer copper weight the row applies to.
+# `bga_mm` is the width / spacing accepted locally in a BGA fan-out.
+[[published.track]]
+layers = [1, 2]
+oz = 1.0
+width_mm = 0.10
+space_mm = 0.10
+
+[[published.track]]
+layers = [3, 32]
+oz = 1.0
+width_mm = 0.09
+space_mm = 0.09
+bga_mm = 0.076
+
+[[published.track]]
+layers = [1, 2]
+oz = 2.0
+width_mm = 0.16
+space_mm = 0.16
+
+[[published.track]]
+layers = [3, 32]
+oz = 2.0
+width_mm = 0.15
+space_mm = 0.15
+
+[[published.track]]
+layers = [1, 2]
+oz = 2.5
+width_mm = 0.20
+space_mm = 0.20
+
+[[published.track]]
+layers = [1, 2]
+oz = 3.5
+width_mm = 0.25
+space_mm = 0.25
+
+[[published.track]]
+layers = [1, 2]
+oz = 4.5
+width_mm = 0.30
+space_mm = 0.30
+
+[published.etch]
+same_net_spacing_mm = 0.25      # "Same-net track spacing"
+track_tolerance_pct = 20.0      # finished width tolerance
+
+[published.mask]
+web_mm = 0.10                   # "Soldermask bridge"
+# minimum pad spacing that still keeps a mask bridge, by outer copper weight and mask colour
+pad_spacing_1oz_mm = 0.10       # green, red, yellow, blue, purple
+pad_spacing_1oz_dark_mm = 0.13  # black, white
+pad_spacing_2oz_mm = 0.20       # any colour
+dark_colors = ["black", "white"]
+expansion_mm = 0.0              # openings 1:1 with the pad (laser direct imaging)
+opening_to_track_mm = 0.09      # mask opening to a neighbouring track
+
+[published.pads]
+smd_pad_to_pad_mm = 0.15        # SMD pads of different nets
+smd_pad_min_mm = 0.25
+pad_to_track_mm = 0.10
+bga_pad_min_mm = 0.20
+bga_pad_to_track_mm = 0.09      # multilayer boards
+
+[published.assembly]
+# "Reflow temperature" of the two assembly services (peak, +/- 5 C)
+reflow_peak_standard_c = 240.0
+reflow_peak_economic_c = 255.0
+reflow_peak_tol_c = 5.0
+min_package_standard = "01005"
+min_package_economic = "0402"
+
+# ---- not published by the fabricator ------------------------------------------------------------
+[assumed.etch]
+etch_factor = [2.5, 4.0]        # typical for cupric-chloride spray etching; not a JLCPCB figure
+etchant = "acidic cupric chloride (inner layers), alkaline ammoniacal (outer layers): typical, not stated by JLCPCB"
+
+[assumed.assembly]
+oven = "multi-zone forced-convection reflow oven: typical, not stated by JLCPCB"
+h_w_m2k = 50.0                  # mean film coefficient of forced-convection reflow (literature value)

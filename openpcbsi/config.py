@@ -70,6 +70,60 @@ DEFAULTS = {
     "crosstalk": {"classes": [], "victims": [], "max_spacing_mm": 0.6, "top": 30},
     "si": {"nets": [], "driver": {"r_ohm": 40.0, "rise_ps": 100.0, "v": 1.0}, "load_pf": 2.0},
     "channels": {},
+    # manufacturing checks (`openpcbsi dfm`, REQUIREMENTS 5.17). Limits that a fabricator publishes come
+    # from the profile ([dfm] fab); the keys below are the model parameters and the proposed limits.
+    "dfm": {
+        "fab": "jlcpcb",               # profile name (openpcbsi/fabs/*.toml) or a file path
+        "mask_color": "green",
+        "assembly_service": "standard",
+        "fab_limits": {},              # overrides of resolved limits, e.g. mask_web_mm = 0.12
+        "acid": {
+            "contact_angle_deg": 45.0,    # etchant on resist and laminate (assumed); Concus-Finn limit = 180 - 2 x this
+            "max_angle_deg": 90.0,        # never judge an opening wider than this
+            "angle_tol_deg": 7.5,         # measurement margin: a wedge is flagged below limit - tol
+            "ball_mm": 0.0,               # reach of the etchant flow; 0 = half the fab's same-net spacing
+            "hires_div": 4,               # the fine raster is raster_res / hires_div
+            "tile_mm": 2.0,
+            "diffusivity_m2s": 1.0e-9,    # ions in water, for the flush time of a pocket
+            "min_gap_len_mm": 0.3,        # a narrow same-net gap shorter than this is not reported
+            "flush_warn_s": 5.0,          # a held corner warns from this flush time; below it is information (proposed)
+        },
+        "pad_balance": {
+            "max_package": "1206",        # two-terminal chips up to this size are checked
+            "small_package": "0603",      # up to this size an imbalance warns; above it is information
+            "ring_mm": 0.075,             # where the copper leaving the pad is measured, outside the pad edge
+            "ratio_warn": 3.0,            # copper leaving one pad against the other (proposed)
+            "min_entry_mm": 0.1,          # floor of the smaller entry in the ratio
+            "solid_fraction": 0.6,        # share of the pad perimeter in copper above which the pad is 'in a pour'
+            "via_reach_mm": 1.0,          # a via of the pad's net into a plane, this close to the pad, ties the pad to the plane
+        },
+        "tombstone": {
+            "cell_mm": 0.05, "coarse": 4, "margin_mm": 2.0,
+            "dt_warn_s": 0.3,             # difference in the time the two joints reach liquidus (proposed)
+            "paste_k": 2.0, "paste_um": 100.0,   # unmelted paste between pad and termination (assumed)
+            "max_parts": 0,               # 0 = every chip in scope
+        },
+    },
+    "reflow": {
+        "cell_mm": 2.0, "dt_s": 0.5,
+        "h_top": 0.0, "h_bot": 0.0,       # W/m2K; 0 = the fab profile's figure
+        "start_c": 25.0,
+        # air temperature of each oven zone (C) and the time the board spends in each (s); a generic
+        # lead-free ramp-soak-spike profile. With `calibrate`, the last `spike_zones` zones are shifted
+        # until the median peak on the board is the assembler's stated reflow temperature.
+        "zones_c": [110.0, 140.0, 160.0, 175.0, 185.0, 200.0, 260.0, 270.0],
+        "zone_s": 30.0,
+        "cool_c": [120.0, 60.0], "cool_s": 30.0,
+        "calibrate": True, "spike_zones": 2,
+        "peak_target_c": 0.0,             # 0 = the fab profile's reflow temperature
+        "liquidus_c": 217.0,              # SAC305
+        "peak_min_c": 230.0, "peak_max_c": 250.0,      # proposed (paste data sheet; J-STD-020 part limits)
+        "tal_min_s": 30.0, "tal_max_s": 90.0,          # time above liquidus (proposed)
+        "spread_warn_c": 10.0,            # difference of peak temperature across the parts (proposed)
+        "ramp_max_c_s": 3.0, "ramp_window_s": 5.0,     # steepest rise, averaged over the window
+        "default_height_mm": 1.0,         # body height of a part with no data
+        "parts": {},                      # REF = {mass_g = .., height_mm = .., cp = ..}
+    },
 }
 
 

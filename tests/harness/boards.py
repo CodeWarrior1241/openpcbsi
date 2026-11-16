@@ -166,3 +166,91 @@ def big_board(out, name="big", layers=6):
     for i in range(40):
         b.pair("F.Cu" if i % 2 == 0 else "B.Cu", f"LANE{i}_TX", 5, 95, 3 + i * 2.35)
     return b.save()
+
+
+# ---- manufacturing checks (`openpcbsi dfm`, items 37-41) ---------------------------------------
+C0402 = "Capacitor_SMD:C_0402_1005Metric"
+R0402 = "Resistor_SMD:R_0402_1005Metric"
+
+
+def acid_board(out, name="acid", planted=True):
+    """A 2 x 2 mm pad with a track leaving its right edge at 45 degrees (planted) or square-on, and two
+    tracks of one net 0.15 mm apart (planted) or 0.35 mm apart, joined at one end."""
+    b = Board(_p(out, name), layers=4, size=(40, 20))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    b.footprint("U1", "PAD", 10, 10, [{"num": 1, "net": "SIG", "dx": 0, "dy": 0, "sx": 2.0}])
+    if planted:
+        b.track("F.Cu", [(10.5, 9.5), (14.5, 13.5)], 0.2, "SIG")
+    else:
+        b.track("F.Cu", [(10.5, 10), (15, 10)], 0.2, "SIG")
+    pitch = 0.45 if planted else 0.65
+    b.track("F.Cu", [(23, 5), (20, 5), (20, 5 + pitch), (23, 5 + pitch)], 0.3, "SIG2")
+    return b.save()
+
+
+def fab_board(out, name="fab", layers=4, w=0.08):
+    b = Board(_p(out, name), layers=layers, size=(40, 20))
+    if layers >= 4:
+        b.plane("In1.Cu", "GND")
+        b.plane("In2.Cu", "GND")
+    b.track("F.Cu", [(5, 10), (35, 10)], w, "SIG")
+    b.track("F.Cu", [(5, 14), (35, 14)], 0.2, "SIG3")
+    return b.save()
+
+
+def mask_board(out, name="mask", planted=True):
+    """Pad pairs with a planted solder-mask defect each (see the `kind` in the comments), or none."""
+    b = Board(_p(out, name), layers=4, size=(50, 20))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+
+    def pair(ref, x, pitch, margin):
+        b.footprint(ref, "PADS", x, 10, [
+            {"num": 1, "net": ref + "_A", "dx": -pitch / 2, "dy": 0, "sx": 0.5, "mask": margin},
+            {"num": 2, "net": ref + "_B", "dx": pitch / 2, "dy": 0, "sx": 0.5, "mask": margin}])
+    if planted:
+        pair("U1", 8, 0.62, 0.0)        # pad_gap: copper 0.12 mm apart (< 0.15)
+        pair("U2", 16, 0.75, 0.09)      # web: 0.25 mm apart, openings leave 0.07 mm (< 0.10)
+        pair("U3", 24, 0.70, 0.12)      # no_dam: 0.20 mm apart, openings overlap
+    else:
+        pair("U1", 8, 0.80, 0.0)
+        pair("U2", 16, 0.90, 0.05)
+        pair("U3", 24, 1.00, 0.05)
+    # one pad with a wide opening and a track of another net beside it
+    b.footprint("U4", "PAD", 34, 10, [{"num": 1, "net": "U4_A", "dx": 0, "dy": 0, "sx": 1.0, "mask": 0.15 if planted else 0.0}])
+    b.track("F.Cu", [(32, 10.65 if planted else 11.2), (36, 10.65 if planted else 11.2)], 0.1, "OTHER")   # 0.10 mm from the pad
+    b.footprint("U5", "PAD", 42, 10, [{"num": 1, "net": "U5_A", "dx": 0, "dy": 0, "sx": 1.0, "mask": 0.05 if planted else 0.0}])
+    b.track("F.Cu", [(40, 10.67 if planted else 11.2), (44, 10.67 if planted else 11.2)], 0.1, "OTHER2")  # 0.07 mm from the opening
+    return b.save()
+
+
+def chip_board(out, name="chips"):
+    """Three 0402 capacitors on GND planes. C1: pad 1 on a thin track, pad 2 on a short track to a via into
+    the planes. C2: both pads on thin tracks (symmetric). C3: pad 1 in a pour, pad 2 on a thin track."""
+    b = Board(_p(out, name), layers=4, size=(60, 30))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    b.two_pin("C1", "100n", 12, 15, "SIG1", "GND", fpid=C0402, mask=0.0)
+    b.track("F.Cu", [(11.5, 15), (6, 15)], 0.15, "SIG1")
+    b.track("F.Cu", [(12.5, 15), (13.3, 15)], 0.3, "GND")
+    b.via(13.3, 15, "GND")
+    b.two_pin("C2", "100n", 30, 15, "SIGA", "SIGB", fpid=C0402, mask=0.0)
+    b.track("F.Cu", [(29.5, 15), (24, 15)], 0.15, "SIGA")
+    b.track("F.Cu", [(30.5, 15), (36, 15)], 0.15, "SIGB")
+    b.two_pin("C3", "100n", 48, 15, "PWR", "SIGC", fpid=C0402, mask=0.0)
+    b.zone("F.Cu", [(42, 11), (48.2, 11), (48.2, 19), (42, 19)], "PWR")
+    b.track("F.Cu", [(48.5, 15), (54, 15)], 0.15, "SIGC")
+    return b.save()
+
+
+def reflow_board(out, name="reflow"):
+    """A 3 g part (U1, 5 mm tall) on the left and 0402 resistors next to it (R1) and far from it (R2)."""
+    b = Board(_p(out, name), layers=4, size=(80, 40))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    b.footprint("U1", "HEAVY", 14, 20, [{"num": i + 1, "net": "GND", "dx": -4 + 8 * (i % 2), "dy": -4 + 8 * (i // 2), "sx": 1.5, "mask": 0.0}
+                                       for i in range(4)], fields={"Mass": "3", "Height": "5"}, courtyard=(-6, -6, 6, 6))
+    b.two_pin("R1", "10k", 23, 20, "N1", "N2", fpid=R0402, mask=0.0)
+    b.two_pin("R2", "10k", 70, 20, "N3", "N4", fpid=R0402, mask=0.0)
+    return b.save()

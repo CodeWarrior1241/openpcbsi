@@ -229,6 +229,58 @@ class Board:
     def outline_rings(self):
         return [ring for poly in self.snap["outline"] for ring in poly]
 
+    def _window_index(self):
+        """Per layer: zone fills as edge arrays with a bounding box, and the bounding boxes of the pads."""
+        if getattr(self, "_win", None) is None:
+            zs = {li: [] for li in range(len(self.layers))}
+            for z in sorted(self.zones, key=lambda z: z.get("priority", 0)):
+                li = self.L.get(z["layer"])
+                segs = geom.ring_segments([ring for poly in z["polys"] for ring in poly])
+                if li is None or not len(segs):
+                    continue
+                bb = (segs[:, [0, 2]].min(), segs[:, [1, 3]].min(), segs[:, [0, 2]].max(), segs[:, [1, 3]].max())
+                zs[li].append((self.net_id.get(z["net"], 0), segs, bb))
+            pb = np.full((len(self.pads), 4), np.nan)
+            for k, p in enumerate(self.pads):
+                if p["poly"]:
+                    a = np.vstack([np.asarray(r, dtype=float) for poly in p["poly"] for r in poly])
+                    pb[k] = (a[:, 0].min(), a[:, 1].min(), a[:, 0].max(), a[:, 1].max())
+            on = np.zeros((len(self.layers), len(self.pads)), bool)
+            for k, p in enumerate(self.pads):
+                on[p["layer_ids"], k] = True
+            self._win = {"zones": zs, "pad_bb": pb, "pad_on": on}
+        return self._win
+
+    def raster_window(self, layer, x0, y0, x1, y1, res):
+        """Net-id raster (int32) of the copper of one layer inside a window, at any resolution: the same
+        drawing order as raster(), from the vector data. Returns (grid, raster)."""
+        li = self.L[layer] if isinstance(layer, str) else layer
+        w = self._window_index()
+        g = geom.window_grid(x0, y0, x1, y1, res)
+        r = np.zeros(g.shape, dtype=np.int32)
+        for nid, segs, bb in w["zones"][li]:
+            if bb[0] > x1 or bb[2] < x0 or bb[1] > y1 or bb[3] < y0:
+                continue
+            r[geom.raster_segs(g, segs)] = nid
+        pb = w["pad_bb"]
+        sel = np.flatnonzero(w["pad_on"][li] & (pb[:, 0] <= x1) & (pb[:, 2] >= x0) & (pb[:, 1] <= y1) & (pb[:, 3] >= y0))
+        for k in sel:
+            p = self.pads[k]
+            r[geom.raster_rings(g, [ring for poly in p["poly"] for ring in poly])] = p["net_id"]
+        T = self.tracks
+        hw = T["w"] / 2
+        sel = np.flatnonzero((T["layer"] == li) & (np.minimum(T["x1"], T["x2"]) - hw <= x1) & (np.maximum(T["x1"], T["x2"]) + hw >= x0)
+                             & (np.minimum(T["y1"], T["y2"]) - hw <= y1) & (np.maximum(T["y1"], T["y2"]) + hw >= y0))
+        for k in sel:
+            geom.raster_capsule(g, r, T["x1"][k], T["y1"][k], T["x2"][k], T["y2"][k], hw[k], T["net"][k])
+        V = self.vias
+        vr = V["d"] / 2
+        sel = np.flatnonzero((V["x"] - vr <= x1) & (V["x"] + vr >= x0) & (V["y"] - vr <= y1) & (V["y"] + vr >= y0))
+        for k in sel:
+            if li in self.via_flashed[k]:
+                geom.raster_capsule(g, r, V["x"][k], V["y"][k], V["x"][k], V["y"][k], vr[k], V["net"][k])
+        return g, r
+
     # -------------------------------------------------------------------------------------------
     def tracks_of(self, net, layer=None):
         nid = self.net_id[net] if isinstance(net, str) else net

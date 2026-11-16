@@ -3,7 +3,8 @@
 Signal- and power-integrity checks for KiCad 10 boards: the electrical review that KiCad's DRC
 does not do. openpcbsi reads a `.kicad_pcb` and reports return-path problems, impedance,
 crosstalk, channel loss, supply drop, PDN impedance and board temperature, with every finding
-placed on the board. It can also compare two layouts of the same design.
+placed on the board. It can also compare two layouts of the same design, and check a layout against
+a fabricator's and an assembler's capabilities before the files are sent.
 
 openpcbsi is research software. Its solvers are checked against closed-form reference cases, and
 its signal-integrity model has been checked against a real, fabricated board: Antmicro's open
@@ -42,6 +43,10 @@ measurements.
 - **Thermal**: a 2.5D board temperature map from part dissipation and I²R heating.
 - **EMC**: a ranked list of likely radiators, for review.
 - **KiCad DRC**: KiCad's own design-rule check and schematic parity, run as part of the evaluation.
+- **Manufacturing** (`dfm`, a separate command): against a fabricator profile, acute copper corners
+  that hold etchant (acid traps), gaps below the same-net spacing, track width, solder-mask webs and
+  copper inside or beside mask openings; for assembly, a reflow simulation of the board and, for
+  each two-terminal chip, how far apart in time its two joints melt (tombstoning).
 
 ## Requirements
 
@@ -150,6 +155,34 @@ python3 -m openpcbsi verify-signoff runs/<board>_<hash>/signoff.json
 `signoff.json` ties the verdict to the SHA-256 of the board, its KiCad project files, the
 configuration and the waivers; `verify-signoff` fails if any of them changed since.
 
+### Manufacturing sign-off
+
+```sh
+python3 -m openpcbsi dfm board.kicad_pcb [-c boards/board.toml] [--fab jlcpcb] [--waivers waivers.toml]
+```
+
+`dfm` checks the layout against a fabricator profile and writes `runs/<board>_<hash>/dfm/dfm.html`,
+with the same finding model, waiver format and exit codes as `evaluate`. The profile shipped,
+[openpcbsi/fabs/jlcpcb.toml](openpcbsi/fabs/jlcpcb.toml), holds JLCPCB's published capabilities as
+an exemplar; copy it for another fabricator and pass the file with `--fab`. Every limit in the
+report is marked as published by the fabricator, assumed, or set in the board configuration.
+
+| Check | What it finds |
+|-------|---------------|
+| `fab_track` | Tracks narrower than the fabricator's minimum for the layer count and copper weight. |
+| `acid_trap` | Corners in copper of one net sharper than the angle below which liquid is held, with the depth of the pocket and its flush time. |
+| `same_net_gap` | Slots and openings in copper of one net narrower than the fabricator's same-net spacing. |
+| `mask_web` | Pads too close for a solder-mask web, webs below the minimum, openings that merge. |
+| `mask_exposed` | Copper of another net inside a pad's mask opening, or too close to it. |
+| `pad_balance` | Chips whose two pads differ in the copper leaving them, in a pour, or in a via. |
+| `reflow` | Peak temperature, time above liquidus, ramp and lag of every part through a convection oven. |
+| `tombstone` | The time between the two joints of a chip reaching liquidus. |
+
+The etching and reflow models are checked against closed forms only, not against fabricated boards
+or an assembler's defect data, and several limits are proposals to be calibrated; the scorecard says
+which inputs were assumed. Clearance, annular rings, copper slivers and starved thermals stay with
+KiCad's DRC, which `evaluate` runs. Models, limits and file formats: [docs/dfm.md](docs/dfm.md).
+
 ## Commands
 
 | Command | What it does |
@@ -157,6 +190,7 @@ configuration and the waivers; `verify-signoff` fails if any of them changed sin
 | `evaluate BOARD [-c CFG] [--waivers FILE] [--families ...] [--checks ...] [--stage S] [--since EVAL] [--em none\|plan\|run] [--json OUT] [-o DIR] [--no-drc] [--no-markers]` | Every check plus KiCad DRC, a scorecard and an exit code. `--em plan` lists automatic 3D regions, `--em run` runs them (minutes each). |
 | `signoff BOARD [evaluate options] [--reviewer NAME]` | Evaluate and write `signoff.json`, tied to the exact inputs. |
 | `verify-signoff RECORD` | Check that a sign-off record still matches its board and files. |
+| `dfm BOARD [-c CFG] [--fab NAME\|FILE] [--checks track,etch,mask,balance,reflow,tombstone] [--waivers FILE] [--json OUT] [-o DIR] [--no-markers]` | Manufacturing sign-off against a fabricator profile: etching, solder mask and reflow checks, a scorecard and an exit code. |
 | `plan BOARD --layer L (--zdiff Z [--gap G] \| --z0 Z)` | Track width for a target impedance on a layer of the board's stackup. |
 | `init BOARD [-o FILE] [--force]` | Draft a board configuration from the board. |
 | `check BOARD [-c CFG] [--checks ...] [--rules ...] [-o DIR] [--no-markers]` | Run checks and write the report, without scorecard or DRC. |
@@ -215,7 +249,9 @@ Each run writes a directory under `runs/` (or `-o DIR`):
 | `em_jobs/` | The automatic 3D region specs (`--em plan` / `run`). |
 | `<board>_openpcbsi.kicad_pcb` | A copy of the board with errors and warnings as markers on layer User.9. |
 
-`compare` writes `compare.html` and `compare.json` to `runs/compare_<A>_vs_<B>/`.
+`compare` writes `compare.html` and `compare.json` to `runs/compare_<A>_vs_<B>/`. `dfm` writes
+`dfm.html`, `dfm.json`, its own layer images, `reflow_peak_top.png` and a marker board to the `dfm/`
+folder of the run ([docs/dfm.md](docs/dfm.md)).
 
 ## Configuration
 
@@ -339,7 +375,11 @@ Each check uses its own model:
 - impedance and crosstalk: a 2D finite-volume field solver;
 - DC drop: a resistive network of the copper;
 - PDN impedance: a cavity and capacitor network;
-- temperature: a 2.5D finite-volume model.
+- temperature: a 2.5D finite-volume model;
+- reflow: the same model with heat capacity, stepped through the oven's zones, and a finer window
+  around each chip for the lag of its two joints;
+- etching: a ball rolled through the space between copper of one net, on a 6.25 µm raster drawn
+  from the vector data, with a diffusion solve for each pocket it cannot reach.
 
 Each finding carries a severity, a stable ID and a position, so waivers survive re-runs and two
 layouts can be compared finding by finding.

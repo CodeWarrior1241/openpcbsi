@@ -16,8 +16,9 @@ import shutil
 import subprocess
 import sys
 
-SNAPSHOT_VERSION = 6   # 4: zones refilled in memory, every footprint field, pin types, file version; 5: back-drill;
+SNAPSHOT_VERSION = 7   # 4: zones refilled in memory, every footprint field, pin types, file version; 5: back-drill;
                        # 6: DNP also from a "DNP" field (KiCad 6 designs mark it that way)
+                       # 7: solder-mask openings and paste margins of pads, mask shapes, via tenting (MF checks)
 NM = 1e-6  # nm -> mm
 
 
@@ -150,7 +151,7 @@ def extract(board_path):
                 "x": t.GetPosition().x * NM, "y": t.GetPosition().y * NM,
                 "d": t.GetWidth(cu_ids[0]) * NM, "drill": t.GetDrillValue() * NM,
                 "net": net, "span": span, "flashed": flashed, "type": int(t.GetViaType()),
-                "backdrill": _backdrill(pcbnew, t, lid2name),
+                "backdrill": _backdrill(pcbnew, t, lid2name), "tented": _tented(pcbnew, t),
             })
         elif ty == pcbnew.PCB_ARC_T:
             # approximate arcs by chords of at most 10 degrees
@@ -204,6 +205,7 @@ def extract(board_path):
             "x": f.GetPosition().x * NM, "y": f.GetPosition().y * NM,
             "rot": f.GetOrientationDegrees(), "side": "B" if f.IsFlipped() else "F",
             "dnp": bool(f.IsDNP()) or _dnp_field(fields), "fields": fields, "courtyard": crt,
+            "smd": bool(f.GetAttributes() & pcbnew.FP_SMD),
             "bbox": [bb.GetX() * NM, bb.GetY() * NM, bb.GetRight() * NM, bb.GetBottom() * NM],
         })
         for p in f.Pads():
@@ -225,10 +227,71 @@ def extract(board_path):
                 "sx": sz.x * NM, "sy": sz.y * NM, "rot": p.GetOrientationDegrees(),
                 "drill": p.GetDrillSize().x * NM if kind in ("pth", "npth") else 0.0,
                 "layers": layers, "poly": polys, "pinfunc": p.GetPinFunction(), "pintype": p.GetPinType(),
+                **_pad_mask_paste(pcbnew, p),
             })
     snap["footprints"] = fps
     snap["pads"] = pads
+    snap["mask_shapes"] = _mask_shapes(pcbnew, b)
     return snap
+
+
+MASK_PASTE = (("F.Mask", "F_Mask", "F.Paste", "F_Paste"), ("B.Mask", "B_Mask", "B.Paste", "B_Paste"))
+
+
+def _pad_mask_paste(pcbnew, p):
+    """Solder-mask opening (the pad shape grown by its mask expansion) and paste margin of a pad, per
+    side. `mask` is {mask layer: polygons}; a pad that is not on a mask layer is covered by mask."""
+    mask, paste = {}, {}
+    for mname, mattr, pname, pattr in MASK_PASTE:
+        ml, pl = getattr(pcbnew, mattr), getattr(pcbnew, pattr)
+        if p.IsOnLayer(ml):
+            try:
+                exp = int(p.GetSolderMaskExpansion(ml))
+                s = pcbnew.SHAPE_POLY_SET()
+                p.TransformShapeToPolygon(s, ml, exp, 2000, pcbnew.ERROR_OUTSIDE)
+                mask[mname] = {"exp": exp * NM, "polys": _polyset(s)}
+            except Exception:
+                pass
+        if p.IsOnLayer(pl):
+            try:
+                m = p.GetSolderPasteMargin(pl)
+                paste[pname] = [m.x * NM, m.y * NM]
+            except Exception:
+                paste[pname] = [0.0, 0.0]
+    return {"mask": mask, "paste": paste}
+
+
+def _tented(pcbnew, v):
+    """[front, back]: whether the via is covered by solder mask on each side (None if unknown)."""
+    out = []
+    for attr in ("F_Mask", "B_Mask"):
+        try:
+            out.append(bool(v.IsTented(getattr(pcbnew, attr))))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _mask_shapes(pcbnew, b):
+    """Graphic shapes on the mask layers (board and footprint level): further openings in the mask."""
+    out = []
+    ids = {pcbnew.F_Mask: "F.Mask", pcbnew.B_Mask: "B.Mask"}
+    items = list(b.GetDrawings())
+    for f in b.GetFootprints():
+        items += list(f.GraphicalItems())
+    for d in items:
+        l = d.GetLayer()
+        if l not in ids or not hasattr(d, "TransformShapeToPolygon"):
+            continue
+        try:
+            s = pcbnew.SHAPE_POLY_SET()
+            d.TransformShapeToPolygon(s, l, 0, 2000, pcbnew.ERROR_OUTSIDE)
+            polys = _polyset(s)
+        except Exception:
+            continue
+        if polys:
+            out.append({"layer": ids[l], "polys": polys})
+    return out
 
 
 def _dnp_field(fields):

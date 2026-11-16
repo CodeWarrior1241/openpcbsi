@@ -150,11 +150,17 @@ class Board:
                     side="F" if layer == "F.Cu" else "B")
         return name + "_P", name + "_N"
 
-    def footprint(self, ref, value, x, y, pads, fields=None, courtyard=None, side="F"):
-        """pads: list of dicts {num, net, dx, dy, sx, sy, kind: smd|pth, drill, shape: rect|circle, pintype, func}."""
+    def footprint(self, ref, value, x, y, pads, fields=None, courtyard=None, side="F", fpid=None):
+        """pads: list of dicts {num, net, dx, dy, sx, sy, kind: smd|pth, drill, shape: rect|circle, pintype, func,
+        mask}. `mask` (mm) opens the solder mask and the paste over an SMD pad, grown by that margin.
+        `fpid` is 'Library:Name' (the manufacturing checks read the package from the name)."""
         fp = pcbnew.FOOTPRINT(self.b)
         fp.SetReference(ref)
         fp.SetValue(value)
+        if fpid:
+            lib, _, name = fpid.partition(":")
+            fp.SetFPID(pcbnew.LIB_ID(lib, name))
+            fp.SetAttributes(pcbnew.FP_SMD)
         fp.SetPosition(V(x, y))
         cu = pcbnew.F_Cu if side == "F" else pcbnew.B_Cu
         for d in pads:
@@ -167,6 +173,10 @@ class Board:
             if kind == "smd":
                 ls = pcbnew.LSET()
                 ls.AddLayer(cu)
+                if d.get("mask") is not None:
+                    ls.AddLayer(pcbnew.F_Mask if side == "F" else pcbnew.B_Mask)
+                    ls.AddLayer(pcbnew.F_Paste if side == "F" else pcbnew.B_Paste)
+                    p.SetLocalSolderMaskMargin(MM(d["mask"]))
                 p.SetLayerSet(ls)
             else:
                 p.SetDrillSize(pcbnew.VECTOR2I(MM(d.get("drill", 0.3)), MM(d.get("drill", 0.3))))
@@ -194,12 +204,12 @@ class Board:
         self.b.Add(fp)
         return fp
 
-    def two_pin(self, ref, value, x, y, net1, net2, pitch=1.0, pad=(0.6, 0.6), fields=None):
+    def two_pin(self, ref, value, x, y, net1, net2, pitch=1.0, pad=(0.6, 0.6), fields=None, fpid=None, mask=None):
         """An 0402/0603-like part along x with pads at x -/+ pitch/2."""
         return self.footprint(ref, value, x, y, [
-            {"num": 1, "net": net1, "dx": -pitch / 2, "dy": 0, "sx": pad[0], "sy": pad[1]},
-            {"num": 2, "net": net2, "dx": pitch / 2, "dy": 0, "sx": pad[0], "sy": pad[1]}],
-            fields=fields, courtyard=(-pitch / 2 - 0.5, -0.5, pitch / 2 + 0.5, 0.5))
+            {"num": 1, "net": net1, "dx": -pitch / 2, "dy": 0, "sx": pad[0], "sy": pad[1], "mask": mask},
+            {"num": 2, "net": net2, "dx": pitch / 2, "dy": 0, "sx": pad[0], "sy": pad[1], "mask": mask}],
+            fields=fields, courtyard=(-pitch / 2 - 0.5, -0.5, pitch / 2 + 0.5, 0.5), fpid=fpid)
 
     # ---- project files ------------------------------------------------------------------------
     def netclass(self, name, patterns, **settings):
