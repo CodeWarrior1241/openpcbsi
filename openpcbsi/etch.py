@@ -246,7 +246,7 @@ def measure_spacing(b, li, pts, limit_of, res, tile_mm, max_tiles, coarse_res, r
             if lim is None:
                 continue
             gap = s[k] * res
-            if gap < lim[0] - res:                  # one fine pixel: the reading's accuracy (validation; KiCad comparison)
+            if gap < lim[0] + res:                  # one fine pixel either side of the limit is the reading's slack
                 add(int(la[k]), int(lb[k]), lim[1], gap, x[k], y[k], lim[0], lim[2], res)
     if rest:                                            # not refined: only what is clear at the coarse resolution
         for x, y, s in pts:
@@ -310,17 +310,20 @@ def run(ctx, fabr, in_bga, want=("gap", "acid", "space"), log=print):
     p = cfg["dfm"]["acid"]
     sp_cfg = cfg["dfm"]["space"]
     g = b.grid()
-    snet = fabr.get("same_net_spacing_mm") if fabr.judged("same_net_spacing_mm") else None
+    snet = fabr.judge("same_net_spacing_mm", "same_net_gap")
     rp_mm = max(p["ball_mm"], (snet or 0.0) / 2)
     res = g.res / max(1, int(p["hires_div"]))
     judge_at = p["acute_deg"] - p["angle_tol_deg"]
-    space = fabr.get("track_space_mm") if fabr.judged("track_space_mm") else None
-    padtrk = fabr.get("pad_to_track_mm") if fabr.judged("pad_to_track_mm") else None
-    bga_sp = fabr.get("bga_track_mm") if fabr.judged("bga_track_mm") else None
-    bga_pt = fabr.get("bga_pad_to_track_mm") if fabr.judged("bga_pad_to_track_mm") else None
+    space = fabr.judge("track_space_mm", "fab_space")
+    padtrk = fabr.judge("pad_to_track_mm", "fab_space")
+    bga_sp = fabr.judge("bga_track_mm", "fab_space")
+    bga_pt = fabr.judge("bga_pad_to_track_mm", "fab_space")
     do_space = "space" in want and (space is not None or padtrk is not None)
 
+    cur = {"space": space, "key": "track_space_mm"}         # the track spacing of the layer being measured
+
     def limit_of(x, y, pad_a, pad_b):
+        space = cur["space"]
         bga = in_bga(x, y)
         if pad_a and pad_b:
             return None                                    # pad to pad: MF4
@@ -332,11 +335,15 @@ def run(ctx, fabr, in_bga, want=("gap", "acid", "space"), log=print):
         if space is None:
             return None
         return (bga_sp, "track spacing in a BGA field", "bga_track_mm") if bga and bga_sp is not None else \
-               (space, "track spacing", "track_space_mm")
+               (space, "track spacing", cur["key"])
 
-    space_px = (max(v for v in (space, padtrk) if v is not None) + 1.5 * g.res) / g.res if do_space else None
+    widest = max([v for v in (space, padtrk) if v is not None] +
+                 [e["value"] for k, e in fabr.limits.items() if k.startswith("track_space_mm@")])  if do_space else None
+    space_px = (widest + 1.5 * g.res) / g.res if do_space else None
     def layer(li):
         lname = b.layers[li]
+        cur["key"] = fabr.layer_key("track_space_mm", lname)
+        cur["space"] = fabr.judge(cur["key"], "fab_space") if space is not None else None
         f_gap, f_sp, corners, counts = [], [], [], {"on_track": 0, "wide_copper": 0}
         m_sp = None
         cands, pts = candidates(b, li, rp_mm / g.res, space_px)
@@ -379,12 +386,15 @@ def run(ctx, fabr, in_bga, want=("gap", "acid", "space"), log=print):
         n_fine = n_left = n_below = 0
         if do_space:
             fs, n_fine, n_left = measure_spacing(b, li, pts, limit_of, res, p["tile_mm"], sp_cfg["max_tiles"], g.res,
-                                                 max(v for v in (space, padtrk) if v is not None) + 0.02)
+                                                 max(v for v in (cur["space"], padtrk) if v is not None) + 0.02)
             for (na, nb, kind), e in sorted(fs.items(), key=lambda kv: kv[1]["gap_mm"] - kv[1]["limit"]):
-                n_below += 1
                 names = f"{b.net_names[na]} / {b.net_names[nb]}" if na or nb else "nets not resolved"
-                f_sp.append(finding("fab_space", "error", f"{names}: {e['gap_mm'] * 1000:.0f} um apart, below the {e['limit'] * 1000:.0f} um "
-                                    f"minimum for {kind.replace(' (coarse)', '')} ({fabr.src(e['key'])}); "
+                below = e["gap_mm"] < e["limit"] - e["res"]
+                n_below += below
+                how = (f"below the {e['limit'] * 1000:.0f} um minimum" if below else
+                       f"within the measuring slack ({e['res'] * 1000:g} um) of the {e['limit'] * 1000:.0f} um minimum, so neither a pass nor a fail can be shown")
+                f_sp.append(finding("fab_space", "error" if below else "warning", f"{names}: {e['gap_mm'] * 1000:.0f} um apart, {how} "
+                                    f"for {kind.replace(' (coarse)', '')} ({fabr.src(e['key'])}); "
                                     f"{e['n'] * e['res']:.2f} mm of it, measured at {e['res'] * 1000:g} um",
                                     b.net_names[na] if na else "", lname, e["x"], e["y"], value=round(e["gap_mm"], 4), limit=e["limit"],
                                     unit="mm", aggressor=b.net_names[nb] if nb else "", kind=kind, basis=fabr.src(e["key"])))

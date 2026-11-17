@@ -171,8 +171,9 @@ def big_board(out, name="big", layers=6):
 # ---- manufacturing review (`openpcbsi dfm`, items 37-46) --------------------------------------
 C0402 = "Capacitor_SMD:C_0402_1005Metric"
 R0402 = "Resistor_SMD:R_0402_1005Metric"
-FAB_RULES = {"min_clearance": 0.09, "min_track_width": 0.09, "min_via_annular_width": 0.05, "min_via_diameter": 0.25,
-             "min_through_hole_diameter": 0.15, "min_hole_to_hole": 0.2, "min_hole_clearance": 0.2,
+# KiCad board-setup rules as strict as JLCPCB's figures for every measurand each rule covers
+FAB_RULES = {"min_clearance": 0.10, "min_track_width": 0.09, "min_via_annular_width": 0.05, "min_via_diameter": 0.25,
+             "min_through_hole_diameter": 0.15, "min_hole_to_hole": 0.45, "min_hole_clearance": 0.30,
              "min_copper_edge_clearance": 0.2, "solder_mask_min_width": 0.1}
 
 
@@ -213,13 +214,17 @@ def acid_board(out, name="acid", planted=True):
     return b.save()
 
 
-def fab_board(out, name="fab", layers=4, w=0.08):
-    b = Board(_p(out, name), layers=layers, size=(40, 20))
+def fab_board(out, name="fab", layers=4, w=0.08, copper=None, inner_track=None):
+    """A track of width `w` on F.Cu; with `inner_track`, a track of that width on In1.Cu (its copper set by
+    `copper`, e.g. {"In1.Cu": 0.07} for 2 oz)."""
+    b = Board(_p(out, name), layers=layers, size=(40, 20), copper=copper)
     if layers >= 4:
         b.plane("In1.Cu", "GND")
         b.plane("In2.Cu", "GND")
     b.track("F.Cu", [(5, 10), (35, 10)], w, "SIG")
     b.track("F.Cu", [(5, 14), (35, 14)], 0.2, "SIG3")
+    if inner_track:
+        b.track("In1.Cu", [(5, 6), (35, 6)], inner_track, "SIG4")
     return b.save()
 
 
@@ -258,8 +263,10 @@ def mask_board(out, name="mask", planted=True):
 
 def drill_board(out, name="drill", planted=True):
     """Holes with a planted defect each, or none: a 0.1 mm via hole; a via ring of 0.03 mm; two holes
-    0.12 mm apart; a via hole 0.12 mm from a track; a through-hole pad with a 0.1 mm ring; copper 0.1 mm
-    from the board edge."""
+    0.12 mm apart wall to wall (0.42 mm centre to centre: noted, not failed); a via hole 0.12 mm from a
+    track; a through-hole pad with a 0.1 mm ring; copper 0.1 mm from the board edge; two vias 0.18 mm
+    apart centre to centre; two vias that overlap; a slot whose end is 0.25 mm from a track; two
+    castellated holes too small (0.4 mm) and too close (0.48 mm edge to edge); copper 1 um beyond the edge clearance (marginal)."""
     b = Board(_p(out, name), layers=4, size=(40, 20))
     b.plane("In1.Cu", "GND")
     b.plane("In2.Cu", "GND")
@@ -275,6 +282,25 @@ def drill_board(out, name="drill", planted=True):
                                        "shape": "circle"}])
     y = 0.2 if p else 0.6
     b.track("F.Cu", [(25, y), (35, y)], 0.2, "F")
+    # hole spacing judged centre to centre (the owner's reading of JLCPCB's 0.2 mm): 0.15 mm vias
+    # 0.18 mm apart centre to centre fail; two 0.3 mm vias cutting into each other fail as such
+    b.via(6, 12, "GND", drill=0.15, size=0.3)
+    b.via(6.18 if p else 7.0, 12, "GND", drill=0.15, size=0.3)
+    b.via(10, 12, "GND", drill=0.3, size=0.5)
+    b.via(10.25 if p else 11.0, 12, "GND", drill=0.3, size=0.5)
+    # a plated slot (0.6 x 1.6 mm, along y) with a track of another net 0.25 mm beyond the end of its
+    # hole: a round hole of the slot's width at the pad centre would put the track 0.75 mm away
+    b.footprint("J2", "SLOT", 15, 14, [{"num": 1, "net": "G", "dx": 0, "dy": 0, "sx": 1.0, "sy": 2.0, "kind": "pth", "drill": 0.6,
+                                        "drill_y": 1.6}])
+    yt = 14 + 0.8 + (0.25 if p else 0.6) + 0.075
+    b.track("F.Cu", [(13.8, yt), (16.2, yt)], 0.15, "H")
+    # castellated holes (plated holes the board edge cuts): 0.4 mm holes 0.4 mm apart edge to edge,
+    # below JLCPCB's 0.5 mm for both
+    for k in range(2):
+        b.footprint(f"J{3 + k}", "CAST", 40, 8 + k * (0.88 if p else 1.4), [{"num": 1, "net": f"K{k}", "dx": 0, "dy": 0, "sx": 0.71 if p else 1.0,
+                                                                             "kind": "pth", "drill": 0.4 if p else 0.6, "shape": "circle"}])
+    # copper 1 um beyond the 0.2 mm edge clearance: inside the measuring slack, reported as marginal
+    b.track("B.Cu", [(5, 0.301 if p else 0.6), (10, 0.301 if p else 0.6)], 0.2, "M")
     return b.save()
 
 
@@ -338,4 +364,70 @@ def parts_board(out, name="parts", planted=True):
                                            {"num": 2, "net": "E2", "dx": 0.5, "dy": 0, "sx": 0.6, "mask": 0.0}], side="B", fpid=C0402)
     else:
         b.footprint("FID1", "Fiducial", 5, 25, [{"num": 1, "net": "", "dx": 0, "dy": 0, "sx": 1.0, "shape": "circle", "mask": 0.5}])
+    return b.save()
+
+
+def custom_pad_board(out, name="custom"):
+    """The pilot's U10 land pattern in miniature: a custom pad (0.2 mm anchor, 1.72 x 1.32 mm copper), a
+    paste-only custom aperture (1.2 x 0.75 mm), a rectangular pad with a negative paste margin. Positive
+    controls: a custom pad whose copper really is 0.2 x 0.2 mm (U2), and a paste-only custom aperture of
+    0.2 x 0.2 mm (U3)."""
+    b = Board(_p(out, name), layers=4, size=(40, 20))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    b.footprint("U1", "QFN", 10, 10, [
+        {"num": 3, "net": "GND", "dx": 0, "dy": 0, "sx": 0.2, "sy": 0.2, "shape": "custom", "prims": [(-0.86, -0.66, 0.86, 0.66)], "mask": 0.0},
+        {"num": "", "dx": 0, "dy": 2.5, "sx": 0.2, "sy": 0.2, "shape": "custom", "only": "paste", "prims": [(-0.6, -0.375, 0.6, 0.375)]},
+        {"num": 1, "net": "A", "dx": -3, "dy": 0, "sx": 0.8, "sy": 0.4, "mask": 0.0, "paste_margin": -0.05}],
+        fpid="Package_DFN_QFN:QFN-9_test", courtyard=(-4, -1.5, 1.5, 3.5))
+    b.footprint("U2", "QFN", 25, 10, [
+        {"num": 1, "net": "B", "dx": 0, "dy": 0, "sx": 0.2, "sy": 0.2, "shape": "custom", "prims": [(-0.1, -0.1, 0.1, 0.1)], "mask": 0.0}],
+        fpid="Package_DFN_QFN:QFN-1_test", courtyard=(-1, -1, 1, 1))
+    b.footprint("U3", "QFN", 32, 10, [
+        {"num": 1, "net": "C", "dx": 0, "dy": 0, "sx": 1.0, "sy": 1.0, "mask": 0.0},
+        {"num": "", "dx": 0, "dy": 0, "sx": 0.2, "sy": 0.2, "shape": "custom", "only": "paste", "prims": [(-0.1, -0.1, 0.1, 0.1)]}],
+        fpid="Package_DFN_QFN:QFN-1b_test", courtyard=(-1, -1, 1, 1))
+    return b.save()
+
+
+def order_board(out, name="order", layers=6, ic_pitch=None, chips=("0402",), via_in_pad=True):
+    """For the order options (plan phase 4): 0402-class chips (`chips` gives their EIA sizes), an IC with
+    `ic_pitch` mm pin pitch if given, and a via in one chip pad when `via_in_pad`."""
+    b = Board(_p(out, name), layers=layers, size=(40, 20))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    dims = {"01005": (0.4, 0.2, 0.2), "0201": (0.6, 0.3, 0.3), "0402": (1.0, 0.5, 0.5), "0603": (1.6, 0.8, 0.8)}
+    lib = {"01005": "Capacitor_SMD:C_01005_0402Metric", "0201": "Capacitor_SMD:C_0201_0603Metric",
+           "0402": C0402, "0603": "Capacitor_SMD:C_0603_1608Metric"}
+    for k, code in enumerate(chips):
+        L_, W_, _ = dims[code]
+        b.two_pin(f"C{k + 1}", "100n", 6 + 5 * k, 6, f"N{k}", "GND", pitch=L_, pad=(L_ / 2, W_), fpid=lib[code], mask=0.0)
+    if via_in_pad:
+        L_ = dims[chips[0]][0]
+        b.via(6 - L_ / 2, 6, "N0", drill=0.3, size=0.6)   # the pilot's vias in pads: 0.3 mm drill, 0.6 mm pad
+    if ic_pitch:
+        b.footprint("U1", "IC", 25, 12, [{"num": i + 1, "net": f"Q{i}", "dx": (i % 8) * ic_pitch, "dy": 2.0 * (i // 8),
+                                           "sx": ic_pitch / 2, "sy": 0.8, "mask": 0.0} for i in range(16)],
+                    fpid="Package_DFN_QFN:QFN-16_test", courtyard=(-0.6, -0.8, 8 * ic_pitch, 2.8))
+    b.footprint("FID1", "Fiducial", 3, 17, [{"num": 1, "net": "", "dx": 0, "dy": 0, "sx": 1.0, "shape": "circle", "mask": 0.5}])
+    return b.save()
+
+
+def class_board(out, name="classes"):
+    """Plan phase 5. C1: an 0402 whose pads are 1.05 mm apart (beyond the 1.0 mm body); C2: 0.95 mm (fine).
+    U1: a part named 'XYZ_123' from KiCad's Package_DFN_QFN library; U2: 'MYPART' with 8 pads on two sides
+    (classified by its pads); U3: a QFN-like part whose body (F.Fab, 6 x 6 mm) overhangs its pads by
+    1 mm, with C3 0.6 mm from the body and 1.6 mm from the pads."""
+    b = Board(_p(out, name), layers=4, size=(60, 30))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    b.two_pin("C1", "100n", 6, 6, "A1", "A2", pitch=1.05 + 0.5, pad=(0.5, 0.5), fpid=C0402, mask=0.0)
+    b.two_pin("C2", "100n", 12, 6, "B1", "B2", pitch=0.95 + 0.5, pad=(0.5, 0.5), fpid=C0402, mask=0.0)
+    b.footprint("U1", "IC", 22, 6, [{"num": i + 1, "net": f"P{i}", "dx": (i % 4) * 0.5, "dy": 2.0 * (i // 4), "sx": 0.25, "sy": 0.6, "mask": 0.0}
+                                     for i in range(8)], fpid="Package_DFN_QFN:XYZ_123", courtyard=(-0.5, -0.6, 2.0, 2.6))
+    b.footprint("U2", "IC", 32, 6, [{"num": i + 1, "net": f"Q{i}", "dx": (i % 4) * 0.65, "dy": 3.0 * (i // 4), "sx": 0.35, "sy": 1.0, "mask": 0.0}
+                                     for i in range(8)], fpid="MyLib:MYPART", courtyard=(-0.5, -0.8, 2.5, 3.8))
+    pads = [{"num": k + 1, "net": f"R{k}", "dx": -2 + (k % 5), "dy": -2 + 4 * (k // 5), "sx": 0.3, "sy": 0.6, "mask": 0.0} for k in range(10)]
+    b.footprint("U3", "IC", 45, 15, pads, fpid="Package_DFN_QFN:QFN-10_6x6mm", fab=(-3, -3, 3, 3), courtyard=(-3.2, -3.2, 3.2, 3.2))
+    b.two_pin("C3", "100n", 45 + 3 + 0.6 + 0.75, 15, "S1", "S2", pitch=1.0, pad=(0.5, 0.5), fpid=C0402, mask=0.0)
     return b.save()

@@ -41,8 +41,10 @@ from . import geom, packages, par, thermal
 from .drc import finding
 from .thermal import K_CU, K_FR4_IN, K_FR4_THRU, RHOC_CU, RHOC_FR4
 
-VARIANTS = (("film coefficient x 0.6", 0.6, 1.0), ("film coefficient x 1.6", 1.6, 1.0),
-            ("assumed bodies x 0.5", 1.0, 0.5), ("assumed bodies x 2", 1.0, 2.0))
+# Variants of the model's parameters (not of its form): the spread of a result over them is its
+# sensitivity to those parameters, not an error bar. Bodies are not varied: a part without body data
+# is left out of the model and listed, instead of being given an assumed body.
+VARIANTS = (("film coefficient x 0.6", 0.6, 1.0), ("film coefficient x 1.6", 1.6, 1.0))
 
 
 def _lu(A):
@@ -127,13 +129,21 @@ def build_model(ctx, fabr, h_scale=1.0, body_scale=1.0):
     N = A.shape[0]
     extra = np.zeros(N)
     parts, rows, cols, vals = [], [], [], []
+    left_out = []
     for ref, fp in b.fps.items():
         if fp.get("dnp") or not any(p["kind"] == "smd" for p in b.pads_by_ref.get(ref, [])):
+            continue
+        why = packages.not_a_part(fp, b.pads_by_ref.get(ref, []))
+        if why:
+            left_out.append({"ref": ref, "why": why})
             continue
         cov = _part_cover(ctx, mesh, fp)
         if cov.sum() <= 0:
             continue
         body = packages.body_of(fp, cfg)
+        if body["assumed"]:
+            left_out.append({"ref": ref, "why": "no body data: give its mass or height in [reflow.parts." + ref + "], or a Mass / Height field"})
+            continue
         scale = body_scale if body["assumed"] else 1.0
         l = 0 if fp["side"] == "F" else L - 1
         w = cov / cov.sum()
@@ -161,7 +171,7 @@ def build_model(ctx, fabr, h_scale=1.0, body_scale=1.0):
     for l in range(L):
         off[idx[l][bm]] = delay[bm]
     W = sp.csr_matrix((vals, (rows, cols)), shape=(len(parts), N)) if parts else sp.csr_matrix((0, N))
-    return {"mesh": mesh, "A": A, "idx": idx, "gconv": gconv, "cap": cap, "off": off, "parts": parts, "W": W,
+    return {"mesh": mesh, "A": A, "idx": idx, "gconv": gconv, "cap": cap, "off": off, "parts": parts, "W": W, "left_out": left_out,
             "h_top": h_top, "h_bot": h_bot, "belt_mm_s": v, "delay_s": float(delay[bm].max()), "cx": cx, "cy": cy}
 
 
@@ -219,7 +229,6 @@ def board(ctx, fabr, out_dir, log=print):
     node_peak = full.max(axis=0) if full is not None else None
     rows = []
     n_cold = max(1, int(round(0.1 * len(peaks)))) if len(peaks) else 0
-    cold_sets = [set(np.argsort(d)[:n_cold].tolist()) for d in dev.values()]
     for k, p in enumerate(M["parts"]):
         T = hp[:, k]
         above = T >= liq
@@ -227,7 +236,6 @@ def board(ctx, fabr, out_dir, log=print):
         row = {"ref": p["ref"], "x": p["x"], "y": p["y"], "side": "F" if p["layer"] == 0 else "B",
                "peak_c": round(float(T.max()), 1), "d_peak_c": round(ds[0], 1), "d_range_c": [round(min(ds), 1), round(max(ds), 1)],
                "tal_s": round(float(above.sum() * dt), 0), "lag_s": round(float(M["W"][k] @ tau), 1),
-               "always_coldest": bool(cold_sets) and all(k in s for s in cold_sets),
                "body": p["body"]["source"], "assumed": p["body"]["assumed"]}
         if node_peak is not None and len(p["nodes"]) >= 4:
             row["within_c"] = round(float(node_peak[p["nodes"]].max() - node_peak[p["nodes"]].min()), 1)
@@ -239,7 +247,7 @@ def board(ctx, fabr, out_dir, log=print):
         for row in rows:
             if -row["d_peak_c"] > j["reflow_cold_c"]:
                 fs.append(finding("reflow", "warning", f"{row['ref']} peaks {-row['d_peak_c']:.1f} C below the board median "
-                                  f"(range {-row['d_range_c'][1]:.1f} to {-row['d_range_c'][0]:.1f} C over the model variants), more than "
+                                  f"(sensitivity {-row['d_range_c'][1]:.1f} to {-row['d_range_c'][0]:.1f} C over the parameter variants), more than "
                                   f"{j['reflow_cold_c']:g} C (board config: {j['source']})", layer=b.layers[0 if row["side"] == "F" else -1],
                                   x=row["x"], y=row["y"], value=-row["d_peak_c"], limit=j["reflow_cold_c"], unit="C", part=row["ref"],
                                   kind="cold", basis=f"board config: {j['source']}"))
@@ -259,9 +267,9 @@ def board(ctx, fabr, out_dir, log=print):
     if rows:
         log(f"  {len(rows)} parts; spike zones shifted {shift:+.1f} C so that the median peak is {med:.1f} C"
             + (f" (target {target:g} C)" if target else "") + f"; belt {M['belt_mm_s']:.1f} mm/s, {M['delay_s']:.0f} s from leading to trailing edge")
-        log(f"  coldest {rows[0]['ref']} {rows[0]['d_peak_c']:+.1f} C from the median (range {rows[0]['d_range_c'][0]:+.1f} to "
-            f"{rows[0]['d_range_c'][1]:+.1f}), hottest {rows[-1]['ref']} {rows[-1]['d_peak_c']:+.1f} C; {n_assumed} of {len(rows)} bodies assumed; "
-            f"{len(dev)} model variants")
+        log(f"  coldest {rows[0]['ref']} {rows[0]['d_peak_c']:+.1f} C from the median (sensitivity {rows[0]['d_range_c'][0]:+.1f} to "
+            f"{rows[0]['d_range_c'][1]:+.1f}), hottest {rows[-1]['ref']} {rows[-1]['d_peak_c']:+.1f} C; {len(M.get('left_out', []))} footprints "
+            f"left out (no body data, or not a soldered part); {len(dev)} parameter variants")
     params = {"cell_mm": r["cell_mm"], "dt_s": dt, "h_top": M["h_top"], "h_bot": M["h_bot"],
               "h_source": fabr.src("h_w_m2k") if not r["h_top"] else "board config", "zones_c": zones, "zone_s": r["zone_s"],
               "cool_c": r["cool_c"], "cool_s": r["cool_s"], "shift_c": round(shift, 1), "target_c": target,
@@ -273,7 +281,8 @@ def board(ctx, fabr, out_dir, log=print):
                         "spread_c": round(rows[-1]["d_peak_c"] - rows[0]["d_peak_c"], 1) if rows else None,
                         "spread_range_c": [round(float(min(d.max() - d.min() for d in dev.values())), 1),
                                            round(float(max(d.max() - d.min() for d in dev.values())), 1)] if dev else None,
-                        "always_coldest": [x["ref"] for x in rows if x["always_coldest"]]},
+                        "left_out": M.get("left_out", []),
+                        "note": "the range is the spread over variants of the model's parameters: its sensitivity to them, not an error bar"},
             "_internal": {"M": M, "tau": lags, "hist": full, "t": t, "r": r, "shift": shift}}
 
 
@@ -687,11 +696,26 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
                 probs.append(f"{fp['ref']} ({name}): {e}")
         res["dt_range_s"] = [_sig(min(vals)), _sig(max(vals))]
         if internal and internal.get("hist") is not None:
-            try:
-                tc = chip_transient(chip_window(ctx, fp, chip, pads, hp, hf, p), internal, liq)
-                res["dt_oven_s"] = _sig(tc[x["last"]] - tc[x["first"]]) if None not in tc else None
-            except Exception as e:
-                probs.append(f"{fp['ref']} (transient): {e}")
+            # the oven figure is another quantity than dt (the belt carries one pad into each zone first, and
+            # the oven is not a slow ramp): it gets its own sensitivity, from the same variants run through the oven
+            ov = []
+            for name, kw in (("nominal", {}), ("paste x 0.5", {"paste_scale": 0.5}), ("paste x 2", {"paste_scale": 2.0}),
+                             ("window x 2", {"margin": 2 * p["margin_mm"]})):
+                try:
+                    tc = chip_transient(chip_window(ctx, fp, chip, pads, hp, hf, p, **kw), internal, liq)
+                    if None not in tc:
+                        ov.append(tc[x["last"]] - tc[x["first"]])
+                        if name == "nominal":
+                            res["dt_oven_s"] = _sig(ov[-1])
+                except Exception as e:
+                    probs.append(f"{fp['ref']} (transient, {name}): {e}")
+            if res.get("dt_oven_s") is not None and len(ov) > 1:
+                res["dt_oven_range_s"] = [_sig(min(ov)), _sig(max(ov))]
+        # self-check: each nominal lies inside its own sensitivity range
+        for key, rk in (("dt_s", "dt_range_s"), ("dt_oven_s", "dt_oven_range_s")):
+            v = x["dt_s"] if key == "dt_s" else res.get(key)
+            if v is not None and res.get(rk) and not (res[rk][0] - 1e-6 <= v <= res[rk][1] + 1e-6):
+                probs.append(f"{fp['ref']}: {key} {v} outside its own sensitivity range {res[rk]}")
         return res, probs
     top = range(min(p["detail"], len(out)))
     for i, (res, probs) in zip(top, par.pmap(detail, top, nw)):
@@ -707,7 +731,7 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
     if j.get("source") and j.get("joint_dt_s") is not None:
         for x in out:
             if x["dt_s"] >= j["joint_dt_s"]:
-                rng = f" (range {x['dt_range_s'][0]:g} to {x['dt_range_s'][1]:g} s)" if x.get("dt_range_s") else ""
+                rng = f" (sensitivity {x['dt_range_s'][0]:g} to {x['dt_range_s'][1]:g} s)" if x.get("dt_range_s") else ""
                 fs.append(finding("chips", "warning", f"{', '.join(x['refs'][:6])}{' ...' if x['n'] > 6 else ''} ({x['package']}): pad "
                                   f"{x['first_pad']} ({x['first_net']}) reaches liquidus {x['dt_s']:g} s before pad {x['last_pad']} "
                                   f"({x['last_net']}){rng}, at least {j['joint_dt_s']:g} s (board config: {j['source']})",

@@ -66,3 +66,16 @@ KiPI picks up a setup that sits next to the board as `<board>.kipi-setup.yml`, o
 `<board>.kipi-setup.json` (the older name, which it still reads). Copy `<run>/kipi/<board>.kipi-setup.json`
 there, onto a copy of the board project, not into a board folder another tool owns (the pilot's
 `kicad/` folder is read-only for openpcbsi).
+
+## File parsers (reading the board)
+
+| Path | What |
+|------|------|
+| `parsers.lock` | The pins: kicad-monkey 2026.9.7 (commit 4c029a39, its Python source identical to the PyPI sdist whose SHA-256 is recorded) and KiCadFiles 1.0.5 (tag v1.0.5), and kicad-monkey's dependencies with versions. |
+| `setup_parsers.sh` | Clones both at the pinned commits, installs the dependencies into `parsers-site/` (`--no-deps`: the system numpy is used), smoke-tests the imports. `--check` only verifies. |
+| `kicad_monkey/` | Clone of wavenumber-eng/kicad_monkey: the primary reader (openpcbsi/parse/monkey.py). |
+| `KiCadFiles/` | Clone of Steffen-W/KiCadFiles: the independent cross-check (openpcbsi/parse/kicadfiles.py). |
+| `parsers-site/` | kicad-monkey's dependencies (shapely, msgspec, ...). |
+
+Only `openpcbsi/parse/` imports the parsers, so a change of their APIs stays there. Change a pin only
+on purpose, then run acceptance tests 50 to 52: the corpus agreement with KiCad's own reading.

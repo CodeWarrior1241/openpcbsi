@@ -134,33 +134,33 @@ def heatmap(T, mesh, board, path, title):
 
 
 def marker_board(report, board_path, out_dir, layer="User.9"):
-    """Copy of the board with a circle and a text per finding (errors and warnings) on a user layer."""
-    import pcbnew
-    b = pcbnew.LoadBoard(board_path)
-    lid = b.GetLayerID(layer)
-    n = 0
+    """Copy of the board with a circle and a text per finding (errors and warnings) on a user layer
+    (`layer` if the board's layer table has it, else Cmts.User). Written as text into a copy of the board
+    file, so nothing else in the file changes and no KiCad library is needed."""
+    import re
+    import uuid
+    text = open(board_path, encoding="utf-8").read()
+    head = text[:text.find("(setup")] if "(setup" in text else text[:20000]
+    if f'"{layer}"' not in head:
+        layer = "Cmts.User"
+    esc = lambda t: t.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    items, n = [], 0
     for f in all_findings(report):
         if f["severity"] == "info" or f["x"] is None:
             continue
-        c = pcbnew.PCB_SHAPE(b)
-        c.SetShape(pcbnew.SHAPE_T_CIRCLE)
-        c.SetLayer(lid)
-        c.SetWidth(pcbnew.FromMM(0.05))
-        c.SetCenter(pcbnew.VECTOR2I(pcbnew.FromMM(f["x"]), pcbnew.FromMM(f["y"])))
-        c.SetEnd(pcbnew.VECTOR2I(pcbnew.FromMM(f["x"] + (0.6 if f["severity"] == "error" else 0.4)), pcbnew.FromMM(f["y"])))
-        b.Add(c)
-        t = pcbnew.PCB_TEXT(b)
-        t.SetText(f"{f['rule']}: {f['net']} {f['msg']}"[:90])
-        t.SetLayer(lid)
-        t.SetTextSize(pcbnew.VECTOR2I(pcbnew.FromMM(0.25), pcbnew.FromMM(0.25)))
-        t.SetTextThickness(pcbnew.FromMM(0.04))
-        t.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM(f["x"] + 0.7), pcbnew.FromMM(f["y"])))
-        t.SetHorizJustify(pcbnew.GR_TEXT_H_ALIGN_LEFT)
-        b.Add(t)
+        x, y = round(float(f["x"]), 4), round(float(f["y"]), 4)
+        r = 0.6 if f["severity"] == "error" else 0.4
+        items.append(f'\t(gr_circle (center {x} {y}) (end {round(x + r, 4)} {y}) (stroke (width 0.05) (type solid)) (fill no) '
+                     f'(layer "{layer}") (uuid "{uuid.uuid4()}"))')
+        msg = esc(f"{f['rule']}: {f['net']} {f['msg']}"[:90])
+        items.append(f'\t(gr_text "{msg}" (at {round(x + 0.7, 4)} {y} 0) (layer "{layer}") (uuid "{uuid.uuid4()}") '
+                     f'(effects (font (size 0.25 0.25) (thickness 0.04)) (justify left)))')
         n += 1
+    end = text.rstrip().rfind(")")
+    out_text = text[:end].rstrip() + "\n" + "\n".join(items) + "\n)\n"
     name = os.path.splitext(os.path.basename(board_path))[0] + "_openpcbsi.kicad_pcb"
     out = os.path.join(out_dir, name)
-    pcbnew.SaveBoard(out, b)
+    open(out, "w", encoding="utf-8").write(out_text)
     return os.path.basename(out), n
 
 

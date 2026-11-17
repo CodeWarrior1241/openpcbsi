@@ -40,8 +40,10 @@ def V(x, y):
 
 
 class Board:
-    def __init__(self, path, layers=4, size=(40.0, 20.0), stackup=None):
+    def __init__(self, path, layers=4, size=(40.0, 20.0), stackup=None, copper=None):
+        """`copper` overrides the finished copper thickness (mm) of named layers, e.g. {"In1.Cu": 0.07}."""
         self.path, self.n_layers, self.size = os.path.abspath(path), layers, size
+        self.copper = copper or {}
         self.stackup = stackup or STACKUPS[layers]
         self.b = pcbnew.NewBoard(self.path)
         self.b.SetCopperLayerCount(layers)
@@ -150,9 +152,13 @@ class Board:
                     side="F" if layer == "F.Cu" else "B")
         return name + "_P", name + "_N"
 
-    def footprint(self, ref, value, x, y, pads, fields=None, courtyard=None, side="F", fpid=None):
-        """pads: list of dicts {num, net, dx, dy, sx, sy, kind: smd|pth, drill, shape: rect|circle, pintype, func,
-        mask}. `mask` (mm) opens the solder mask and the paste over an SMD pad, grown by that margin.
+    def footprint(self, ref, value, x, y, pads, fields=None, courtyard=None, side="F", fpid=None, fab=None):
+        """pads: list of dicts {num, net, dx, dy, sx, sy, kind: smd|pth, drill, drill_y (an oblong hole), shape: rect|circle|custom, pintype,
+        func, mask, prims, only, paste_margin}. `mask` (mm) opens the solder mask and the paste over an SMD pad,
+        grown by that margin. A custom pad has an anchor of sx x sy and `prims`, rectangles (x0, y0, x1, y1)
+        relative to the pad centre, that make its real copper. `only` = "paste" or "mask" makes a pad that
+        exists on that technical layer alone (no copper), as land patterns with separate paste apertures
+        have. `paste_margin` (mm) sets the pad's paste margin.
         `fpid` is 'Library:Name' (the manufacturing checks read the package from the name)."""
         fp = pcbnew.FOOTPRINT(self.b)
         fp.SetReference(ref)
@@ -168,19 +174,42 @@ class Board:
             p.SetNumber(str(d["num"]))
             kind = d.get("kind", "smd")
             p.SetAttribute(pcbnew.PAD_ATTRIB_SMD if kind == "smd" else pcbnew.PAD_ATTRIB_PTH)
-            p.SetShape(pcbnew.PAD_SHAPE_CIRCLE if d.get("shape") == "circle" else pcbnew.PAD_SHAPE_RECTANGLE)
+            shape = d.get("shape")
+            p.SetShape(pcbnew.PAD_SHAPE_CIRCLE if shape == "circle" else pcbnew.PAD_SHAPE_RECTANGLE)
             p.SetSize(pcbnew.VECTOR2I(MM(d["sx"]), MM(d.get("sy", d["sx"]))))
+            only = d.get("only")
             if kind == "smd":
                 ls = pcbnew.LSET()
-                ls.AddLayer(cu)
-                if d.get("mask") is not None:
-                    ls.AddLayer(pcbnew.F_Mask if side == "F" else pcbnew.B_Mask)
+                if only == "paste":
                     ls.AddLayer(pcbnew.F_Paste if side == "F" else pcbnew.B_Paste)
-                    p.SetLocalSolderMaskMargin(MM(d["mask"]))
+                elif only == "mask":
+                    ls.AddLayer(pcbnew.F_Mask if side == "F" else pcbnew.B_Mask)
+                else:
+                    ls.AddLayer(cu)
+                    if d.get("mask") is not None:
+                        ls.AddLayer(pcbnew.F_Mask if side == "F" else pcbnew.B_Mask)
+                        ls.AddLayer(pcbnew.F_Paste if side == "F" else pcbnew.B_Paste)
+                        p.SetLocalSolderMaskMargin(MM(d["mask"]))
                 p.SetLayerSet(ls)
+                if d.get("paste_margin") is not None:
+                    p.SetLocalSolderPasteMargin(MM(d["paste_margin"]))
             else:
-                p.SetDrillSize(pcbnew.VECTOR2I(MM(d.get("drill", 0.3)), MM(d.get("drill", 0.3))))
+                dr = d.get("drill", 0.3)
+                p.SetDrillSize(pcbnew.VECTOR2I(MM(dr), MM(d.get("drill_y", dr))))
+                if d.get("drill_y") and abs(d["drill_y"] - dr) > 1e-9:
+                    p.SetDrillShape(pcbnew.PAD_DRILL_SHAPE_OBLONG)
                 p.SetLayerSet(pcbnew.PAD.PTHMask())
+            if shape == "custom":
+                lay = pcbnew.F_Cu if only is None else (pcbnew.F_Paste if only == "paste" else pcbnew.F_Mask)
+                if side != "F":
+                    lay = {pcbnew.F_Cu: pcbnew.B_Cu, pcbnew.F_Paste: pcbnew.B_Paste, pcbnew.F_Mask: pcbnew.B_Mask}[lay]
+                p.SetShape(lay, pcbnew.PAD_SHAPE_CUSTOM)
+                p.SetAnchorPadShape(lay, pcbnew.PAD_SHAPE_RECTANGLE)
+                for x0, y0, x1, y1 in d.get("prims", []):
+                    pts = pcbnew.VECTOR_VECTOR2I()
+                    for px_, py_ in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+                        pts.append(pcbnew.VECTOR2I(MM(px_), MM(py_)))
+                    p.AddPrimitivePoly(lay, pts, 0, True)
             p.SetPosition(V(x + d["dx"], y + d["dy"]))
             if d.get("net"):
                 p.SetNet(self.net(d["net"]))
@@ -191,6 +220,16 @@ class Board:
             fp.Add(p)
         for k, v in (fields or {}).items():
             fp.SetField(k, str(v))
+        if fab:                                       # the body outline on the fabrication layer
+            x0, y0, x1, y1 = fab
+            for (a, b_), (c, d_) in (((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)), ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))):
+                s = pcbnew.PCB_SHAPE(fp)
+                s.SetShape(pcbnew.SHAPE_T_SEGMENT)
+                s.SetLayer(pcbnew.F_Fab if side == "F" else pcbnew.B_Fab)
+                s.SetStart(V(x + a, y + b_))
+                s.SetEnd(V(x + c, y + d_))
+                s.SetWidth(MM(0.1))
+                fp.Add(s)
         if courtyard:
             x0, y0, x1, y1 = courtyard
             for (a, b_), (c, d_) in (((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)), ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))):
@@ -242,7 +281,7 @@ class Board:
              '\t\t\t(layer "F.Paste" (type "Top Solder Paste"))',
              f'\t\t\t(layer "F.Mask" (type "Top Solder Mask") (thickness {MASK[0]}) (epsilon_r {MASK[1]}))']
         for i, name in enumerate(cu):
-            t = OUTER_CU if name in ("F.Cu", "B.Cu") else INNER_CU
+            t = self.copper.get(name, OUTER_CU if name in ("F.Cu", "B.Cu") else INNER_CU)
             L.append(f'\t\t\t(layer "{name}" (type "copper") (thickness {t}))')
             if i < len(self.stackup):
                 dn, typ, th, er, tand = self.stackup[i]

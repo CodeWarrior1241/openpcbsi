@@ -1,0 +1,30 @@
+# File parsers for openpcbsi (plan phase 2). Change a pin only on purpose, together with a run of the
+# corpus agreement tests (tests/acceptance.py, the corpus items).
+#
+# kicad-monkey: primary parser. Its repository is a monorepo; release 2026.9.7 is the commit
+# "release: prepare KiCad toolchain 2026.9.7" (tag kicad-cruncher-v2026.9.7). Its Python source
+# (src/py) is identical to the PyPI sdist kicad_monkey-2026.9.7.tar.gz, whose SHA-256 is recorded.
+[kicad_monkey]
+repo = "https://github.com/wavenumber-eng/kicad_monkey"
+version = "2026.9.7"
+commit = "4c029a39f38304ca4d39beddabb93c117bbb6653"
+dir = "kicad_monkey"
+python_path = "kicad_monkey/src/py"
+sdist_sha256 = "deaee71ac27d4bb423f7f81ac7d320fcb631ba59d7b63623132bfa20b7c7d3e4"
+license = "MIT"
+
+# KiCadFiles: independent cross-check parser (no dependencies).
+[kicadfiles]
+repo = "https://github.com/Steffen-W/KiCadFiles"
+version = "1.0.5"
+tag = "v1.0.5"
+commit = "41554b5e61a7660ec566801c61dab0f6ba18eb60"
+dir = "KiCadFiles"
+python_path = "KiCadFiles"
+sdist_sha256 = "3417c7d94248e63bb464025cd04bda89619ad75a4fae2c079388059ea57838a7"
+license = "MIT"
+
+# kicad-monkey's dependencies, installed with --no-deps into parsers-site (the system numpy is used).
+[site]
+dir = "parsers-site"
+requirements = ["colorama==0.4.6", "freetype-py==2.5.1", "msgspec==0.22.0", "shapely==2.2.0", "trimesh==5.2.1", "uharfbuzz==0.57.0", "zstandard==0.25.0"]

@@ -5,6 +5,7 @@ from the tables below; every other part is a block over its courtyard with an as
 the board config (`[reflow.parts.REF]`) or a footprint field (`Mass`, `Height`) says otherwise. All
 of these are approximate and the report states which source each part used.
 """
+import math
 import re
 
 import numpy as np
@@ -116,17 +117,54 @@ PART_CLASSES = (("BGA", "BGA"), ("CSP", "BGA"), ("LGA", "BGA"), ("QFN", "QFN"), 
                 ("SSOP", "SOP"), ("TSSOP", "SOP"), ("MSOP", "SOP"), ("SOP", "SOP"), ("SOT", "SOT"), ("SC-70", "SOT"), ("TSOT", "SOT"))
 
 
-def part_class(fp):
-    """Package class for the fabricator's part-spacing table: an EIA chip size, or QFN / QFP / SOP / SOT /
-    BGA from the footprint name; None when the name says neither."""
+# KiCad's standard library nicknames by package class
+LIB_CLASSES = (("PACKAGE_BGA", "BGA"), ("PACKAGE_CSP", "BGA"), ("PACKAGE_DFN_QFN", "QFN"), ("PACKAGE_QFP", "QFP"),
+               ("PACKAGE_SO", "SOP"), ("PACKAGE_TO_SOT_SMD", "SOT"))
+
+
+def part_class_how(fp, pads=None):
+    """(class, how it was decided) for the fabricator's part-spacing table: an EIA chip size, or QFN / QFP /
+    SOP / SOT / BGA. Decided from the footprint's EIA size, its KiCad library, its name, then its pads;
+    (None, why) when none of these places it."""
     chip = chip_of(fp)
     if chip:
-        return chip["code"]
-    name = (fp.get("fpid") or "").split(":")[-1].upper() + " " + str(fp.get("value") or "").upper()
+        return chip["code"], "EIA size in the footprint name"
+    lib, _, name = (fp.get("fpid") or "").partition(":")
+    if not name:
+        lib, name = "", lib
+    for key, cls in LIB_CLASSES:
+        if lib.upper().startswith(key):
+            return cls, f"KiCad library {lib}"
+    if lib.upper().startswith("CONNECTOR") or (re.match(r"(J|P|CN|X)\d", fp.get("ref") or "") and not chip_of(fp)):
+        return None, "a connector: the assembler's table has no class for connectors"
+    text = name.upper() + " " + str(fp.get("value") or "").upper()
     for key, cls in PART_CLASSES:
-        if key in name:
-            return cls
-    return None
+        if key in text:
+            return cls, f"'{key}' in the footprint name"
+    if pads:
+        smd = [p for p in pads if p["kind"] == "smd" and p.get("layers") and str(p["num"]).strip()]
+        nums = {str(p["num"]) for p in smd}
+        if len(nums) >= 9 and all(p.get("shape") == "circle" for p in smd):
+            return "BGA", f"{len(nums)} round pads"
+        if len(nums) == 3:
+            return "SOT", "three pads"
+        if len(nums) >= 4:
+            xy = np.array([(p["x"], p["y"]) for p in smd])
+            cx, cy = xy.mean(axis=0)
+            rot = math.radians(fp.get("rot") or 0.0)
+            u = (xy[:, 0] - cx) * math.cos(rot) - (xy[:, 1] - cy) * math.sin(rot)
+            v = (xy[:, 0] - cx) * math.sin(rot) + (xy[:, 1] - cy) * math.cos(rot)
+            rows = len(set(np.round(v, 2))) <= 3 and len(set(np.round(u, 2))) > 3
+            cols = len(set(np.round(u, 2))) <= 3 and len(set(np.round(v, 2))) > 3
+            if rows or cols:
+                return "SOP", "pins on two sides"
+            return None, f"{len(nums)} pins on more than two sides: QFN or QFP cannot be told from the pads alone"
+        return None, f"{len(nums)} numbered SMD pads and no package class in its name or library"
+    return None, "no package class in its name or library"
+
+
+def part_class(fp, pads=None):
+    return part_class_how(fp, pads)[0]
 
 
 def land_pattern(chip, pads):
@@ -148,3 +186,82 @@ def land_pattern(chip, pads):
     return {"gap_mm": round(gap, 3), "span_mm": round(span, 3), "toe_mm": round((span - chip["L"]) / 2, 3),
             "width_ratio": round(width / chip["W"], 2), "area_ratio": round(max(areas) / max(min(areas), 1e-9), 2),
             "body": f"{chip['L']:g} x {chip['W']:g} mm"}
+
+
+def pin_pitch(pads, min_pins=4):
+    """The smallest distance between two distinct pin positions of a part's SMD pads (a pin drawn as
+    several pads counts once), or None for fewer than `min_pins` pins."""
+    pins = {}
+    for p in pads:
+        if p["kind"] == "smd" and p.get("layers") and str(p["num"]).strip():
+            pins.setdefault(str(p["num"]), (p["x"], p["y"]))
+    if len(pins) < min_pins:
+        return None
+    from scipy.spatial import cKDTree
+    xy = np.array(list(pins.values()))
+    d = cKDTree(xy).query(xy, k=2)[0][:, 1]
+    d = d[d > 1e-6]
+    return float(d.min()) if len(d) else None
+
+
+def stencil_prediction(b, guide):
+    """The stencil thickness a fabricator's guide gives for this board: per placed SMD part, the row for
+    its chip size or its pin / ball pitch; the board's finest part decides. Returns {thickness_mm, part,
+    row, uncovered: [refs the guide does not cover]}."""
+    rows = guide.get("rows", [])
+    larger = guide.get("larger_mm")
+    best, uncovered = None, []
+    for ref, fp in b.fps.items():
+        pads = [p for p in b.pads_by_ref.get(ref, []) if p["kind"] == "smd" and p.get("layers")]
+        if fp.get("dnp") or not fp.get("placed", True) or not pads:
+            continue
+        chip = chip_of(fp)
+        t, row = None, None
+        if chip:
+            r = next((r for r in rows if r.get("kind") == "chip" and r.get("size") == chip["code"]), None)
+            if r:
+                t, row = r["thickness_mm"], f"{chip['code']} chips"
+            elif size_rank(chip["code"]) < min((size_rank(r["size"]) for r in rows if r.get("kind") == "chip"), default=0):
+                uncovered.append(f"{ref} ({chip['code']})")
+                continue
+            else:
+                t, row = larger, f"{chip['code']} chips (larger parts)"
+        else:
+            pitch = pin_pitch(pads)
+            if pitch is None:
+                t, row = larger, "parts with fewer than 4 pins (larger parts)"
+            else:
+                kind = "bga" if part_class(fp) == "BGA" else "ic"
+                cand = sorted((r for r in rows if r.get("kind") == kind), key=lambda r: r["pitch_mm"])
+                fit = [r for r in cand if r["pitch_mm"] <= pitch + 1e-3]
+                if not fit:
+                    uncovered.append(f"{ref} ({kind.upper()} pitch {pitch:.2f} mm)")
+                    continue
+                r = fit[-1]
+                t, row = r["thickness_mm"], f"{kind.upper()} pitch {r['pitch_mm']:g} mm (this part: {pitch:.2f} mm)"
+        if t is not None and (best is None or t < best[0]):
+            best = (t, ref, row)
+    return {"thickness_mm": None if (uncovered or best is None) else best[0], "part": best[1] if best else None,
+            "row": best[2] if best else None, "uncovered": uncovered}
+
+
+NOT_PARTS = ("FIDUCIAL", "TESTPOINT", "TEST_POINT", "MOUNTINGHOLE", "MOUNTING_HOLE")
+NOT_PART_REFS = ("FID", "TP", "MH", "H")
+
+
+def not_a_part(fp, pads):
+    """Why a footprint is not a part that is soldered in reflow (a fiducial, a test point, a mounting hole,
+    a board-only or BOM-excluded footprint, or one with no paste), else None."""
+    if fp.get("board_only"):
+        return "board-only footprint"
+    if fp.get("in_bom") is False:
+        return "excluded from the BOM"
+    name = (fp.get("fpid") or "").upper()
+    if any(k in name for k in NOT_PARTS):
+        return "fiducial, test point or mounting hole (footprint)"
+    m = re.match(r"[A-Za-z]+", fp.get("ref") or "")
+    if m and m.group(0).upper() in NOT_PART_REFS:
+        return f"reference {m.group(0).upper()}"
+    if not any(p.get("paste") for p in pads):
+        return "no paste on any pad"
+    return None

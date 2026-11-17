@@ -114,6 +114,7 @@ def main(argv=None):
     dm.add_argument("--json", dest="json_out")
     dm.add_argument("-o", "--out")
     dm.add_argument("--no-markers", action="store_true")
+    dm.add_argument("--no-cross-check", action="store_true", help="do not read the board a second time with KiCadFiles")
     a = ap.parse_args(argv)
     from . import run as runmod
     if getattr(a, "live", False):                 # #32: the board open in KiCad
@@ -160,7 +161,8 @@ def main(argv=None):
         from .snapshot import InputError
         try:
             code, _ = dfm.run(a.board, a.config, a.fab, a.checks.split(",") if a.checks else None, a.out, a.waivers,
-                              a.json_out, markers=not a.no_markers, gerbers=a.gerbers, observed=a.observed)
+                              a.json_out, markers=not a.no_markers, gerbers=a.gerbers, observed=a.observed,
+                              cross=not a.no_cross_check)
         except Exception as ex:  # 3 = could not evaluate
             if not isinstance(ex, (InputError, FileNotFoundError, ValueError)):
                 import traceback

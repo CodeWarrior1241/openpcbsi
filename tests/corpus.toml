@@ -1,0 +1,47 @@
+# Reference corpus (plan phase 0): real boards whose readings are recorded once from KiCad itself and
+# compared with every later reader. `python3 tests/harness/corpus.py build [NAME...]` writes
+# corpus/<name>/ (gitignored: the boards are not ours to publish). `source` may use environment
+# variables; an entry whose source is missing is skipped and reported.
+#
+# Each entry is recorded with:
+#   snapshot_pcbnew.json.gz   openpcbsi's snapshot through KiCad's pcbnew (the golden reading)
+#   ipc2581.xml               `kicad-cli pcb export ipc2581`: KiCad's own pad and copper geometry
+#   drc.json                  `kicad-cli pcb drc --format json --all-track-errors --refill-zones`
+#   gerbers/                  `kicad-cli pcb export gerbers` and `export drill`
+#   pos.csv                   `kicad-cli pcb export pos`
+
+[[board]]
+name = "pilot"
+source = "${OPENPCBSI_PILOT_BOARD}"
+why = "8-layer FPGA board: custom pads (U10-U14), paste-only and mask-only pads, 15 um inner copper"
+
+[[board]]
+name = "antmicro_si"
+source = "${OPENPCBSI_ROOT}/cache/references/antmicro_si_de0b5922c3_5001f1a95c/si-simulation-test-board.kicad_pcb"
+why = "fabricated and measured board (#8); test 46's oracle board"
+
+[[board]]
+name = "jetson_thor"
+source = "${KICAD_DEMOS}/jetson-agx-thor-baseboard/jetson-agx-thor-baseboard.kicad_pcb"
+why = "large dense board, 71 custom pads"
+ipc2581 = false        # kicad-cli's IPC-2581 export of this 85 MB board ran over 80 minutes
+
+[[board]]
+name = "royalblue54l"
+source = "${KICAD_DEMOS}/royalblue54L_feather/RoyalBlue54L-Feather.kicad_pcb"
+why = "39 custom pads, many oval pads"
+
+[[board]]
+name = "tinytapeout"
+source = "${KICAD_DEMOS}/tiny_tapeout/tinytapeout-demo.kicad_pcb"
+why = "16 custom pads, oval holes"
+
+[[board]]
+name = "one_air_max"
+source = "${KICAD_DEMOS}/openair-max/One-Air-Max.kicad_pcb"
+why = "12 custom pads"
+
+[[board]]
+name = "cm5_minima"
+source = "${KICAD_DEMOS}/cm5_minima/CM5_MINIMA_3.kicad_pcb"
+why = "connector-heavy board with oval holes"

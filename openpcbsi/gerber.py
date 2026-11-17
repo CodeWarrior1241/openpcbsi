@@ -145,7 +145,8 @@ def read(path):
     Returns {"function", "polarity", "ops", "unsupported"}; ops are (dark, "poly", points) and
     (dark, "capsule", x1, y1, x2, y2, r) in drawing order."""
     text = open(path, encoding="latin-1").read()
-    out = {"function": None, "polarity": "Positive", "ops": [], "unsupported": set(), "path": path}
+    out = {"function": None, "polarity": "Positive", "ops": [], "unsupported": set(), "path": path,
+           "flashes": [], "draws": []}     # flashes: (x, y, w, h, area, dark); draws: (x0, y0, x1, y1, r, dark), Gerber axes
     bad = out["unsupported"]
     macros, aps = {}, {}
     scale, dec = 1.0, 6
@@ -166,10 +167,19 @@ def read(path):
         if a is None:
             bad.add("flash without an aperture")
             return
+        xs, ys, area = [], [], 0.0
         for p in a.polys:
             out["ops"].append((dark, "poly", [(px + u, py + v) for u, v in p]))
+            xs += [u for u, v in p]
+            ys += [v for u, v in p]
+            area += abs(0.5 * sum(p[k][0] * p[k - 1][1] - p[k - 1][0] * p[k][1] for k in range(len(p))))
         for cx, cy, r in a.circles:
             out["ops"].append((dark, "capsule", px + cx, py + cy, px + cx, py + cy, r))
+            xs += [cx - r, cx + r]
+            ys += [cy - r, cy + r]
+            area += math.pi * r * r
+        if xs:
+            out["flashes"].append((px, py, max(xs) - min(xs), max(ys) - min(ys), area, dark))
 
     def draw(x0, y0, x1, y1):
         if region:
@@ -182,6 +192,7 @@ def read(path):
             bad.add("draw with a non-circular aperture")
             return
         out["ops"].append((dark, "capsule", x0, y0, x1, y1, a.diameter / 2))
+        out["draws"].append((x0, y0, x1, y1, a.diameter / 2, dark))
 
     i, n = 0, len(text)
     while i < n:

@@ -139,6 +139,7 @@ class Board:
             "net": np.array([self.net_id.get(t["net"], 0) for t in T], dtype=np.int64),
         }
         self.tracks["len"] = np.hypot(self.tracks["x2"] - self.tracks["x1"], self.tracks["y2"] - self.tracks["y1"])
+        self.tracks["arc"] = np.array([bool(t.get("arc")) for t in T], dtype=bool)          # chords of an arc track
         V = snap["vias"]
         self.vias = {
             "x": np.array([v["x"] for v in V]), "y": np.array([v["y"] for v in V]),

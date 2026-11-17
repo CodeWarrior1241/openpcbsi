@@ -2,6 +2,7 @@
 cache/
 runs/
 tests/out/
+corpus/
 
 # KiPI: recreated from deps/kipi.lock by deps/setup_kipi.sh
 deps/KiPI
@@ -16,7 +17,13 @@ __pycache__/
 # internal design documents, kept out of the public repository
 REQUIREMENTS.md
 docs/G0_survey.md
+PLAN_dfm_and_parsers.md
 
 # pip install build output (#36)
 build/
 *.egg-info/
+
+# file parsers: recreated from deps/parsers.lock by deps/setup_parsers.sh
+deps/kicad_monkey
+deps/KiCadFiles
+deps/parsers-site

@@ -1,170 +1,213 @@
 # Fabricator profile: JLCPCB (exemplar for `openpcbsi dfm`).
 #
-# Every value under [published] is from JLCPCB's own capability pages, as read on the date below.
-# Values under [standard] come from a published industry standard, not from the fabricator.
-# Values under [assumed] are on neither: they are typical figures used only by the ranking models,
-# never by a check that can fail a board.
+# Every value under [published] is from JLCPCB's own pages, as read on the date below, and carries:
+#   page        a key of [fab.pages]
+#   quote       the page's own words for the value (row label and cell, or the sentence)
+#   measurand   what is measured (see docs/dfm.md, "What a limit measures")
+#   certainty   stated (the page says what it measures; the default), interpreted (the profile had to
+#               choose; a rule judging with it can warn but not fail), chosen (the board owner's
+#               choice, named in `note`), confirmed (the fabricator answered; `note` says who and when)
+#   use         limit (judged by a rule; the default), order (an order option: the order checklist),
+#               input (an input to a model or a choice), record (recorded, not judged)
+#   conflict    another page of the same fabricator that gives a different figure
+# Values under [standard] come from a published industry standard; [guidance] from the fabricator's
+# design articles (not its capability pages); [assumed] are on neither and are used only by rankings.
 # Copy this file to describe another fabricator; `dfm --fab FILE` reads it.
 
 [fab]
 name = "JLCPCB"
 retrieved = "2026-11-16"
-sources = [
-    "https://jlcpcb.com/capabilities/pcb-capabilities",
-    "https://jlcpcb.com/capabilities/pcb-assembly-capabilities",
-    "https://jlcpcb.com/capabilities/pcb-stencil-manufacturing",
-    "https://jlcpcb.com/help/article/minimum-spacing-for-smd-components",
-]
 
-# ---- track width / spacing by layer count and finished outer copper weight ----------------------
-# `layers` is [min, max] copper layers; `oz` the finished outer copper weight the row applies to.
-# `bga_mm` is the width / spacing accepted locally in a BGA fan-out.
+[fab.pages]
+main = "https://jlcpcb.com/capabilities/pcb-capabilities"
+assembly = "https://jlcpcb.com/capabilities/pcb-assembly-capabilities"
+stencil = "https://jlcpcb.com/capabilities/pcb-stencil-manufacturing"
+stencil_order = "https://jlcpcb.com/help/article/instructions-for-stencil-order"
+stencil_guide = "https://jlcpcb.com/blog/how-to-choose-a-solder-paste-stencil"
+stencil_design = "https://jlcpcb.com/blog/design-guidelines-for-industry-standard-stencils"
+via_covering = "https://jlcpcb.com/help/article/pcb-via-covering"
+via_finishes = "https://jlcpcb.com/blog/five-via-finishes"
+part_spacing = "https://jlcpcb.com/help/article/minimum-spacing-for-smd-components"
+castellated = "https://jlcpcb.com/blog/142-castellated-pcbs-introduction-and-design-requirements"
+
+# ---- track width / spacing by layer count and finished copper weight ----------------------------
+# `layers` is [min, max] copper layers; `oz` the finished copper weight of the layer the row applies
+# to. JLCPCB gives no separate row for inner layers; their default copper is 0.5 oz ("Finished copper
+# weight of inner layer is 0.5oz by default"), for which no row exists: the 1 oz row is used (heavier
+# copper needs the wider figure, so this is the strict side) and the finding says so.
 [[published.track]]
 layers = [1, 2]
 oz = 1.0
 width_mm = 0.10
 space_mm = 0.10
+page = "main"
+quote = "Min. track width and spacing (1 oz): 1- and 2-layer: 0.10 / 0.10 mm (4 / 4 mil)"
 
 [[published.track]]
 layers = [3, 32]
 oz = 1.0
 width_mm = 0.09
 space_mm = 0.09
-bga_mm = 0.076
+bga_mm = 0.0762
+page = "main"
+quote = "Multilayer: 0.09 / 0.09 mm (3.5 / 3.5 mil). 3 mil is acceptable in BGA fan-outs."
 
 [[published.track]]
 layers = [1, 2]
 oz = 2.0
 width_mm = 0.16
 space_mm = 0.16
+page = "main"
+quote = "Min. track width and spacing (2 oz): 2-layer: 0.16 / 0.16 mm (6.5 / 6.5 mil)"
 
 [[published.track]]
 layers = [3, 32]
 oz = 2.0
 width_mm = 0.15
 space_mm = 0.15
+page = "main"
+quote = "Multilayer: 0.15 / 0.15 mm (6 / 6 mil)"
 
 [[published.track]]
 layers = [1, 2]
 oz = 2.5
 width_mm = 0.20
 space_mm = 0.20
+page = "main"
+quote = "Min. track width and spacing (2.5 oz): 2 layer: 0.2/0.2mm(8mil/8mil)"
 
 [[published.track]]
 layers = [1, 2]
 oz = 3.5
 width_mm = 0.25
 space_mm = 0.25
+page = "main"
+quote = "Min. track width and spacing (3.5 oz): 2 layer: 0.25/0.25mm(10mil/10mil)"
 
 [[published.track]]
 layers = [1, 2]
 oz = 4.5
 width_mm = 0.30
 space_mm = 0.30
+page = "main"
+quote = "Min. track width and spacing (4.5 oz): 2 layer: 0.3/0.3mm(12mil/12mil)"
 
 [published.etch]
-same_net_spacing_mm = 0.25      # "Same-net track spacing"
-track_tolerance_pct = 20.0      # "Track width tolerance" of the finished track: recorded, not judged
+same_net_spacing_mm = { value = 0.25, page = "main", quote = "Same-net track spacing: 0.25mm", measurand = "copper_gap" }
+track_tolerance_pct = { value = 20.0, page = "main", quote = "Track width tolerance: ±20%", measurand = "finished_track_width", use = "record" }
 
-# ---- holes ("Drilling" table) ---------------------------------------------------------------------
+# ---- holes ------------------------------------------------------------------------------------------
 [published.drill]
-via_hole_min_mm = 0.15          # "Min. Via hole size/diameter 0.15/0.25mm"
-via_diameter_min_mm = 0.25
-via_diameter_over_hole_mm = 0.10   # "Via diameter should be 0.1mm (0.15mm preferred) larger than Via hole size"
-npth_min_mm = 0.50              # "Min. Non-plated holes"
-drill_max_mm = 6.3              # "Drill Diameter 0.15 - 6.3 mm"
-via_hole_spacing_mm = 0.20      # "Via Hole-to-Hole Spacing"; taken as wall to wall (see [notes])
-pad_hole_spacing_mm = 0.45      # "Pad Hole-to-Hole Spacing"; taken as wall to wall
-plated_slot_min_2l_mm = 0.50    # "Min. Plated Slots Width"
-plated_slot_min_ml_mm = 0.35
+via_hole_min_mm = { value = 0.15, page = "main", quote = "Min. Via hole size/diameter: 0.15/0.25mm", measurand = "drill", note = "the same page prefers 0.2 mm (\"Preferred Min. Via hole size: 0.2mm\")" }
+via_diameter_min_mm = { value = 0.25, page = "main", quote = "2-layer: 0.15mm hole size / 0.25mm via diameter", measurand = "via_pad_diameter" }
+via_diameter_over_hole_mm = { value = 0.10, page = "main", quote = "Via diameter should be 0.1mm(0.15mm preferred) larger than Via hole size.", measurand = "via_pad_minus_drill" }
+npth_min_mm = { value = 0.50, page = "main", quote = "Min. Non-plated holes: 0.50mm", measurand = "drill" }
+drill_max_mm = { value = 6.3, page = "main", quote = "Drill Diameter: Multilayer: 0.15 – 6.3 mm", measurand = "drill" }
+via_hole_spacing_mm = { value = 0.20, page = "main", quote = "Via Hole-to-Hole Spacing: 0.2mm", measurand = "hole_centre_to_centre", certainty = "chosen", note = "no JLCPCB page says whether hole-to-hole spacing is measured wall to wall or centre to centre; the board owner chose centre to centre (the lenient reading: a pair that passes it but not wall to wall is noted)" }
+pad_hole_spacing_mm = { value = 0.45, page = "main", quote = "Pad Hole-to-Hole Spacing: 0.45mm", measurand = "hole_centre_to_centre", certainty = "chosen", note = "as via_hole_spacing_mm" }
+plated_slot_min_2l_mm = { value = 0.50, page = "main", quote = "Min. Plated Slots Width: 2-layer: 0.5mm", measurand = "slot_width" }
+plated_slot_min_ml_mm = { value = 0.35, page = "main", quote = "Min. Plated Slots Width: Multi-layer: 0.35mm", measurand = "slot_width" }
+castellated_hole_min_mm = { value = 0.50, page = "main", quote = "Min. Castellated Holes: 0.5mm; ① Hole diameter (Φ): ≥ 0.5 mm", measurand = "drill", conflict = "the castellated-PCB guide gives 0.6 mm minimum, 0.8 mm recommended (castellated page)" }
+castellated_spacing_mm = { value = 0.50, page = "main", quote = "③ Hole to hole (D): ≥ 0.5 mm", measurand = "hole_wall_to_wall", note = "the castellated-PCB guide measures it \"Castellated hole edge to hole edge\"", conflict = "the castellated-PCB guide gives 0.6 mm (castellated page)" }
 
-# "PTH annular ring" by layer count and outer copper weight: absolute minimum and recommended
+# "PTH annular ring" by layer count and copper weight: absolute minimum and recommended
 [[published.pth_ring]]
 layers = [1, 2]
 oz = 1.0
 min_mm = 0.18
 recommended_mm = 0.25
+page = "main"
+quote = "PTH annular ring, 2-layer: 1 oz: Recommended 0.25 mm or above; absolute minimum 0.18 mm"
 
 [[published.pth_ring]]
 layers = [3, 32]
 oz = 1.0
 min_mm = 0.15
 recommended_mm = 0.20
+page = "main"
+quote = "Multilayer: 1 oz: Recommended 0.20 mm or above; absolute minimum 0.15 mm"
 
 [[published.pth_ring]]
 layers = [1, 32]
 oz = 2.0
 min_mm = 0.254
 recommended_mm = 0.254
+page = "main"
+quote = "2 oz: 0.254 mm or above"
 
-# ---- clearances ("Traces" and "Outline" tables), from the hole wall or the copper edge -------------
+# ---- clearances -----------------------------------------------------------------------------------
 [published.clearance]
-via_hole_to_copper_mm = 0.20        # "Via hole to Track"
-pth_hole_to_copper_mm = 0.28        # "PTH to Track" (0.35 recommended)
-npth_hole_to_copper_mm = 0.20       # "NPTH to Track"
-inner_via_hole_to_copper_mm = 0.20  # "Inner layer via hole to copper clearance"
-inner_pth_hole_to_copper_mm = 0.30  # "Inner layer PTH pad hole to copper clearance"
-pad_to_track_mm = 0.10              # "Pad to track clearance (1oz)"
-bga_pad_to_track_mm = 0.09          # "Min. 0.09 mm locally for BGA pads"
-copper_to_edge_mm = 0.20            # "Copper clearance from routed board edges"
-copper_to_vcut_mm = 0.40
+via_hole_to_copper_mm = { value = 0.20, page = "main", quote = "Via hole to Track: 0.2mm", measurand = "hole_wall_to_copper" }
+pth_hole_to_copper_mm = { value = 0.28, page = "main", quote = "PTH to Track: 0.28mm (0.35mm is recommended, minimum 0.28mm)", measurand = "hole_wall_to_copper" }
+npth_hole_to_copper_mm = { value = 0.20, page = "main", quote = "NPTH to Track: 0.2mm", measurand = "hole_wall_to_copper" }
+inner_via_hole_to_copper_mm = { value = 0.20, page = "main", quote = "Inner layer via hole to copper clearance: 0.2mm", measurand = "hole_wall_to_copper" }
+inner_pth_hole_to_copper_mm = { value = 0.30, page = "main", quote = "Inner layer PTH pad hole to copper clearance: 0.3mm", measurand = "hole_wall_to_copper" }
+pad_to_track_mm = { value = 0.10, page = "main", quote = "Pad to track clearance (1oz): 0.1mm", measurand = "copper_gap" }
+bga_pad_to_track_mm = { value = 0.09, page = "main", quote = "BGA pad to trace clearance ≥ 0.1 mm (min. 0.09 mm for multilayer boards)", measurand = "copper_gap", note = "0.09 mm on multilayer boards; 0.1 mm otherwise" }
+copper_to_edge_mm = { value = 0.20, page = "main", quote = "Copper clearance from routed board edges: ≧0.2 mm", measurand = "copper_to_board_edge" }
+copper_to_vcut_mm = { value = 0.40, page = "main", quote = "Copper clearance from V-cut board edges: ≧0.4 mm", measurand = "copper_to_board_edge", use = "record", note = "the board file does not say which edges are V-cut" }
 
 [published.board]
-thickness_min_mm = 0.4
-thickness_max_mm = 4.5
+thickness_min_mm = { value = 0.4, page = "main", quote = "Thickness: 0.4 – 4.5 mm", measurand = "board_thickness" }
+thickness_max_mm = { value = 4.5, page = "main", quote = "Thickness: 0.4 – 4.5 mm", measurand = "board_thickness", conflict = "the same page's FAQ says \"standard thicknesses from 0.4 mm to 3.2 mm\"" }
 
 # ---- via covering ----------------------------------------------------------------------------------
 [published.via_cover]
-filled_default_from_layers = 6      # epoxy filled and capped "is the default for 6-layer and above"
-filled_via_min_mm = 0.15            # via diameters the filled-and-capped process accepts
-filled_via_max_mm = 0.55
-plugged_via_max_mm = 0.50           # soldermask-plugged vias
-plugged_to_opening_mm = 0.35        # plugged via to another mask opening
+filled_default_from_layers = { value = 6, page = "main", quote = "② This process is the default for 6-layer and above multilayer boards.", measurand = "layer_count", use = "order" }
+filled_order_note = { value = "say which vias to fill", page = "via_covering", quote = "For epoxy-filled vias, please leave a note or upload an image along with your design files to explain which vias should be filled.", measurand = "order_option", use = "order" }
+filled_via_min_mm = { value = 0.15, page = "main", quote = "Compatible with via diameters from 0.15 to 0.55 mm.", measurand = "drill", note = "the lower bound is the smallest mechanical drill; the range is read as drill sizes, as the via-covering article states for its upper bound" }
+filled_via_max_mm = { value = 0.50, page = "via_covering", quote = "Plugged and epoxy-filled vias holes should not be larger than 0.5 mm as larger holes may be incompletely filled.", measurand = "drill", conflict = "the capability page says \"Compatible with via diameters from 0.15 to 0.55 mm\" (main page); the stricter, explicitly hole-size figure is used" }
+plugged_via_max_mm = { value = 0.50, page = "main", quote = "③ Filled vias must be no wider than 0.5 mm diameter", measurand = "drill" }
+plugged_to_opening_mm = { value = 0.35, page = "main", quote = "② Filled vias should have ≥ 0.35 mm clearance from other soldermask openings (e.g. pads)", measurand = "via_to_mask_opening" }
 
 [published.mask]
-web_mm = 0.10                   # "Soldermask bridge"
-# minimum pad spacing that still keeps a mask bridge, by outer copper weight and mask colour
-pad_spacing_1oz_mm = 0.10       # green, red, yellow, blue, purple
-pad_spacing_1oz_dark_mm = 0.13  # black, white
-pad_spacing_2oz_mm = 0.20       # any colour
-dark_colors = ["black", "white"]
-expansion_mm = 0.0              # openings 1:1 with the pad (laser direct imaging)
-opening_to_track_mm = 0.09      # mask opening to a neighbouring track
+web_mm = { value = 0.10, page = "main", quote = "Soldermask bridge: 0.10mm", measurand = "mask_web" }
+pad_spacing_1oz_mm = { value = 0.10, page = "main", quote = "1oz: Min. pad spacing: 0.10 mm (green, red, yellow, blue, purple)", measurand = "pad_gap" }
+pad_spacing_1oz_dark_mm = { value = 0.13, page = "main", quote = "Min. pad spacing: 0.13 mm (black, white)", measurand = "pad_gap" }
+pad_spacing_2oz_mm = { value = 0.20, page = "main", quote = "2oz: Min. pad spacing: 0.20 mm (any color)", measurand = "pad_gap" }
+dark_colors = { value = ["black", "white"], page = "main", quote = "Min. pad spacing: 0.13 mm (black, white)", measurand = "mask_colour", use = "input" }
+expansion_mm = { value = 0.0, page = "main", quote = "Soldermask Expansion: 1:1", measurand = "mask_expansion", use = "input" }
+opening_to_track_mm = { value = 0.09, page = "main", quote = "Keep at least 0.09 mm clearance between soldermask openings and neighboring traces.", measurand = "mask_opening_to_copper" }
 
 [published.pads]
-smd_pad_to_pad_mm = 0.15        # SMD pads of different nets
-smd_pad_min_mm = 0.25
-pad_to_track_mm = 0.10
-bga_pad_min_mm = 0.20
-bga_pad_to_track_mm = 0.09      # multilayer boards
+smd_pad_to_pad_mm = { value = 0.15, page = "main", quote = "SMD pad to pad clearance (different nets): 0.15mm", measurand = "pad_gap" }
+smd_pad_min_mm = { value = 0.25, page = "main", quote = "Minimum SMD pad: 0.25mm × 0.25mm", measurand = "pad_extent", certainty = "interpreted", note = "read as: a pad is too small when it is below 0.25 mm in both directions (a 0.2 mm wide pad of a fine-pitch part, which the assembly service accepts, is not)" }
+pad_to_track_mm = { value = 0.10, page = "main", quote = "Pad to track clearance (1oz): 0.1mm", measurand = "copper_gap" }
+bga_pad_min_mm = { value = 0.20, page = "main", quote = "BGA: 0.2mm (① 0.2mm-0.25mm BGA pad diameter requires ENIG)", measurand = "pad_diameter" }
+bga_pad_to_track_mm = { value = 0.09, page = "main", quote = "BGA pad to trace clearance ≥ 0.1 mm (min. 0.09 mm for multilayer boards)", measurand = "copper_gap" }
 
 [published.assembly]
-# "Reflow temperature" of the two assembly services (peak, +/- 5 C)
-reflow_peak_standard_c = 240.0
-reflow_peak_economic_c = 255.0
-reflow_peak_tol_c = 5.0
-min_package_standard = "01005"
-min_package_economic = "0402"
-pin_pitch_standard_mm = 0.35        # "Minimum IC Pin Spacing"
-pin_pitch_economic_mm = 0.40
-bga_pitch_standard_mm = 0.30        # "Minimum BGA Spacing (center to center)"
-bga_pitch_economic_mm = 0.50
-double_sided_standard = true        # "Single & double sided placement"
-double_sided_economic = false       # "Single sided placement"
-fiducials_standard = true           # "Fiducials: Necessary" / "Not necessary"
-fiducials_economic = false
-rails_standard = true               # "Edge Rails: Necessary" / "Not necessary"
-rails_economic = false
+reflow_peak_standard_c = { value = 240.0, page = "assembly", quote = "Reflow temperature: 240+/-5 °C (Standard PCBA)", measurand = "reflow_temperature", certainty = "interpreted", use = "input", note = "the page says \"Reflow temperature\", read as the peak" }
+reflow_peak_economic_c = { value = 255.0, page = "assembly", quote = "Reflow temperature: 255+/-5 °C (not adjustable) (Economic PCBA)", measurand = "reflow_temperature", certainty = "interpreted", use = "input", note = "as reflow_peak_standard_c" }
+reflow_peak_tol_c = { value = 5.0, page = "assembly", quote = "240+/-5 °C", measurand = "reflow_temperature", use = "record" }
+min_package_standard = { value = "01005", page = "assembly", quote = "Minimum Package: 01005 (Standard PCBA)", measurand = "package" }
+min_package_economic = { value = "0402", page = "assembly", quote = "Minimum Package: 0402 (Economic PCBA)", measurand = "package" }
+pin_pitch_standard_mm = { value = 0.35, page = "assembly", quote = "Minimum IC Pin Spacing: 0.35mm (Standard PCBA)", measurand = "pin_pitch" }
+pin_pitch_economic_mm = { value = 0.40, page = "assembly", quote = "Minimum IC Pin Spacing: 0.4mm (Economic PCBA)", measurand = "pin_pitch" }
+bga_pitch_standard_mm = { value = 0.30, page = "assembly", quote = "Minimum BGA Spacing: 0.3mm(center to center) (Standard PCBA)", measurand = "pitch_centre_to_centre" }
+bga_pitch_economic_mm = { value = 0.50, page = "assembly", quote = "Minimum BGA Spacing: 0.5mm(center to center) (Economic PCBA)", measurand = "pitch_centre_to_centre" }
+double_sided_standard = { value = true, page = "assembly", quote = "Assembly Types: Single & double sided placement (SMT/Thru-hole)", measurand = "sides" }
+double_sided_economic = { value = false, page = "assembly", quote = "Assembly Types: Single sided placement (SMT/Thru-hole)", measurand = "sides" }
+fiducials_standard = { value = true, page = "assembly", quote = "Fiducials: Necessary (Standard PCBA)", measurand = "fiducials" }
+fiducials_economic = { value = false, page = "assembly", quote = "Fiducials: Not necessary (Economic PCBA)", measurand = "fiducials" }
+rails_standard = { value = true, page = "assembly", quote = "Edge Rails: Necessary (Standard PCBA)", measurand = "edge_rails", use = "order" }
+rails_economic = { value = false, page = "assembly", quote = "Edge Rails: Not necessary (Economic PCBA)", measurand = "edge_rails", use = "order" }
 
-# ---- stencil ("PCB stencil" page) -----------------------------------------------------------------
+# ---- stencil ----------------------------------------------------------------------------------------
 [published.stencil]
-thickness_mm = [0.10, 0.12, 0.15, 0.18, 0.20]   # standard thicknesses; the fabricator chooses one
-aperture_min_mm = 0.08                            # "Minimum Aperture Size > 0.08mm"
+thickness_mm = { value = [0.10, 0.12, 0.15, 0.18, 0.20], page = "stencil", quote = "Standard thickness ( no extra cost): 0.10 mm, 0.12 mm, 0.15 mm, 0.18 mm, 0.20 mm.", measurand = "stencil_thickness", use = "input", conflict = "the stencil-choice article also lists 0.13 mm as free (stencil_guide page)" }
+engineer_chooses = { value = true, page = "stencil_order", quote = "You can either select a thickness by yourself, or you can just let JLCPCB engineer to select the appropriate thickness for you based on your Gerber file features.", measurand = "order_option", use = "order" }
+aperture_min_mm = { value = 0.08, page = "stencil", quote = "Minimum Aperture Size: >0.08mm", measurand = "aperture_width" }
 
-# ---- spacing between SMD parts ("Minimum Spacing Requirements for SMD Components", recommended) ----
-# mm between two parts by package class; chip sizes by EIA code. The article's drawing of how the
-# distance is measured was not read: see [notes].
+# ---- spacing between SMD parts ("Minimum Spacing Requirements for SMD Components") ----------------
+# mm between two parts by package class; chip sizes by EIA code. The article's measurement diagram
+# shows the distance between the parts' overall outlines: from the outer end of one part's pads to
+# the outer end of the next part's, or body edge to body edge where no pads stick out.
 [published.part_spacing]
+page = "part_spacing"
+quote = "The values below represent JLCPCB's recommended minimum spacing requirements to ensure reliable SMT assembly, inspection, and rework accessibility."
+measurand = "part_outline_to_outline"
+recommended = true
 classes = ["0201", "0402", "0603", "0805", "1206", "QFN", "QFP", "SOP", "SOT", "BGA"]
 matrix = [
     [0.15, 0.15, 0.18, 0.18, 0.25, 1.0, 0.5, 0.4, 0.2, 1.0],
@@ -184,11 +227,32 @@ matrix = [
 area_ratio_min = 0.66               # IPC-7525: aperture area / aperture wall area
 aspect_ratio_min = 1.5              # IPC-7525: aperture width / stencil thickness
 
-[notes]
-hole_spacing = "the page does not say whether hole-to-hole spacing is wall to wall or centre to centre; wall to wall is used (centre to centre would let the smallest holes touch)"
-part_spacing = "the article's drawing of the measured distance was not read; the distance is measured between the pads of the two parts, so a part whose body is larger than its pads (a BGA) is closer than reported"
-smd_pad_min = "the page gives the smallest SMD pad as 0.25 x 0.25 mm; a pad is judged too small when it is below that in both directions (a 0.2 mm wide pad of a fine-pitch part, which the assembly service accepts, is not)"
-not_published = "drill aspect ratio, copper balance and warpage limits, fiducial count and size, part-to-board-edge spacing, maximum part height and mass"
+# ---- the fabricator's design guidance (articles, not capability pages) ------------------------------
+# Stencil thickness JLCPCB's article gives as "commonly used" per package and pitch: the review
+# predicts the thickness from the board's finest-pitch part when `[dfm] stencil_mm` is not set.
+# `kind` is ic (QFN, QFP, SOP, ...), bga or chip (EIA size); `pitch_mm` the part's pitch (ic, bga).
+[guidance.stencil]
+page = "stencil_guide"
+quote = "Reference table: IC/QFN/QFP 0.4 mm: 0.10-0.12 / 0.10 ... BGA 0.8 mm: 0.13-0.15 / 0.15 (Recommended range / Commonly used)"
+finest_pitch_quote = "Give most of your attention to the board's smallest pitch component."
+finest_pitch_page = "stencil_design"
+conflict = "the same article's quick answer gives 0.10 mm for every pitch up to 0.5 mm; its table gives 0.12 mm for 0.5 mm-pitch ICs. The table is used."
+rows = [
+    { kind = "ic", pitch_mm = 0.3, thickness_mm = 0.08 },
+    { kind = "ic", pitch_mm = 0.4, thickness_mm = 0.10 },
+    { kind = "ic", pitch_mm = 0.5, thickness_mm = 0.12 },
+    { kind = "ic", pitch_mm = 0.65, thickness_mm = 0.15 },
+    { kind = "bga", pitch_mm = 0.4, thickness_mm = 0.10 },
+    { kind = "bga", pitch_mm = 0.5, thickness_mm = 0.10 },
+    { kind = "bga", pitch_mm = 0.65, thickness_mm = 0.12 },
+    { kind = "bga", pitch_mm = 0.8, thickness_mm = 0.15 },
+    { kind = "bga", pitch_mm = 1.27, thickness_mm = 0.15 },
+    { kind = "chip", size = "0201", thickness_mm = 0.10 },
+    { kind = "chip", size = "0402", thickness_mm = 0.12 },
+]
+# larger parts: "Used for larger components, including ICs ≥ 0.65 mm pitch and BGAs ≥ 0.8 mm pitch." (0.15 mm)
+larger_mm = 0.15
+larger_quote = "Used for larger components, including ICs ≥ 0.65 mm pitch and BGAs ≥ 0.8 mm pitch."
 
 # ---- not published by the fabricator ------------------------------------------------------------
 [assumed.etch]
@@ -198,3 +262,6 @@ etchant = "acidic cupric chloride (inner layers), alkaline ammoniacal (outer lay
 [assumed.assembly]
 oven = "multi-zone forced-convection reflow oven: typical, not stated by JLCPCB"
 h_w_m2k = 50.0                  # mean film coefficient of forced-convection reflow (literature value)
+
+[notes]
+not_published = "drill aspect ratio, copper balance and warpage limits, fiducial count and size, part-to-board-edge spacing, maximum part height and mass"

@@ -53,8 +53,12 @@ measurements.
 
 ## Requirements
 
-- KiCad 10, whose system `python3` provides the `pcbnew` module, and `kicad-cli` on the `PATH`.
-- numpy, scipy and matplotlib for that same `python3`.
+- `kicad-cli` of KiCad 10 on the `PATH` (it refills zones on a copy, runs DRC and plots files).
+- Python 3.11 or newer with numpy, scipy and matplotlib.
+- The file parsers: `deps/setup_parsers.sh` checks out kicad-monkey 2026.9.7 and KiCadFiles 1.0.5 at
+  their pinned commits (`deps/parsers.lock`) and installs kicad-monkey's dependencies into `deps/`.
+  openpcbsi reads boards with them; KiCad's own `pcbnew` Python module, which KiCad has deprecated,
+  is no longer needed. It can still be used (`OPENPCBSI_READER=pcbnew`, KiCad's system `python3`).
 - Optional: [KiPI](https://github.com/drewsum/KiPI), a finite-element DC and PDN solver that
   openpcbsi can use in place of its own. `deps/setup_kipi.sh` installs the pinned version into
   `deps/` in its own environment; see [deps/README.md](deps/README.md).
@@ -63,8 +67,9 @@ measurements.
 - Optional: [kicad-python](https://pypi.org/project/kicad-python/) (`kipy`) in its own environment,
   for `evaluate --live`. Point `OPENPCBSI_KIPY_PYTHON` at that environment's Python.
 
-Run openpcbsi from the repository root, or install it with `pip install .` (into KiCad's Python, or a
-venv made with `--system-site-packages` so that `pcbnew` is found) to get an `openpcbsi` command.
+Run openpcbsi from the repository root, or install it with `pip install .` to get an `openpcbsi`
+command; an installed copy finds the parsers through `OPENPCBSI_DEPS` (a `deps/` folder set up by
+`deps/setup_parsers.sh`).
 Caches and results go to `cache/` and `runs/` beside a checkout, or under `./openpcbsi/` for an
 installed copy; `OPENPCBSI_CACHE`, `OPENPCBSI_RUNS` and `OPENPCBSI_DEPS` set them. The board is only
 read, never modified.
@@ -185,8 +190,8 @@ BGA fields included (with the figures the fabricator publishes for them).
 | `same_net_gap` | Gaps beside a track narrower than the fabricator's same-net track spacing. |
 | `fab_drill` | Via and hole sizes, annular rings, hole to hole, hole to copper on every layer, copper to the board edge. |
 | `mask_web`, `mask_exposed`, `via_pad` | Mask webs as drawn and at the fabricator's own expansion; copper inside or beside an opening; vias in or beside pads. |
-| `paste` | Stencil aperture area and aspect ratios (IPC-7525) and the stencil thickness that prints every aperture. |
-| `footprint`, `part_spacing`, `assembly` | Chip land patterns against the named package; spacing between parts; pin pitch, package size, sides and fiducials for the assembly service. |
+| `paste` | Stencil aperture area and aspect ratios (IPC-7525) at the stencil thickness the board config gives (`[dfm] stencil_mm`), else the one the fabricator's guide gives for the finest-pitch part (then an assumption, and the review is "pass with assumptions"), and which standard thicknesses print every aperture. |
+| `footprint`, `part_spacing`, `assembly` | Two-pad chip land patterns whose pads are further apart than the chip's EIA body can reach; spacing between parts; pin pitch, package size, sides and fiducials for the assembly service. |
 
 **Rankings** order places on the board by a measurement or a model that no published limit covers
 and that has not been compared with fabricated boards: acute corners in copper (`acid_trap`), copper
@@ -383,8 +388,13 @@ Running openpcbsi against this board found four faults, all fixed before the res
 
 ## How it works
 
-openpcbsi reads the board once through KiCad's `pcbnew` API into a cached snapshot. Boards saved by
-a newer KiCad are first converted with `kicad-cli pcb downgrade`. Copper is rasterised per layer at
+openpcbsi reads the board file once into a cached snapshot, with its own file reader on
+kicad-monkey: zones are refilled first by `kicad-cli` on a copy, and every polygon (pads of every
+shape, mask openings, paste apertures, the outline) is computed by openpcbsi. The reading is checked
+against KiCad's own (its `pcbnew` module and its IPC-2581 export) on a corpus of real boards, and the
+manufacturing review and sign-off read every board a second time with an independent parser,
+KiCadFiles ([docs/dfm.md](docs/dfm.md#reading-the-board)). Boards saved by a newer KiCad are first
+converted with `kicad-cli pcb downgrade`. Copper is rasterised per layer at
 25 µm, and plane questions (reference copper, splits, antipads, edges) are answered on the rasters;
 traces stay vector geometry.
 

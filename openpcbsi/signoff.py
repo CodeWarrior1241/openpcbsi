@@ -62,6 +62,19 @@ def write(ev, out_dir, cfg_path=None, waivers=None, reviewer=None):
     }
     if ev.get("stage") != "final":
         rec["verdict"] = f"blocked: layout stage '{ev.get('stage')}'"
+    # the board read again by an independent parser: a sign-off needs both readings to agree
+    try:
+        from . import run as runmod, snapshot as snap_mod
+        snap = snap_mod.load_or_extract(board, runmod.CACHE)
+        if snap.get("reader") == "kicad-monkey":
+            x = snap_mod.cross_check(snap, runmod.CACHE)
+            rec["cross_check"] = {"reader": x["reader"], "compared": x["compared"], "differences": x["n_problems"],
+                                  "not_cross_checked": x["not_cross_checked"]}
+            if x["n_problems"]:
+                rec["verdict"] = f"blocked: the two readings of the board differ ({x['n_problems']}): {x['problems'][0]}"
+    except Exception as e:
+        rec["cross_check"] = {"error": str(e)}
+        rec["verdict"] = f"blocked: the cross-check could not run ({e})"
     p = os.path.join(out_dir, "signoff.json")
     json.dump(rec, open(p, "w"), indent=1)
     return p, rec
