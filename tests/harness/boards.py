@@ -168,14 +168,30 @@ def big_board(out, name="big", layers=6):
     return b.save()
 
 
-# ---- manufacturing checks (`openpcbsi dfm`, items 37-41) ---------------------------------------
+# ---- manufacturing review (`openpcbsi dfm`, items 37-46) --------------------------------------
 C0402 = "Capacitor_SMD:C_0402_1005Metric"
 R0402 = "Resistor_SMD:R_0402_1005Metric"
+FAB_RULES = {"min_clearance": 0.09, "min_track_width": 0.09, "min_via_annular_width": 0.05, "min_via_diameter": 0.25,
+             "min_through_hole_diameter": 0.15, "min_hole_to_hole": 0.2, "min_hole_clearance": 0.2,
+             "min_copper_edge_clearance": 0.2, "solder_mask_min_width": 0.1}
+
+
+def set_rules(board, rules, severities=None):
+    """Write board-setup design rules into the board's .kicad_pro (the generator leaves them unset)."""
+    import json
+    pro = os.path.splitext(board)[0] + ".kicad_pro"
+    d = json.load(open(pro))
+    ds = d.setdefault("board", {}).setdefault("design_settings", {})
+    ds["rules"] = dict(rules)
+    ds["rule_severities"] = dict(severities or {})
+    json.dump(d, open(pro, "w"), indent=2)
+    return board
 
 
 def acid_board(out, name="acid", planted=True):
-    """A 2 x 2 mm pad with a track leaving its right edge at 45 degrees (planted) or square-on, and two
-    tracks of one net 0.15 mm apart (planted) or 0.35 mm apart, joined at one end."""
+    """Copper geometry with a planted defect each, or none:
+    a 45 degree track exit from a pad; two tracks of one net 0.15 mm apart; two tracks of different
+    nets 0.07 mm apart; a track 0.08 mm from a pad; a track 0.06 mm from a pad that has no net."""
     b = Board(_p(out, name), layers=4, size=(40, 20))
     b.plane("In1.Cu", "GND")
     b.plane("In2.Cu", "GND")
@@ -186,6 +202,14 @@ def acid_board(out, name="acid", planted=True):
         b.track("F.Cu", [(10.5, 10), (15, 10)], 0.2, "SIG")
     pitch = 0.45 if planted else 0.65
     b.track("F.Cu", [(23, 5), (20, 5), (20, 5 + pitch), (23, 5 + pitch)], 0.3, "SIG2")
+    b.track("F.Cu", [(26, 14), (34, 14)], 0.2, "SP_A")
+    b.track("F.Cu", [(26, 14.27 if planted else 14.5), (34, 14.27 if planted else 14.5)], 0.2, "SP_B")
+    b.footprint("U2", "PAD", 10, 17, [{"num": 1, "net": "PT_A", "dx": 0, "dy": 0, "sx": 1.0}])
+    y = 16.5 - (0.08 if planted else 0.3) - 0.075
+    b.track("F.Cu", [(8, y), (12, y)], 0.15, "PT_B")
+    b.footprint("FID1", "Fiducial", 30, 5, [{"num": 1, "net": "", "dx": 0, "dy": 0, "sx": 1.0, "shape": "circle"}])
+    x = 30.5 + (0.06 if planted else 0.3) + 0.075
+    b.track("F.Cu", [(x, 3), (x, 7)], 0.15, "NN")
     return b.save()
 
 
@@ -201,7 +225,7 @@ def fab_board(out, name="fab", layers=4, w=0.08):
 
 def mask_board(out, name="mask", planted=True):
     """Pad pairs with a planted solder-mask defect each (see the `kind` in the comments), or none."""
-    b = Board(_p(out, name), layers=4, size=(50, 20))
+    b = Board(_p(out, name), layers=4, size=(60, 20))
     b.plane("In1.Cu", "GND")
     b.plane("In2.Cu", "GND")
 
@@ -222,25 +246,61 @@ def mask_board(out, name="mask", planted=True):
     b.track("F.Cu", [(32, 10.65 if planted else 11.2), (36, 10.65 if planted else 11.2)], 0.1, "OTHER")   # 0.10 mm from the pad
     b.footprint("U5", "PAD", 42, 10, [{"num": 1, "net": "U5_A", "dx": 0, "dy": 0, "sx": 1.0, "mask": 0.05 if planted else 0.0}])
     b.track("F.Cu", [(40, 10.67 if planted else 11.2), (44, 10.67 if planted else 11.2)], 0.1, "OTHER2")  # 0.07 mm from the opening
+    # a via in an SMD pad (planted) or beside it on a track
+    b.footprint("U6", "PAD", 52, 10, [{"num": 1, "net": "GND", "dx": 0, "dy": 0, "sx": 1.0, "mask": 0.0}])
+    if planted:
+        b.via(52, 10, "GND", drill=0.3, size=0.5)
+    else:
+        b.track("F.Cu", [(52, 10), (52, 12)], 0.3, "GND")
+        b.via(52, 12, "GND", drill=0.3, size=0.6)
+    return b.save()
+
+
+def drill_board(out, name="drill", planted=True):
+    """Holes with a planted defect each, or none: a 0.1 mm via hole; a via ring of 0.03 mm; two holes
+    0.12 mm apart; a via hole 0.12 mm from a track; a through-hole pad with a 0.1 mm ring; copper 0.1 mm
+    from the board edge."""
+    b = Board(_p(out, name), layers=4, size=(40, 20))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    p = planted
+    b.via(6, 6, "A", drill=0.1 if p else 0.3, size=0.4 if p else 0.6)
+    b.via(10, 6, "B", drill=0.3, size=0.36 if p else 0.6)
+    b.via(14, 6, "GND", drill=0.3, size=0.5)
+    b.via(14.42 if p else 15.2, 6, "GND", drill=0.3, size=0.5)
+    b.via(20, 6, "C", drill=0.3, size=0.45)
+    x = 20.15 + (0.12 if p else 0.4) + 0.075
+    b.track("F.Cu", [(x, 3), (x, 9)], 0.15, "D")
+    b.footprint("J1", "PIN", 30, 10, [{"num": 1, "net": "E", "dx": 0, "dy": 0, "sx": 1.0 if p else 1.4, "kind": "pth", "drill": 0.8,
+                                       "shape": "circle"}])
+    y = 0.2 if p else 0.6
+    b.track("F.Cu", [(25, y), (35, y)], 0.2, "F")
     return b.save()
 
 
 def chip_board(out, name="chips"):
-    """Three 0402 capacitors on GND planes. C1: pad 1 on a thin track, pad 2 on a short track to a via into
-    the planes. C2: both pads on thin tracks (symmetric). C3: pad 1 in a pour, pad 2 on a thin track."""
+    """Three 0402 capacitors on GND planes, across the belt (pads along y). C1: pad 1 on a thin track, pad 2
+    on a short track to a via into the planes. C2: both pads on thin tracks (symmetric). C3: pad 1 in a
+    pour, pad 2 on a thin track. A fiducial without a net, so that copper without a net is in the files."""
     b = Board(_p(out, name), layers=4, size=(60, 30))
     b.plane("In1.Cu", "GND")
     b.plane("In2.Cu", "GND")
-    b.two_pin("C1", "100n", 12, 15, "SIG1", "GND", fpid=C0402, mask=0.0)
-    b.track("F.Cu", [(11.5, 15), (6, 15)], 0.15, "SIG1")
-    b.track("F.Cu", [(12.5, 15), (13.3, 15)], 0.3, "GND")
-    b.via(13.3, 15, "GND")
-    b.two_pin("C2", "100n", 30, 15, "SIGA", "SIGB", fpid=C0402, mask=0.0)
-    b.track("F.Cu", [(29.5, 15), (24, 15)], 0.15, "SIGA")
-    b.track("F.Cu", [(30.5, 15), (36, 15)], 0.15, "SIGB")
-    b.two_pin("C3", "100n", 48, 15, "PWR", "SIGC", fpid=C0402, mask=0.0)
-    b.zone("F.Cu", [(42, 11), (48.2, 11), (48.2, 19), (42, 19)], "PWR")
-    b.track("F.Cu", [(48.5, 15), (54, 15)], 0.15, "SIGC")
+
+    def chip(ref, x, n1, n2):
+        b.footprint(ref, "100n", x, 15, [
+            {"num": 1, "net": n1, "dx": 0, "dy": -0.5, "sx": 0.6, "mask": 0.0},
+            {"num": 2, "net": n2, "dx": 0, "dy": 0.5, "sx": 0.6, "mask": 0.0}], courtyard=(-0.6, -1.1, 0.6, 1.1), fpid=C0402)
+    chip("C1", 12, "SIG1", "GND")
+    b.track("F.Cu", [(12, 14.5), (12, 9)], 0.15, "SIG1")
+    b.track("F.Cu", [(12, 15.5), (12, 16.3)], 0.3, "GND")
+    b.via(12, 16.3, "GND")
+    chip("C2", 30, "SIGA", "SIGB")
+    b.track("F.Cu", [(30, 14.5), (30, 9)], 0.15, "SIGA")
+    b.track("F.Cu", [(30, 15.5), (30, 21)], 0.15, "SIGB")
+    chip("C3", 48, "PWR", "SIGC")
+    b.zone("F.Cu", [(44, 9), (52, 9), (52, 14.8), (44, 14.8)], "PWR")
+    b.track("F.Cu", [(48, 15.5), (48, 21)], 0.15, "SIGC")
+    b.footprint("FID1", "Fiducial", 5, 5, [{"num": 1, "net": "", "dx": 0, "dy": 0, "sx": 1.0, "shape": "circle", "mask": 0.5}])
     return b.save()
 
 
@@ -253,4 +313,29 @@ def reflow_board(out, name="reflow"):
                                        for i in range(4)], fields={"Mass": "3", "Height": "5"}, courtyard=(-6, -6, 6, 6))
     b.two_pin("R1", "10k", 23, 20, "N1", "N2", fpid=R0402, mask=0.0)
     b.two_pin("R2", "10k", 70, 20, "N3", "N4", fpid=R0402, mask=0.0)
+    return b.save()
+
+
+def parts_board(out, name="parts", planted=True):
+    """Parts with a planted defect each, or none: a paste aperture too narrow for the stencil; an 0402
+    footprint whose pads are 1.4 mm apart; two 0402 parts 0.1 mm apart; an IC with a 0.3 mm pin pitch;
+    an 0201 and a part on the back (for the economic service); no fiducial."""
+    b = Board(_p(out, name), layers=4, size=(60, 30))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    p = planted
+    b.footprint("U1", "IC", 8, 8, [{"num": i + 1, "net": f"P{i}", "dx": i * 1.5, "dy": 0, "sx": 0.14 if p else 0.3, "sy": 0.5, "mask": 0.0}
+                                    for i in range(2)])
+    b.two_pin("C1", "100n", 20, 8, "A1", "A2", pitch=1.9 if p else 1.0, pad=(0.5, 0.6), fpid=C0402, mask=0.0)
+    b.two_pin("C2", "100n", 30, 8, "B1", "B2", fpid=C0402, mask=0.0)
+    b.two_pin("C3", "100n", 31.7 if p else 32.5, 8, "B3", "B4", fpid=C0402, mask=0.0)
+    pitch = 0.3 if p else 0.5
+    b.footprint("U2", "IC8", 42, 8, [{"num": i + 1, "net": f"Q{i}", "dx": (i % 4) * pitch, "dy": 2.0 * (i // 4), "sx": 0.17, "sy": 0.8, "mask": 0.0}
+                                      for i in range(8)], fpid="Package_SO:TSSOP-8_3x3mm")
+    if p:
+        b.two_pin("C4", "100n", 50, 20, "D1", "D2", pitch=0.5, pad=(0.28, 0.3), fpid="Capacitor_SMD:C_0201_0603Metric", mask=0.0)
+        b.footprint("C5", "100n", 20, 20, [{"num": 1, "net": "E1", "dx": -0.5, "dy": 0, "sx": 0.6, "mask": 0.0},
+                                           {"num": 2, "net": "E2", "dx": 0.5, "dy": 0, "sx": 0.6, "mask": 0.0}], side="B", fpid=C0402)
+    else:
+        b.footprint("FID1", "Fiducial", 5, 25, [{"num": 1, "net": "", "dx": 0, "dy": 0, "sx": 1.0, "shape": "circle", "mask": 0.5}])
     return b.save()

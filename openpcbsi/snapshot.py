@@ -16,9 +16,10 @@ import shutil
 import subprocess
 import sys
 
-SNAPSHOT_VERSION = 7   # 4: zones refilled in memory, every footprint field, pin types, file version; 5: back-drill;
+SNAPSHOT_VERSION = 8   # 4: zones refilled in memory, every footprint field, pin types, file version; 5: back-drill;
                        # 6: DNP also from a "DNP" field (KiCad 6 designs mark it that way)
                        # 7: solder-mask openings and paste margins of pads, mask shapes, via tenting (MF checks)
+                       # 8: slot length of pad holes, via mask opening, footprint attributes, board mask settings
 NM = 1e-6  # nm -> mm
 
 
@@ -126,6 +127,8 @@ def extract(board_path):
         "board_thickness": b.GetDesignSettings().GetBoardThickness() * NM,
         "zones_refilled": refilled,
     }
+    ds = b.GetDesignSettings()
+    snap["design"] = {"mask_expansion": ds.m_SolderMaskExpansion * NM, "mask_min_width": ds.m_SolderMaskMinWidth * NM}
 
     ps = pcbnew.SHAPE_POLY_SET()
     b.GetBoardPolygonOutlines(ps, True)
@@ -152,6 +155,7 @@ def extract(board_path):
                 "d": t.GetWidth(cu_ids[0]) * NM, "drill": t.GetDrillValue() * NM,
                 "net": net, "span": span, "flashed": flashed, "type": int(t.GetViaType()),
                 "backdrill": _backdrill(pcbnew, t, lid2name), "tented": _tented(pcbnew, t),
+                "mask_exp": _via_mask_exp(pcbnew, t),
             })
         elif ty == pcbnew.PCB_ARC_T:
             # approximate arcs by chords of at most 10 degrees
@@ -206,6 +210,7 @@ def extract(board_path):
             "rot": f.GetOrientationDegrees(), "side": "B" if f.IsFlipped() else "F",
             "dnp": bool(f.IsDNP()) or _dnp_field(fields), "fields": fields, "courtyard": crt,
             "smd": bool(f.GetAttributes() & pcbnew.FP_SMD),
+            "placed": not (f.GetAttributes() & (pcbnew.FP_EXCLUDE_FROM_POS_FILES | pcbnew.FP_BOARD_ONLY)),
             "bbox": [bb.GetX() * NM, bb.GetY() * NM, bb.GetRight() * NM, bb.GetBottom() * NM],
         })
         for p in f.Pads():
@@ -226,6 +231,7 @@ def extract(board_path):
                 "x": p.GetPosition().x * NM, "y": p.GetPosition().y * NM,
                 "sx": sz.x * NM, "sy": sz.y * NM, "rot": p.GetOrientationDegrees(),
                 "drill": p.GetDrillSize().x * NM if kind in ("pth", "npth") else 0.0,
+                "drill_y": p.GetDrillSize().y * NM if kind in ("pth", "npth") else 0.0,
                 "layers": layers, "poly": polys, "pinfunc": p.GetPinFunction(), "pintype": p.GetPinType(),
                 **_pad_mask_paste(pcbnew, p),
             })
@@ -259,6 +265,14 @@ def _pad_mask_paste(pcbnew, p):
             except Exception:
                 paste[pname] = [0.0, 0.0]
     return {"mask": mask, "paste": paste}
+
+
+def _via_mask_exp(pcbnew, v):
+    """Mask expansion of a via's opening (mm), where it is not tented; None if unknown."""
+    try:
+        return v.GetSolderMaskExpansion() * NM
+    except Exception:
+        return None
 
 
 def _tented(pcbnew, v):

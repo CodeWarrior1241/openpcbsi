@@ -191,7 +191,7 @@ class Board:
         if li in self._rasters:
             return self._rasters[li]
         g = self.grid()
-        key = f"raster_{self.sha[:16]}_{g.res:.4f}_{li}.npy"
+        key = f"raster_{self.sha[:16]}_{g.res:.4f}_{li}{'_nn' if getattr(self, '_nonet', False) else ''}.npy"
         cpath = os.path.join(self.cache_dir, key) if self.cache_dir else None
         if cpath and os.path.exists(cpath):
             r = np.load(cpath)
@@ -229,6 +229,23 @@ class Board:
     def outline_rings(self):
         return [ring for poly in self.snap["outline"] for ring in poly]
 
+    def label_nonet_pads(self):
+        """Give every pad without a net its own label, so that copper such as fiducials and mounting
+        pads is part of the rasters (the manufacturing checks need all copper, not only the nets).
+        The labels are appended to net_names as '<no net> REF.PAD'."""
+        if getattr(self, "_nonet", False):
+            return
+        for p in self.pads:
+            if p["net_id"] == 0 and p["poly"] and p["layer_ids"] and p["kind"] != "npth":
+                name = f"<no net> {p['ref']}.{p['num']}"
+                if name not in self.net_id:
+                    self.net_id[name] = len(self.net_names)
+                    self.net_names.append(name)
+                p["net_id"] = self.net_id[name]
+        self._nonet = True
+        self._rasters = {}
+        self._win = None
+
     def _window_index(self):
         """Per layer: zone fills as edge arrays with a bounding box, and the bounding boxes of the pads."""
         if getattr(self, "_win", None) is None:
@@ -251,9 +268,10 @@ class Board:
             self._win = {"zones": zs, "pad_bb": pb, "pad_on": on}
         return self._win
 
-    def raster_window(self, layer, x0, y0, x1, y1, res):
+    def raster_window(self, layer, x0, y0, x1, y1, res, pads=False):
         """Net-id raster (int32) of the copper of one layer inside a window, at any resolution: the same
-        drawing order as raster(), from the vector data. Returns (grid, raster)."""
+        drawing order as raster(), from the vector data. Returns (grid, raster), and with `pads` also a
+        mask of the pixels that are pad copper."""
         li = self.L[layer] if isinstance(layer, str) else layer
         w = self._window_index()
         g = geom.window_grid(x0, y0, x1, y1, res)
@@ -264,9 +282,13 @@ class Board:
             r[geom.raster_segs(g, segs)] = nid
         pb = w["pad_bb"]
         sel = np.flatnonzero(w["pad_on"][li] & (pb[:, 0] <= x1) & (pb[:, 2] >= x0) & (pb[:, 1] <= y1) & (pb[:, 3] >= y0))
+        pm = np.zeros(g.shape, dtype=bool) if pads else None
         for k in sel:
             p = self.pads[k]
-            r[geom.raster_rings(g, [ring for poly in p["poly"] for ring in poly])] = p["net_id"]
+            m = geom.raster_rings(g, [ring for poly in p["poly"] for ring in poly])
+            r[m] = p["net_id"]
+            if pads:
+                pm |= m
         T = self.tracks
         hw = T["w"] / 2
         sel = np.flatnonzero((T["layer"] == li) & (np.minimum(T["x1"], T["x2"]) - hw <= x1) & (np.maximum(T["x1"], T["x2"]) + hw >= x0)
@@ -279,7 +301,7 @@ class Board:
         for k in sel:
             if li in self.via_flashed[k]:
                 geom.raster_capsule(g, r, V["x"][k], V["y"][k], V["x"][k], V["y"][k], vr[k], V["net"][k])
-        return g, r
+        return (g, r, pm) if pads else (g, r)
 
     # -------------------------------------------------------------------------------------------
     def tracks_of(self, net, layer=None):

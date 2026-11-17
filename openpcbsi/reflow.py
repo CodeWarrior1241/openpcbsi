@@ -1,214 +1,280 @@
-"""MF7 / MF8: the board in a convection reflow oven.
+"""MF7 / MF8: thermal rankings of the board in a convection reflow oven.
+
+These are models, not measurements, and nothing here has been compared with a profiled board or
+with an assembler's defect data. They order the parts of one board; they do not judge them. A limit
+applies only when the user supplies one with its source (`[dfm.judge]`).
 
 MF7, board level. The 2.5-D finite-volume model of thermal.py (one node per copper layer per cell)
-with heat capacity added: the laminate, the copper and each part as a lump on the cells under it.
-Both faces exchange heat with the oven air through a film coefficient h (forced convection with the
-radiation linearised into it; about 50 W/m2K in the literature). The air temperature follows the
-oven's zones in time. Backward Euler, one factorisation. Per part: peak temperature, time above
-liquidus, steepest ramp, and the lag time tau (below). With `calibrate`, the spike zones are shifted
-until the median peak over the board is the assembler's stated reflow temperature, which is what
-an operator does with a profiling board.
+with heat capacity: the laminate, the copper and each part as a lump on the cells under it. Both
+faces, and the side faces of each part, exchange heat with the oven air through a film coefficient.
+The air temperature follows the oven's zones, and each point of the board enters a zone when the
+belt carries it there. With `calibrate`, the spike zones are shifted until the median peak over the
+parts is the assembler's stated reflow temperature; the absolute peak is therefore an input, and
+only the differences between parts are a result. The run is repeated with the film coefficient and
+the assumed part bodies varied, and each part's difference from the median is given as a range.
 
-MF8, pad level (tombstoning). In a ramp every node rises at the ramp rate r and lags the air by
-r tau_i, where tau = (K + H)^-1 C 1 is the first moment of the node's response (its Elmore delay):
-K conduction, H the film conductances, C the heat capacities. Two joints of one chip therefore reach
-liquidus tau_1 - tau_2 seconds apart, whatever the ramp rate. tau is solved in a window around the
-part: the part's own copper layer at 50 um, the layers below at 200 um, the chip as two nodes (its
-halves) that take heat from the air over their own surface, pass it to the pads through the unmelted
-paste, and are joined through the body.
+MF8, chip level. A window around each two-terminal chip: its own copper layer at 50 um, the other
+layers at 200 um, the chip as two nodes heated over their own surface and joined to the pads
+through the unmelted paste and to each other through the body. The window's edge takes its values
+from the board model, so the planes do not end at the window. Two numbers per chip:
+  lag difference   tau = (K + H)^-1 C 1 is the first moment of a node's response; in a slow ramp
+                   two joints reach liquidus tau_1 - tau_2 apart. Solved for every chip.
+  in this oven     the same window marched through the oven profile, giving the time between the
+                   two joints crossing liquidus directly. Run for the layouts at the top of the
+                   list, together with an error bar from the assumed paste, film coefficient and
+                   window size.
+Timing is one input to tombstoning. The wetting forces (pad geometry, paste volume and offset,
+placement, alloy) are not modelled; the land-pattern geometry is listed beside the timing.
 
-Not modelled: latent heat of the paste, flux evaporation, shadowing by tall neighbours, the
-non-uniform film coefficient of real ovens, infrared heating. The results compare places on one
-board; they do not predict a measured profile.
+Not modelled: latent heat, flux, shadowing by tall parts, the non-uniform film coefficient of real
+ovens, infrared heating, the temperature inside a part (a part is as warm as the board under it),
+panels, and the second pass of a double-sided board.
 """
 import math
 
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from scipy import ndimage
 
-from . import geom, packages, thermal
-from .drc import finding, result
+from . import geom, packages, par, thermal
+from .drc import finding
 from .thermal import K_CU, K_FR4_IN, K_FR4_THRU, RHOC_CU, RHOC_FR4
 
-K_SOLDER_PASTE = 2.0
+VARIANTS = (("film coefficient x 0.6", 0.6, 1.0), ("film coefficient x 1.6", 1.6, 1.0),
+            ("assumed bodies x 0.5", 1.0, 0.5), ("assumed bodies x 2", 1.0, 2.0))
 
 
 def _lu(A):
     return spla.splu(A.tocsc(), permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options={"SymmetricMode": True})
 
 
-def air_profile(r, shift=0.0):
-    """Time (s) and air temperature (C) of the oven: zones held for zone_s each, then the cooling zones.
-    `shift` is added to the last `spike_zones` heating zones."""
-    dt = r["dt_s"]
+def profile_fn(r, shift=0.0, unit=False):
+    """Air temperature against the time since a point entered the oven. `shift` is added to the last
+    `spike_zones` heating zones; `unit` gives the change for a shift of +1 C instead."""
     zones = list(r["zones_c"])
-    for k in range(1, int(r["spike_zones"]) + 1):
-        zones[-k] += shift
-    seg = [(z, r["zone_s"]) for z in zones] + [(z, r["cool_s"]) for z in r["cool_c"]]
-    t_end = sum(s for _, s in seg)
-    t = np.arange(1, int(round(t_end / dt)) + 1) * dt
-    ta = np.empty(len(t))
-    edge = 0.0
-    for z, s in seg:
-        ta[(t > edge - 1e-9) & (t <= edge + s + 1e-9)] = z
-        edge += s
-    return t, ta
+    ks = range(len(zones) - int(r["spike_zones"]), len(zones))
+    for k in ks:
+        zones[k] += shift
+    temps = zones + list(r["cool_c"])
+    edges = np.cumsum([r["zone_s"]] * len(zones) + [r["cool_s"]] * len(r["cool_c"]))
+    if unit:
+        temps = [1.0 if k in ks else 0.0 for k in range(len(zones))] + [0.0] * len(r["cool_c"])
+    vals = np.array([0.0 if unit else r["start_c"]] + temps)
+
+    def fn(tau):
+        tau = np.asarray(tau, dtype=float)
+        k = np.searchsorted(edges, tau, side="left") + 1
+        k = np.where(tau <= 0, 0, np.minimum(k, len(vals) - 1))
+        return vals[k]
+    return fn, float(edges[-1])
 
 
-def _part_cover(mesh, fp):
-    """Share of each cell (of the part's outer layer) under the part's body."""
-    g = mesh["g"]
-    k, ny, nx = mesh["k"], mesh["ny"], mesh["nx"]
-    m = np.zeros(g.shape, bool)
-    rings = [r for poly in fp["courtyard"] for r in poly]
-    if not rings:
-        x0, y0, x1, y1 = fp["bbox"]
-        rings = [[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]]
-    geom.raster_rings(g, rings, m)
-    return m[:ny * k, :nx * k].reshape(ny, k, nx, k).mean(axis=(1, 3)) * mesh["board"]
+def times(r):
+    _, end = profile_fn(r)
+    return np.arange(1, int(round(end / r["dt_s"])) + 1) * r["dt_s"]
 
 
-def transient(A, idx, gconv, cap, t, ta, t0, surf):
-    """Backward-Euler march. Returns the temperature history of the nodes `surf` (len(t), len(surf))."""
-    dt = t[1] - t[0] if len(t) > 1 else t[0]
+def march(A, cap, gconv, off, pfn, t, t0, project=None, keep=False):
+    """Backward Euler through the oven. `off` is each node's delay behind the leading edge (s).
+    Returns (projected history, full history or None): `project` (rows x nodes) picks or averages."""
+    dt = t[0]
     lu = _lu(A + sp.diags(cap / dt))
     T = np.full(A.shape[0], float(t0))
-    hist = np.empty((len(t), len(surf)), dtype=np.float32)
+    act = np.flatnonzero(gconv > 0)
+    hp = np.empty((len(t), project.shape[0]), dtype=np.float32) if project is not None else None
+    full = np.empty((len(t), A.shape[0]), dtype=np.float32) if keep else None
     for n in range(len(t)):
-        T = lu.solve(cap / dt * T + gconv * ta[n])
-        hist[n] = T[surf]
-    return hist
+        rhs = cap / dt * T
+        rhs[act] += gconv[act] * pfn(t[n] - off[act])
+        T = lu.solve(rhs)
+        if hp is not None:
+            hp[n] = project @ T
+        if keep:
+            full[n] = T
+    return hp, full
 
 
-def board(ctx, fabr, out_dir, log=print):
-    """MF7. Returns the rule result (findings, per-part rows, the calibrated profile)."""
+def _part_cover(ctx, mesh, fp):
+    """Share of each cell (of the part's outer layer) under the part's body."""
+    cache = ctx.__dict__.setdefault("_reflow_cov", {})
+    if fp["ref"] not in cache:
+        g = mesh["g"]
+        k, ny, nx = mesh["k"], mesh["ny"], mesh["nx"]
+        m = np.zeros(g.shape, bool)
+        rings = [r for poly in fp["courtyard"] for r in poly]
+        if not rings:
+            x0, y0, x1, y1 = fp["bbox"]
+            rings = [[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]]
+        geom.raster_rings(g, rings, m)
+        cache[fp["ref"]] = m[:ny * k, :nx * k].reshape(ny, k, nx, k).mean(axis=(1, 3)) * mesh["board"]
+    return cache[fp["ref"]]
+
+
+def build_model(ctx, fabr, h_scale=1.0, body_scale=1.0):
+    """The board with its parts: matrix, capacities, film conductances, belt delays, part weights."""
     b, cfg = ctx.b, ctx.cfg
     r = cfg["reflow"]
     h_fab = fabr.get("h_w_m2k", 50.0)
-    h_top, h_bot = r["h_top"] or h_fab, r["h_bot"] or h_fab
-    mesh = thermal.build(ctx, r["cell_mm"])
+    h_top, h_bot = (r["h_top"] or h_fab) * h_scale, (r["h_bot"] or h_fab) * h_scale
+    mesh = ctx.__dict__.get("_reflow_mesh")
+    if mesh is None:
+        mesh = ctx._reflow_mesh = thermal.build(ctx, r["cell_mm"])
     L, ny, nx = mesh["frac"].shape
     bm = mesh["board"]
     A, idx, gconv = thermal.assemble(b.stack, b.vias, mesh, h_top, h_bot)
     C = thermal.capacity(b.stack, mesh)
-    parts = []
-    extra = np.zeros(A.shape[0])                 # film conductance of the parts' side faces
+    N = A.shape[0]
+    extra = np.zeros(N)
+    parts, rows, cols, vals = [], [], [], []
     for ref, fp in b.fps.items():
         if fp.get("dnp") or not any(p["kind"] == "smd" for p in b.pads_by_ref.get(ref, [])):
             continue
-        cov = _part_cover(mesh, fp)
+        cov = _part_cover(ctx, mesh, fp)
         if cov.sum() <= 0:
             continue
         body = packages.body_of(fp, cfg)
+        scale = body_scale if body["assumed"] else 1.0
         l = 0 if fp["side"] == "F" else L - 1
         w = cov / cov.sum()
-        C[l] += body["C"] * w
-        side = 4.0 * math.sqrt(max(body["area"], 0.0)) * body["height"] * 1e-6       # m2, a square body of that area
+        C[l] += body["C"] * scale * w
+        side = 4.0 * math.sqrt(max(body["area"], 0.0)) * body["height"] * scale * 1e-6      # m2, a square body of that area
         extra[idx[l][bm]] += (h_top if l == 0 else h_bot) * side * w[bm]
-        parts.append({"ref": ref, "layer": l, "cov": cov, "body": body, "x": fp["x"], "y": fp["y"]})
+        nodes = idx[l][bm][w[bm] > 0]
+        rows += [len(parts)] * len(nodes)
+        cols += nodes.tolist()
+        vals += w[bm][w[bm] > 0].tolist()
+        parts.append({"ref": ref, "layer": l, "body": body, "x": fp["x"], "y": fp["y"], "nodes": nodes})
     A = (A + sp.diags(extra)).tocsc()
     gconv = gconv + extra
-    cap = np.zeros(A.shape[0])
+    cap = np.zeros(N)
     for l in range(L):
         cap[idx[l][bm]] = C[l][bm]
-    surf = np.concatenate([idx[0][bm], idx[L - 1][bm]])
-    nb = int(bm.sum())
-    t, ta0 = air_profile(r)
-    _, ta1 = air_profile(r, 1.0)
-    base = transient(A, idx, gconv, cap, t, ta0, r["start_c"], surf)
-    target = r["peak_target_c"] or fabr.get("reflow_peak_c")
+    # delay of each node behind the leading edge of the board
+    v = r["zone_mm"] / r["zone_s"]
+    jj, ii = np.meshgrid(np.arange(nx), np.arange(ny))
+    cx, cy = mesh["g"].x0 + (jj + 0.5) * mesh["cs"], mesh["g"].y0 + (ii + 0.5) * mesh["cs"]
+    axis = cx if "x" in r["travel"] else cy
+    lead = axis[bm].min() if r["travel"].startswith("-") else axis[bm].max()
+    delay = np.abs(lead - axis) / v
+    off = np.zeros(N)
+    for l in range(L):
+        off[idx[l][bm]] = delay[bm]
+    W = sp.csr_matrix((vals, (rows, cols)), shape=(len(parts), N)) if parts else sp.csr_matrix((0, N))
+    return {"mesh": mesh, "A": A, "idx": idx, "gconv": gconv, "cap": cap, "off": off, "parts": parts, "W": W,
+            "h_top": h_top, "h_bot": h_bot, "belt_mm_s": v, "delay_s": float(delay[bm].max()), "cx": cx, "cy": cy}
+
+
+def run_profile(M, r, target, keep=False):
+    """March the model through the oven and, with a target, shift the spike zones until the median
+    peak over the parts meets it. Returns (part history, full history or None, shift)."""
+    t = times(r)
+    pfn, _ = profile_fn(r)
+    hp, full = march(M["A"], M["cap"], M["gconv"], M["off"], pfn, t, r["start_c"], M["W"], keep)
     shift = 0.0
-    if r["calibrate"] and target:
-        unit = transient(A, idx, gconv, cap, t, ta1 - ta0, 0.0, surf)       # response to +1 C on the spike zones
+    if r["calibrate"] and target and hp.shape[1]:
+        ufn, _ = profile_fn(r, unit=True)
+        up, ufull = march(M["A"], M["cap"], M["gconv"], M["off"], ufn, t, 0.0, M["W"], keep)
         lo, hi = -150.0, 150.0
         for _ in range(40):
             shift = (lo + hi) / 2
-            if np.median((base + shift * unit).max(axis=0)) < target:
+            if np.median((hp + shift * up).max(axis=0)) < target:
                 lo = shift
             else:
                 hi = shift
-        hist = base + shift * unit
-        del unit
-    else:
-        hist = base
-    del base
-    tau = _lu(A).solve(cap)                                                    # lag time of every node, s
-    dt = r["dt_s"]
-    liq = r["liquidus_c"]
-    peak = hist.max(axis=0)
+        hp = hp + shift * up
+        if keep:
+            full += shift * ufull
+    return hp, full, shift
+
+
+def board(ctx, fabr, out_dir, log=print):
+    """MF7. A ranking of the parts by how far their peak lies from the board's median."""
+    b, cfg = ctx.b, ctx.cfg
+    r = cfg["reflow"]
+    target = r["peak_target_c"] or fabr.get("reflow_peak_c")
+    M = build_model(ctx, fabr)
+    mesh, bm = M["mesh"], M["mesh"]["board"]
+    L, ny, nx = mesh["frac"].shape
+    t = times(r)
+    keep = M["A"].shape[0] * len(t) * 4 < 400e6
+    hp, full, shift = run_profile(M, r, target, keep)
+    tau = _lu(M["A"]).solve(M["cap"])
+    liq, dt = r["liquidus_c"], r["dt_s"]
+    peaks = hp.max(axis=0) if hp.shape[1] else np.zeros(0)
+    med = float(np.median(peaks)) if len(peaks) else None
+    dev = {"base": peaks - med} if len(peaks) else {}
+    lags = {"base": tau}
+    if r["sensitivity"] and len(peaks):
+        def variant(v):
+            name, hs, bs = v
+            Mv = build_model(ctx, fabr, hs, bs)
+            hv, _, _ = run_profile(Mv, r, target)
+            pv = hv.max(axis=0)
+            return name, pv - np.median(pv), _lu(Mv["A"]).solve(Mv["cap"]) if bs == 1.0 else None
+        for name, d, tv in par.pmap(variant, VARIANTS, par.workers(cfg)):
+            dev[name] = d
+            if tv is not None:
+                lags[name] = tv
+    node_peak = full.max(axis=0) if full is not None else None
     rows = []
-    for p in parts:
-        w = p["cov"][bm]
-        w = w / w.sum()
-        off = 0 if p["layer"] == 0 else nb
-        T = hist[:, off:off + nb] @ w
+    n_cold = max(1, int(round(0.1 * len(peaks)))) if len(peaks) else 0
+    cold_sets = [set(np.argsort(d)[:n_cold].tolist()) for d in dev.values()]
+    for k, p in enumerate(M["parts"]):
+        T = hp[:, k]
         above = T >= liq
-        ramp = np.diff(T) / dt
-        win = max(1, int(round(r["ramp_window_s"] / dt)))                    # steepest rise, averaged over the window
-        ramp = np.convolve(ramp, np.ones(win) / win, mode="valid") if len(ramp) >= win else ramp
-        rows.append({"ref": p["ref"], "x": p["x"], "y": p["y"], "side": "F" if p["layer"] == 0 else "B",
-                     "peak_c": round(float(T.max()), 1), "tal_s": round(float(above.sum() * dt), 1),
-                     "t_liquidus_s": round(float(t[np.argmax(above)]), 1) if above.any() else None,
-                     "ramp_c_s": round(float(ramp.max()), 2),
-                     "lag_s": round(float(tau[idx[p["layer"]][bm]] @ w), 1),
-                     "body": p["body"]["source"], "assumed": p["body"]["assumed"]})
-    lim = {k: r[k] for k in ("peak_min_c", "peak_max_c", "tal_min_s", "tal_max_s", "spread_warn_c", "ramp_max_c_s", "ramp_window_s")}
+        ds = [float(d[k]) for d in dev.values()]
+        row = {"ref": p["ref"], "x": p["x"], "y": p["y"], "side": "F" if p["layer"] == 0 else "B",
+               "peak_c": round(float(T.max()), 1), "d_peak_c": round(ds[0], 1), "d_range_c": [round(min(ds), 1), round(max(ds), 1)],
+               "tal_s": round(float(above.sum() * dt), 0), "lag_s": round(float(M["W"][k] @ tau), 1),
+               "always_coldest": bool(cold_sets) and all(k in s for s in cold_sets),
+               "body": p["body"]["source"], "assumed": p["body"]["assumed"]}
+        if node_peak is not None and len(p["nodes"]) >= 4:
+            row["within_c"] = round(float(node_peak[p["nodes"]].max() - node_peak[p["nodes"]].min()), 1)
+        rows.append(row)
+    rows.sort(key=lambda x: x["d_peak_c"])
     fs = []
-    lname = lambda row: b.layers[0] if row["side"] == "F" else b.layers[-1]
-    for row in rows:
-        why = []
-        if row["peak_c"] < lim["peak_min_c"]:
-            why.append((f"peaks at {row['peak_c']:.0f} C, below {lim['peak_min_c']:g} C: risk of an unwetted joint",
-                        row["peak_c"], lim["peak_min_c"], "C", "peak_low"))
-        elif row["peak_c"] > lim["peak_max_c"]:
-            why.append((f"peaks at {row['peak_c']:.0f} C, above {lim['peak_max_c']:g} C", row["peak_c"], lim["peak_max_c"],
-                        "C", "peak_high"))
-        if row["peak_c"] >= liq and not (lim["tal_min_s"] <= row["tal_s"] <= lim["tal_max_s"]):
-            why.append((f"{row['tal_s']:.0f} s above liquidus ({liq:g} C), outside {lim['tal_min_s']:g}-{lim['tal_max_s']:g} s",
-                        row["tal_s"], lim["tal_max_s"] if row["tal_s"] > lim["tal_max_s"] else lim["tal_min_s"], "s", "tal"))
-        if row["ramp_c_s"] > lim["ramp_max_c_s"]:
-            why.append((f"heats at {row['ramp_c_s']:.1f} C/s, above {lim['ramp_max_c_s']:g} C/s", row["ramp_c_s"],
-                        lim["ramp_max_c_s"], "C/s", "ramp"))
-        for msg, val, limit, unit, kind in why:
-            fs.append(finding("reflow", "warning", f"{row['ref']} {msg} (lag {row['lag_s']:.0f} s; {row['body']})",
-                              layer=lname(row), x=row["x"], y=row["y"], value=val, limit=limit, unit=unit,
-                              part=row["ref"], kind=kind))
-    spread = None
-    if rows:
-        cold, hot = min(rows, key=lambda x: x["peak_c"]), max(rows, key=lambda x: x["peak_c"])
-        spread = round(hot["peak_c"] - cold["peak_c"], 1)
-        if spread > lim["spread_warn_c"]:
-            fs.append(finding("reflow", "warning", f"peak temperature differs by {spread:.0f} C across the parts: {cold['ref']} "
-                              f"{cold['peak_c']:.0f} C, {hot['ref']} {hot['peak_c']:.0f} C (limit {lim['spread_warn_c']:g} C)",
-                              layer=lname(cold), x=cold["x"], y=cold["y"], value=spread, limit=lim["spread_warn_c"], unit="C",
-                              part=cold["ref"], kind="spread"))
+    j = cfg["dfm"]["judge"]
+    if j.get("source") and j.get("reflow_cold_c") is not None:
+        for row in rows:
+            if -row["d_peak_c"] > j["reflow_cold_c"]:
+                fs.append(finding("reflow", "warning", f"{row['ref']} peaks {-row['d_peak_c']:.1f} C below the board median "
+                                  f"(range {-row['d_range_c'][1]:.1f} to {-row['d_range_c'][0]:.1f} C over the model variants), more than "
+                                  f"{j['reflow_cold_c']:g} C (board config: {j['source']})", layer=b.layers[0 if row["side"] == "F" else -1],
+                                  x=row["x"], y=row["y"], value=-row["d_peak_c"], limit=j["reflow_cold_c"], unit="C", part=row["ref"],
+                                  kind="cold", basis=f"board config: {j['source']}"))
     img = None
-    try:
-        from . import report
-        pk = np.full((ny, nx), np.nan)
-        pk[bm] = peak[:nb]
-        img = report.heatmap(pk, mesh, b, f"{out_dir}/reflow_peak_top.png", "Peak temperature in reflow, top layer (C)")
-    except Exception as e:
-        log(f"  (no image: {e})")
+    if node_peak is not None:
+        try:
+            from . import report
+            pk = np.full((ny, nx), np.nan)
+            pk[bm] = node_peak[M["idx"][0][bm]]
+            img = report.heatmap(pk, mesh, b, f"{out_dir}/reflow_peak_top.png", "Modelled peak temperature in reflow, top layer (C)")
+        except Exception as e:
+            log(f"  (no image: {e})")
     n_assumed = sum(1 for x in rows if x["assumed"])
     zones = list(r["zones_c"])
-    for k in range(1, int(r["spike_zones"]) + 1):
-        zones[-k] = round(zones[-k] + shift, 1)
-    log(f"  {len(rows)} parts, h = {h_top:g}/{h_bot:g} W/m2K, spike zones shifted {shift:+.1f} C for a median peak of "
-        f"{float(np.median(peak)):.1f} C" + (f" (target {target:g} C)" if target else ""))
+    for k in range(len(zones) - int(r["spike_zones"]), len(zones)):
+        zones[k] = round(zones[k] + shift, 1)
     if rows:
-        log(f"  peak {min(x['peak_c'] for x in rows):.1f} to {max(x['peak_c'] for x in rows):.1f} C over the parts; "
-            f"lag {min(x['lag_s'] for x in rows):.0f} to {max(x['lag_s'] for x in rows):.0f} s; {n_assumed} parts with an assumed body")
-    params = {"cell_mm": r["cell_mm"], "dt_s": dt, "h_top": h_top, "h_bot": h_bot, "h_source": fabr.src("h_w_m2k") if not r["h_top"] else "board config",
-              "zones_c": zones, "zone_s": r["zone_s"], "cool_c": r["cool_c"], "cool_s": r["cool_s"], "shift_c": round(shift, 1),
-              "target_c": target, "target_source": "board config" if r["peak_target_c"] else fabr.src("reflow_peak_c"),
-              "liquidus_c": liq, "limits": lim, "limits_source": "proposed defaults ([reflow] in the board config)"}
-    return dict(result("reflow", "MF7", "Reflow: peak temperature, time above liquidus and lag of every part", params,
-                       {x["ref"]: {"peak_c": x["peak_c"], "tal_s": x["tal_s"], "lag_s": x["lag_s"]} for x in rows}, fs,
-                       {"spread_c": spread, "median_peak_c": round(float(np.median(peak)), 1), "parts": len(rows),
-                        "assumed_bodies": n_assumed}),
-                parts=rows, image=img)
+        log(f"  {len(rows)} parts; spike zones shifted {shift:+.1f} C so that the median peak is {med:.1f} C"
+            + (f" (target {target:g} C)" if target else "") + f"; belt {M['belt_mm_s']:.1f} mm/s, {M['delay_s']:.0f} s from leading to trailing edge")
+        log(f"  coldest {rows[0]['ref']} {rows[0]['d_peak_c']:+.1f} C from the median (range {rows[0]['d_range_c'][0]:+.1f} to "
+            f"{rows[0]['d_range_c'][1]:+.1f}), hottest {rows[-1]['ref']} {rows[-1]['d_peak_c']:+.1f} C; {n_assumed} of {len(rows)} bodies assumed; "
+            f"{len(dev)} model variants")
+    params = {"cell_mm": r["cell_mm"], "dt_s": dt, "h_top": M["h_top"], "h_bot": M["h_bot"],
+              "h_source": fabr.src("h_w_m2k") if not r["h_top"] else "board config", "zones_c": zones, "zone_s": r["zone_s"],
+              "cool_c": r["cool_c"], "cool_s": r["cool_s"], "shift_c": round(shift, 1), "target_c": target,
+              "target_source": "board config" if r["peak_target_c"] else fabr.src("reflow_peak_c"), "liquidus_c": liq,
+              "belt_mm_s": round(M["belt_mm_s"], 2), "travel": r["travel"], "variants": list(dev)}
+    return {"rule": "reflow", "spec": "MF7", "title": "Reflow: how far each part's peak lies from the board median (model)",
+            "params": params, "findings": fs, "rows": rows, "image": img,
+            "summary": {"parts": len(rows), "assumed_bodies": n_assumed, "median_peak_c": None if med is None else round(med, 1),
+                        "spread_c": round(rows[-1]["d_peak_c"] - rows[0]["d_peak_c"], 1) if rows else None,
+                        "spread_range_c": [round(float(min(d.max() - d.min() for d in dev.values())), 1),
+                                           round(float(max(d.max() - d.min() for d in dev.values())), 1)] if dev else None,
+                        "always_coldest": [x["ref"] for x in rows if x["always_coldest"]]},
+            "_internal": {"M": M, "tau": lags, "hist": full, "t": t, "r": r, "shift": shift}}
 
 
 # ------------------------------------------------------------------------------------------------
@@ -224,8 +290,9 @@ def window_matrix(stack, cu, inside, vias, lf, kf, m, res, h_fine, h_far):
 
     cu: list (one per copper layer) of boolean rasters of the window at `res` mm, sized a multiple of
     kf * m; inside: the board area; vias: dict x, y (pixel coordinates in the window), top, bot, drill.
-    Layer `lf` is meshed at kf pixels per cell, every other layer at kf * m. Returns A (CSC), the
-    capacity vector, the fine-layer node index (ny, nx; -1 outside the board) and the cell size (m)."""
+    Layer `lf` is meshed at kf pixels per cell, every other layer at kf * m. Returns A (CSR, film on the
+    diagonal), the capacities, the film conductances, the node index of every layer (-1 outside the
+    board) and the fine cell size (m)."""
     L = len(cu)
     kc = kf * m
     bf, bc = _blockmean(inside, kf) > 0.5, _blockmean(inside, kc) > 0.5
@@ -235,10 +302,10 @@ def window_matrix(stack, cu, inside, vias, lf, kf, m, res, h_fine, h_far):
     cs_f, cs_c = kf * res * 1e-3, kc * res * 1e-3
     idx, n = [], 0
     for l in range(L):
-        bm = bf if l == lf else bc
-        ix = -np.ones(bm.shape, np.int64)
-        ix[bm] = n + np.arange(int(bm.sum()))
-        n += int(bm.sum())
+        bmk = bf if l == lf else bc
+        ix = -np.ones(bmk.shape, np.int64)
+        ix[bmk] = n + np.arange(int(bmk.sum()))
+        n += int(bmk.sum())
         idx.append(ix)
     rows, cols, vals = [], [], []
     diag = np.zeros(n)
@@ -295,11 +362,12 @@ def window_matrix(stack, cu, inside, vias, lf, kf, m, res, h_fine, h_far):
     cols = np.concatenate([np.atleast_1d(x) for x in cols])
     vals = np.concatenate([np.atleast_1d(x) for x in vals])
     A = sp.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr() + sp.diags(diag + gconv)
-    return A, cap, gconv, idx[lf], cs_f
+    return A, cap, gconv, idx, cs_f
 
 
-def chip_lag(ctx, fp, chip, pads, h_part, h_far, p):
-    """Lag times (s) of the two joints of a chip: pad, termination and their mean, per pad."""
+def chip_window(ctx, fp, chip, pads, h_part, h_far, p, paste_scale=1.0, margin=None):
+    """The window model of one chip: matrix with the two chip nodes appended, capacities, film
+    conductances, the nodes on the window's edge with their layer and position, and the pad weights."""
     b = ctx.b
     g = b.grid()
     L = len(b.layers)
@@ -308,7 +376,7 @@ def chip_lag(ctx, fp, chip, pads, h_part, h_far, p):
     m = max(1, int(p["coarse"]))
     kc = kf * m
     pts = np.vstack([np.asarray(r, dtype=float) for pad in pads for poly in pad["poly"] for r in poly])
-    mar = p["margin_mm"]
+    mar = p["margin_mm"] if margin is None else margin
     j0 = int(math.floor((pts[:, 0].min() - mar - g.x0) / g.res / kc)) * kc
     j1 = int(math.ceil((pts[:, 0].max() + mar - g.x0) / g.res / kc)) * kc
     i0 = int(math.floor((pts[:, 1].min() - mar - g.y0) / g.res / kc)) * kc
@@ -321,20 +389,21 @@ def chip_lag(ctx, fp, chip, pads, h_part, h_far, p):
     vx, vy = (V["x"] - g.x0) / g.res - j0, (V["y"] - g.y0) / g.res - i0
     near = (vx >= 0) & (vx < j1 - j0) & (vy >= 0) & (vy < i1 - i0)
     vias = {"x": vx[near], "y": vy[near], "top": V["top"][near], "bot": V["bot"][near], "drill": V["drill"][near]}
-    A, cap, gconv, fidx, cs = window_matrix(b.stack, cu, thermal._inside(ctx)[sl], vias, lf, kf, m, g.res, h_part, h_far)
+    A, cap, gconv, idx, cs = window_matrix(b.stack, cu, thermal._inside(ctx)[sl], vias, lf, kf, m, g.res, h_part, h_far)
     n = A.shape[0]
+    fidx = idx[lf]
+    x0, y0 = g.x0 + j0 * g.res, g.y0 + i0 * g.res
     sub = geom.Grid.__new__(geom.Grid)
-    sub.res, sub.x0, sub.y0, sub.nx, sub.ny = g.res, g.x0 + j0 * g.res, g.y0 + i0 * g.res, j1 - j0, i1 - i0
+    sub.res, sub.x0, sub.y0, sub.nx, sub.ny = g.res, x0, y0, j1 - j0, i1 - i0
     covs = []
     for pad in pads:
         mk = np.zeros(sub.shape, bool)
         geom.raster_rings(sub, [ring for poly in pad["poly"] for ring in poly], mk)
         covs.append(_blockmean(mk, kf) * (fidx >= 0))
-    # two nodes for the halves of the chip
     surf = (chip["L"] * chip["W"] + 2 * chip["H"] * (chip["L"] + chip["W"])) * 1e-6
     gap = max(math.hypot(pads[0]["x"] - pads[1]["x"], pads[0]["y"] - pads[1]["y"]), 0.1) * 1e-3
     g_body = chip["k"] * chip["W"] * chip["H"] * 1e-6 / gap
-    g_paste = p["paste_k"] / (p["paste_um"] * 1e-6) * cs * cs            # per fully covered cell
+    g_paste = p["paste_k"] * paste_scale / (p["paste_um"] * 1e-6) * cs * cs            # per fully covered cell
     rows, cols, vals = [n, n + 1], [n + 1, n], [-g_body, -g_body]
     dg = np.zeros(n + 2)
     dg[n] = dg[n + 1] = g_body + h_part * surf / 2
@@ -349,23 +418,133 @@ def chip_lag(ctx, fp, chip, pads, h_part, h_far, p):
     rows = np.concatenate([np.atleast_1d(x) for x in rows])
     cols = np.concatenate([np.atleast_1d(x) for x in cols])
     vals = np.concatenate([np.atleast_1d(x) for x in vals])
-    A2 = sp.bmat([[A, None], [None, sp.csr_matrix((2, 2))]]).tocsr() + \
-        sp.coo_matrix((vals, (rows, cols)), shape=(n + 2, n + 2)).tocsr() + sp.diags(dg)
+    A2 = (sp.bmat([[A, None], [None, sp.csr_matrix((2, 2))]]).tocsr() +
+          sp.coo_matrix((vals, (rows, cols)), shape=(n + 2, n + 2)).tocsr() + sp.diags(dg)).tocsr()
+    g2 = np.concatenate([gconv, [h_part * surf / 2, h_part * surf / 2]])
     c2 = np.concatenate([cap, [chip["C"] / 2, chip["C"] / 2]])
-    tau = _lu(A2).solve(c2)
+    # nodes on the edge of the window: one ring of coarse cells in every layer
+    bnodes, blayer, bx, by = [], [], [], []
+    for l, ix in enumerate(idx):
+        k = kf if l == lf else kc
+        w = m if l == lf else 1
+        edge = np.zeros(ix.shape, bool)
+        edge[:w, :] = edge[-w:, :] = edge[:, :w] = edge[:, -w:] = True
+        ii, jj = np.nonzero(edge & (ix >= 0))
+        bnodes.append(ix[ii, jj])
+        blayer.append(np.full(len(ii), l))
+        bx.append(x0 + (jj + 0.5) * k * g.res)
+        by.append(y0 + (ii + 0.5) * k * g.res)
+    wts = []
+    for cov in covs:
+        w = np.zeros(n + 2)
+        w[fidx[cov > 0]] = cov[cov > 0] / max(cov.sum(), 1e-12)
+        wts.append(w)
+    return {"A": A2, "cap": c2, "gconv": g2, "n": n, "bnodes": np.concatenate(bnodes), "blayer": np.concatenate(blayer),
+            "bx": np.concatenate(bx), "by": np.concatenate(by), "wts": wts, "x": float(pts[:, 0].mean()), "y": float(pts[:, 1].mean())}
+
+
+def _board_weights(M, layer, x, y):
+    """Sparse matrix (points x board nodes): bilinear weights of the board model's nodes at points of
+    one copper layer each; cells outside the board are left out and the rest renormalised."""
+    mesh = M["mesh"]
+    cs = mesh["cs"]
+    L, ny, nx = mesh["frac"].shape
+    fx, fy = (x - mesh["g"].x0) / cs - 0.5, (y - mesh["g"].y0) / cs - 0.5
+    j0, i0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
+    tx, ty = fx - j0, fy - i0
+    rows, cols, vals = [], [], []
+    tot = np.zeros(len(x))
+    for di, dj, w in ((0, 0, (1 - tx) * (1 - ty)), (0, 1, tx * (1 - ty)), (1, 0, (1 - tx) * ty), (1, 1, tx * ty)):
+        i, j = np.clip(i0 + di, 0, ny - 1), np.clip(j0 + dj, 0, nx - 1)
+        node = M["idx"][layer, i, j]
+        ok = (node >= 0) & (w > 0)
+        rows.append(np.flatnonzero(ok))
+        cols.append(node[ok])
+        vals.append(w[ok])
+        np.add.at(tot, np.flatnonzero(ok), w[ok])
+    rows, cols, vals = np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+    lone = tot <= 0                                   # a point with no board cell around it: the nearest board cell
+    if lone.any():
+        bm = mesh["board"]
+        bi, bj = np.nonzero(bm)
+        for k in np.flatnonzero(lone):
+            q = int(np.argmin((bi - fy[k]) ** 2 + (bj - fx[k]) ** 2))
+            rows = np.r_[rows, k]
+            cols = np.r_[cols, M["idx"][layer[k]][bi[q], bj[q]]]
+            vals = np.r_[vals, 1.0]
+            tot[k] = 1.0
+    return sp.csr_matrix((vals / tot[rows], (rows, cols)), shape=(len(x), M["A"].shape[0]))
+
+
+def chip_lag(Wm, M=None, tau_board=None):
+    """Lag times of the two joints (pad, termination, mean per pad). With a board model the window's
+    edge is held at the board's lag time there; without one the edge is insulated."""
+    n2 = Wm["A"].shape[0]
+    if M is not None and tau_board is not None and len(Wm["bnodes"]):
+        tb = _board_weights(M, Wm["blayer"], Wm["bx"], Wm["by"]) @ tau_board
+        free = np.ones(n2, bool)
+        free[Wm["bnodes"]] = False
+        A = Wm["A"]
+        rhs = Wm["cap"][free] - A[free][:, Wm["bnodes"]] @ tb
+        tau = np.empty(n2)
+        tau[Wm["bnodes"]] = tb
+        tau[free] = _lu(A[free][:, free]).solve(rhs)
+    else:
+        tau = _lu(Wm["A"]).solve(Wm["cap"])
+    n = Wm["n"]
+    return [{"tau_pad_s": float(w @ tau), "tau_term_s": float(tau[n + k]), "tau_joint_s": (float(w @ tau) + float(tau[n + k])) / 2}
+            for k, w in enumerate(Wm["wts"])]
+
+
+def chip_transient(Wm, I, liquidus):
+    """The window marched through the oven profile of the board run: time (s) at which each joint
+    crosses liquidus, or None. The window's edge follows the board model's temperatures."""
+    M, t, r = I["M"], I["t"], I["r"]
+    dt = t[0]
+    n2 = Wm["A"].shape[0]
+    free = np.ones(n2, bool)
+    free[Wm["bnodes"]] = False
+    A = Wm["A"]
+    Aff, Afb = A[free][:, free], A[free][:, Wm["bnodes"]]
+    Wb = _board_weights(M, Wm["blayer"], Wm["bx"], Wm["by"])
+    cap, gc = Wm["cap"][free], Wm["gconv"][free]
+    lu = _lu(Aff + sp.diags(cap / dt))
+    pfn, _ = profile_fn(r, I["shift"])
+    v = M["belt_mm_s"]
+    cx, cy, bm = M["cx"], M["cy"], M["mesh"]["board"]
+    axis, here = (cx, Wm["x"]) if "x" in r["travel"] else (cy, Wm["y"])
+    lead = axis[bm].min() if r["travel"].startswith("-") else axis[bm].max()
+    off = abs(lead - here) / v
+    T = np.full(int(free.sum()), float(r["start_c"]))
+    sel = np.cumsum(free) - 1
+    n = Wm["n"]
+    probes = []
+    for k, w in enumerate(Wm["wts"]):
+        wf = w[free]
+        e = np.zeros(len(T))
+        e[sel[n + k]] = 1.0
+        probes.append((wf + e) / 2)
+    P = np.array(probes)
+    hist = np.empty((len(t), len(probes)))
+    for s in range(len(t)):
+        T = lu.solve(cap / dt * T + gc * pfn(t[s] - off) - Afb @ (Wb @ I["hist"][s]))
+        hist[s] = P @ T
     out = []
-    for k, cov in enumerate(covs):
-        w = cov[cov > 0]
-        t_pad = float(tau[fidx[cov > 0]] @ w / w.sum()) if w.sum() > 0 else float("nan")
-        out.append({"pad": pads[k]["num"], "net": pads[k]["net"], "tau_pad_s": t_pad, "tau_term_s": float(tau[n + k]),
-                    "tau_joint_s": (t_pad + float(tau[n + k])) / 2})
-    return out, n + 2
+    for k in range(len(probes)):
+        y = hist[:, k]
+        up = np.flatnonzero((y[1:] >= liquidus) & (y[:-1] < liquidus))
+        if not len(up):
+            out.append(None)
+            continue
+        s = int(up[0])
+        out.append(float(t[s] + (liquidus - y[s]) / (y[s + 1] - y[s]) * dt))
+    return out
 
 
 def chips_in_scope(ctx):
-    """Two-terminal chips to judge: [(footprint, chip, [pad a, pad b])]."""
+    """Two-terminal chips to rank: [(footprint, chip, [pad a, pad b])]."""
     b, cfg = ctx.b, ctx.cfg
-    top = packages.size_rank(cfg["dfm"]["pad_balance"]["max_package"])
+    top = packages.size_rank(cfg["dfm"]["chips"]["max_package"])
     out = []
     for ref, fp in b.fps.items():
         pads = b.pads_by_ref.get(ref, [])
@@ -380,52 +559,177 @@ def chips_in_scope(ctx):
     return out
 
 
-def tombstone(ctx, fabr, order=None, log=print):
-    """MF8 over the chips in scope (`order`: references to solve first when max_parts limits the run)."""
+def _rings(pad):
+    return [ring for poly in pad["poly"] for ring in poly]
+
+
+def pad_copper(ctx, pad, plane_cache):
+    """What leaves a pad: width of copper of its net crossing a ring just outside it (mm), the share of
+    the ring in copper, vias in the pad, and vias of its net into a plane within reach."""
+    b = ctx.b
+    p = ctx.cfg["dfm"]["chips"]
+    g = b.grid()
+    ring_px = max(2, int(round(p["ring_mm"] / g.res)))
+    rings = _rings(pad)
+    a = np.vstack([np.asarray(r, dtype=float) for r in rings])
+    x0, y0, x1, y1 = a[:, 0].min(), a[:, 1].min(), a[:, 0].max(), a[:, 1].max()
+    mm = (ring_px + 3) * g.res
+    i0, j0 = g.ij(x0 - mm, y0 - mm)
+    i1, j1 = g.ij(x1 + mm, y1 + mm)
+    i0, j0 = max(int(i0), 0), max(int(j0), 0)
+    i1, j1 = min(int(i1) + 1, g.ny), min(int(j1) + 1, g.nx)
+    sub = geom.Grid.__new__(geom.Grid)
+    sub.res, sub.x0, sub.y0, sub.nx, sub.ny = g.res, g.x0 + j0 * g.res, g.y0 + i0 * g.res, j1 - j0, i1 - i0
+    M = geom.raster_rings(sub, rings)
+    d = ndimage.distance_transform_edt(~M)
+    ring = (d > ring_px - 0.5) & (d <= ring_px + 0.5)
+    lab = b.raster(pad["layer_ids"][0])[i0:i1, j0:j1]
+    n = int(ring.sum())
+    cu = int((ring & (lab == pad["net_id"])).sum()) if pad["net_id"] else 0
+    V = b.vias
+    reach = p["via_reach_mm"]
+    same = V["net"] == pad["net_id"] if pad["net_id"] else np.zeros(len(V["x"]), bool)
+    inbox = np.flatnonzero(same & (V["x"] >= x0) & (V["x"] <= x1) & (V["y"] >= y0) & (V["y"] <= y1))
+    in_pad = int(geom.points_in_rings(V["x"][inbox], V["y"][inbox], rings).sum()) if len(inbox) else 0
+    close = np.flatnonzero(same & (V["x"] >= x0 - reach) & (V["x"] <= x1 + reach) & (V["y"] >= y0 - reach) & (V["y"] <= y1 + reach))
+    planes = 0
+    for k in close:
+        k = int(k)
+        if k not in plane_cache:
+            plane_cache[k] = bool(b.zone_connected_layers(k))
+        planes += plane_cache[k]
+    return {"pad": pad["num"], "net": pad["net"], "entry_mm": round(cu * g.res, 3), "share": round(cu / n if n else 0.0, 3),
+            "vias_in_pad": in_pad, "plane_vias": planes}
+
+
+def _sig(x, n=2):
+    """Two significant digits; anything below 5 ms is 0 (the model is not good to that)."""
+    return 0.0 if abs(x) < 0.005 else round(x, n - 1 - int(math.floor(math.log10(abs(x)))))
+
+
+def chips(ctx, fabr, internal=None, exposure=None, log=print):
+    """MF8. A ranking of the two-terminal chips by the time between their two joints reaching liquidus,
+    with the copper and land-pattern geometry of each beside it."""
     b, cfg = ctx.b, ctx.cfg
-    p = cfg["dfm"]["tombstone"]
+    p = cfg["dfm"]["chips"]
     r = cfg["reflow"]
     h_fab = fabr.get("h_w_m2k", 50.0)
     h_top, h_bot = r["h_top"] or h_fab, r["h_bot"] or h_fab
-    small = packages.size_rank(cfg["dfm"]["pad_balance"]["small_package"])
-    chips = chips_in_scope(ctx)
-    if order:
-        rank = {ref: k for k, ref in enumerate(order)}
-        chips.sort(key=lambda c: rank.get(c[0]["ref"], len(rank)))
+    M = internal["M"] if internal else None
+    tau_b = internal["tau"]["base"] if internal else None
+    scope = chips_in_scope(ctx)
     skipped = 0
-    if p["max_parts"] and len(chips) > p["max_parts"]:
-        skipped = len(chips) - p["max_parts"]
-        chips = chips[: p["max_parts"]]
-    rows, fs = [], []
-    for fp, chip, pads in chips:
+    if p["max_parts"] and len(scope) > p["max_parts"]:
+        skipped = len(scope) - p["max_parts"]
+        scope = scope[: p["max_parts"]]
+    for l in range(len(b.layers)):                 # loaded before the workers start, so they share them
+        b.raster(l)
+    thermal._inside(ctx)
+    nw = par.workers(cfg)
+
+    def first(k):
+        fp, chip, pads = scope[k]
         front = fp["side"] == "F"
+        hp, hf = (h_top, h_bot) if front else (h_bot, h_top)
         try:
-            j, n = chip_lag(ctx, fp, chip, pads, h_top if front else h_bot, h_bot if front else h_top, p)
+            j = chip_lag(chip_window(ctx, fp, chip, pads, hp, hf, p), M, tau_b)
         except Exception as e:                       # a window that cannot be solved is reported, not hidden
-            fs.append(finding("tombstone", "warning", f"{fp['ref']}: pad-level model failed: {e}", part=fp["ref"],
-                              layer=b.layers[pads[0]["layer_ids"][0]], x=fp["x"], y=fp["y"], kind="problem"))
-            continue
+            return {"problem": f"{fp['ref']}: {e}"}
         d = j[0]["tau_joint_s"] - j[1]["tau_joint_s"]
-        first, last = (j[1], j[0]) if d > 0 else (j[0], j[1])
-        row = {"ref": fp["ref"], "package": chip["code"], "kind": chip["kind"], "x": fp["x"], "y": fp["y"],
-               "dt_s": round(abs(d), 3), "first_pad": first["pad"], "first_net": first["net"], "last_pad": last["pad"],
-               "last_net": last["net"], "tau_s": [round(j[0]["tau_joint_s"], 2), round(j[1]["tau_joint_s"], 2)], "nodes": n}
-        rows.append(row)
-        if abs(d) >= p["dt_warn_s"]:
-            sev = "warning" if packages.size_rank(chip["code"]) <= small else "info"
-            fs.append(finding("tombstone", sev, f"{fp['ref']} ({chip['code']}): pad {first['pad']} ({first['net']}) reaches liquidus "
-                              f"{abs(d):.2f} s before pad {last['pad']} ({last['net']}) (limit {p['dt_warn_s']:g} s, proposed)",
-                              net=last["net"], layer=b.layers[pads[0]["layer_ids"][0]], x=fp["x"], y=fp["y"],
-                              value=round(abs(d), 3), limit=p["dt_warn_s"], unit="s", part=fp["ref"], kind="dt"))
+        a, z = (1, 0) if d > 0 else (0, 1)
+        cache = {}
+        geo = [pad_copper(ctx, pad, cache) for pad in pads]
+        for q in geo:
+            q["exposure"] = round((exposure or {}).get((fp["ref"], q["pad"]), 1.0), 3)
+        ax = "x" if "x" in r["travel"] else "y"
+        sgn = -1.0 if r["travel"].startswith("-") else 1.0
+        belt = sgn * (pads[a][ax] - pads[z][ax]) / (r["zone_mm"] / r["zone_s"])      # the first pad's lead into each zone (s)
+        return {"k": k, "ref": fp["ref"], "package": chip["code"], "kind": chip["kind"], "x": fp["x"], "y": fp["y"], "belt_s": round(belt, 3),
+                "layer": b.layers[pads[0]["layer_ids"][0]], "dt_s": abs(d), "first_pad": pads[a]["num"],
+                "first_net": pads[a]["net"], "last_pad": pads[z]["num"], "last_net": pads[z]["net"],
+                "first": a, "last": z, "pads": geo, "land": packages.land_pattern(chip, pads)}
+    rows, problems = [], []
+    for x in par.pmap(first, range(len(scope)), nw):
+        (problems if "problem" in x else rows).append(x["problem"] if "problem" in x else x)
+    # parts with the same layout and nearly the same result share a row
     rows.sort(key=lambda x: -x["dt_s"])
-    if rows:
-        ds = np.array([x["dt_s"] for x in rows])
-        log(f"  {len(rows)} chips solved" + (f" ({skipped} left out by max_parts)" if skipped else "")
-            + f": difference between the two joints median {np.median(ds):.2f} s, 90 % below {np.percentile(ds, 90):.2f} s, "
-              f"largest {ds.max():.2f} s ({rows[0]['ref']})")
-    params = dict(p, h_top=h_top, h_bot=h_bot, limit_source="proposed default ([dfm.tombstone] dt_warn_s)")
-    return dict(result("tombstone", "MF8", "Tombstoning: time between the two joints of a chip reaching liquidus", params,
-                       {x["ref"]: {"dt_s": x["dt_s"]} for x in rows}, fs, {"chips": len(rows), "not_solved": skipped}), parts=rows)
+    out = []
+    for x in rows:
+        sig = (x["package"], x["kind"], x["first_net"] == "GND", x["last_net"] == "GND",
+               tuple((q["entry_mm"], q["vias_in_pad"], q["plane_vias"]) for q in sorted(x["pads"], key=lambda q: q["pad"] != x["first_pad"])))
+        for gq in out:
+            if gq["_sig"] == sig and abs(gq["dt_s"] - x["dt_s"]) <= 0.15 * gq["dt_s"] + 0.02:
+                gq["refs"].append(x["ref"])
+                gq["n"] += 1
+                break
+        else:
+            out.append(dict(x, refs=[x["ref"]], n=1, _sig=sig))
+    liq = r["liquidus_c"]
+
+    def detail(i):
+        x = out[i]
+        fp, chip, pads = scope[x["k"]]
+        hp, hf = (h_top, h_bot) if fp["side"] == "F" else (h_bot, h_top)
+        res, vals, probs = {"variants": {}}, [x["dt_s"]], []
+        for name, kw, tkey, hs in (("paste x 0.5", {"paste_scale": 0.5}, "base", 1.0), ("paste x 2", {"paste_scale": 2.0}, "base", 1.0),
+                                   ("window x 2", {"margin": 2 * p["margin_mm"]}, "base", 1.0),
+                                   ("film coefficient x 0.6", {}, "film coefficient x 0.6", 0.6),
+                                   ("film coefficient x 1.6", {}, "film coefficient x 1.6", 1.6)):
+            tb = internal["tau"].get(tkey) if internal else None
+            if internal and tb is None:
+                continue
+            try:
+                jv = chip_lag(chip_window(ctx, fp, chip, pads, hp * hs, hf * hs, p, **kw), M, tb)
+                dv = jv[x["last"]]["tau_joint_s"] - jv[x["first"]]["tau_joint_s"]
+                res["variants"][name] = round(dv, 3)
+                vals.append(dv)
+            except Exception as e:
+                probs.append(f"{fp['ref']} ({name}): {e}")
+        res["dt_range_s"] = [_sig(min(vals)), _sig(max(vals))]
+        if internal and internal.get("hist") is not None:
+            try:
+                tc = chip_transient(chip_window(ctx, fp, chip, pads, hp, hf, p), internal, liq)
+                res["dt_oven_s"] = _sig(tc[x["last"]] - tc[x["first"]]) if None not in tc else None
+            except Exception as e:
+                probs.append(f"{fp['ref']} (transient): {e}")
+        return res, probs
+    top = range(min(p["detail"], len(out)))
+    for i, (res, probs) in zip(top, par.pmap(detail, top, nw)):
+        out[i].update(res)
+        problems += probs
+    for x in out:
+        for k in ("_sig", "k", "first", "last"):
+            x.pop(k, None)
+    for x in out:
+        x["dt_s"] = _sig(x["dt_s"])
+    fs = []
+    j = cfg["dfm"]["judge"]
+    if j.get("source") and j.get("joint_dt_s") is not None:
+        for x in out:
+            if x["dt_s"] >= j["joint_dt_s"]:
+                rng = f" (range {x['dt_range_s'][0]:g} to {x['dt_range_s'][1]:g} s)" if x.get("dt_range_s") else ""
+                fs.append(finding("chips", "warning", f"{', '.join(x['refs'][:6])}{' ...' if x['n'] > 6 else ''} ({x['package']}): pad "
+                                  f"{x['first_pad']} ({x['first_net']}) reaches liquidus {x['dt_s']:g} s before pad {x['last_pad']} "
+                                  f"({x['last_net']}){rng}, at least {j['joint_dt_s']:g} s (board config: {j['source']})",
+                                  net=x["last_net"], layer=x["layer"], x=x["x"], y=x["y"], value=x["dt_s"], limit=j["joint_dt_s"],
+                                  unit="s", part=x["ref"], kind="dt", basis=f"board config: {j['source']}"))
+    if out:
+        ds = np.array([x["dt_s"] for x in out for _ in range(x["n"])])
+        chk = [(x["dt_s"], x["dt_oven_s"]) for x in out if x.get("dt_oven_s") is not None]
+        log(f"  {len(rows)} chips in {len(out)} layouts" + (f" ({skipped} left out by max_parts)" if skipped else "")
+            + f": median {np.median(ds):.2f} s, largest {ds.max():.2g} s ({out[0]['refs'][0]}"
+            + (f" and {out[0]['n'] - 1} like it" if out[0]["n"] > 1 else "") + ")")
+        if chk:
+            log("  lag difference against the same window marched through the oven: "
+                + ", ".join(f"{a:g} / {c:g} s" for a, c in chk[:6]))
+    for msg in problems[:5]:
+        log(f"  problem: {msg}")
+    params = {"cell_mm": p["cell_mm"], "coarse": p["coarse"], "margin_mm": p["margin_mm"], "paste_k": p["paste_k"],
+              "paste_um": p["paste_um"], "h_top": h_top, "h_bot": h_bot, "edge": "board model" if M is not None else "insulated",
+              "detail": p["detail"], "liquidus_c": liq}
+    return {"rule": "chips", "spec": "MF8", "title": "Chips: time between the two joints reaching liquidus (model), with the land geometry",
+            "params": params, "findings": fs, "rows": out, "problems": problems,
+            "summary": {"chips": len(rows), "layouts": len(out), "not_solved": skipped + len(problems)}}
 
 
 # ------------------------------------------------------------------------------------------------
@@ -447,12 +751,14 @@ def validation_cases():
     out = []
     dt = 0.5
     t = np.arange(1, int(6 * tau_ref / dt)) * dt
-    hist = transient(A, idx, gconv, cap, t, np.full(len(t), 200.0), 25.0, np.array([0]))[:, 0]
+    off = np.zeros(A.shape[0])
+    pick = sp.csr_matrix(([1.0], ([0], [0])), shape=(1, A.shape[0]))
+    hist = march(A, cap, gconv, off, lambda x: np.full(np.shape(x), 200.0), t, 25.0, pick)[0][:, 0]
     k = int(round(tau_ref / dt)) - 1
     out.append(_case("step of the air temperature: rise after one time constant", "reflow", float(hist[k] - 25.0),
                      175.0 * (1 - math.exp(-t[k] / tau_ref)), 1.0, "C", "lumped body, tau = C / (h_top + h_bot)"))
     rate = 1.5
-    hist = transient(A, idx, gconv, cap, t, 25.0 + rate * t, 25.0, np.array([0]))[:, 0]
+    hist = march(A, cap, gconv, off, lambda x: 25.0 + rate * np.asarray(x), t, 25.0, pick)[0][:, 0]
     out.append(_case("ramp of the air temperature: steady lag", "reflow", float(25.0 + rate * t[-1] - hist[-1]),
                      rate * tau_ref * (1 - math.exp(-t[-1] / tau_ref)), 1.0, "C", "lag = ramp rate x tau"))
     out.append(_case("lag time from the steady solve", "reflow", float(_lu(A).solve(cap)[0]), tau_ref, 0.5, "s",
@@ -460,8 +766,8 @@ def validation_cases():
     res, kf, m = 0.025, 2, 4
     npx = 160
     cu = [np.ones((npx, npx), bool), np.ones((npx, npx), bool)]
-    A, cap, gconv, fidx, cs = window_matrix(st, cu, np.ones((npx, npx), bool), None, 0, kf, m, res, h, h)
+    A, cap, gconv, widx, cs = window_matrix(st, cu, np.ones((npx, npx), bool), None, 0, kf, m, res, h, h)
     tw = _lu(A).solve(cap)
-    out.append(_case("window model (50 um over 200 um cells): lag time", "reflow", float(tw[fidx[40, 40]]), tau_ref, 0.5, "s",
+    out.append(_case("window model (50 um over 200 um cells): lag time", "reflow", float(tw[widx[0][40, 40]]), tau_ref, 0.5, "s",
                      "same uniform board: the two mesh sizes must agree with the lumped value"))
     return out

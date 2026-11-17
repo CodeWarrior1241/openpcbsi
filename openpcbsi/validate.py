@@ -8,7 +8,7 @@ import time
 from . import xsec
 
 SOLVER_VERSIONS = {"xsec2d": "xsec-1", "pdn": "pdn-1", "dc": "dc-1", "thermal": "th-1", "si": "si-1", "em3d": "em3d-1",
-                   "etch": "etch-1", "reflow": "rf-1"}
+                   "etch": "etch-2", "reflow": "rf-2"}
 
 
 def _case(name, solver, value, ref, tol_pct, unit, source):

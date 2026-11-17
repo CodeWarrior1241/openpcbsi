@@ -1,8 +1,9 @@
 # Fabricator profile: JLCPCB (exemplar for `openpcbsi dfm`).
 #
 # Every value under [published] is from JLCPCB's own capability pages, as read on the date below.
-# Values under [assumed] are NOT on those pages: they are typical figures, stated here so that a
-# check has a number to work with, and the report marks every finding that rests on one.
+# Values under [standard] come from a published industry standard, not from the fabricator.
+# Values under [assumed] are on neither: they are typical figures used only by the ranking models,
+# never by a check that can fail a board.
 # Copy this file to describe another fabricator; `dfm --fab FILE` reads it.
 
 [fab]
@@ -11,6 +12,8 @@ retrieved = "2026-11-16"
 sources = [
     "https://jlcpcb.com/capabilities/pcb-capabilities",
     "https://jlcpcb.com/capabilities/pcb-assembly-capabilities",
+    "https://jlcpcb.com/capabilities/pcb-stencil-manufacturing",
+    "https://jlcpcb.com/help/article/minimum-spacing-for-smd-components",
 ]
 
 # ---- track width / spacing by layer count and finished outer copper weight ----------------------
@@ -61,7 +64,62 @@ space_mm = 0.30
 
 [published.etch]
 same_net_spacing_mm = 0.25      # "Same-net track spacing"
-track_tolerance_pct = 20.0      # finished width tolerance
+track_tolerance_pct = 20.0      # "Track width tolerance" of the finished track: recorded, not judged
+
+# ---- holes ("Drilling" table) ---------------------------------------------------------------------
+[published.drill]
+via_hole_min_mm = 0.15          # "Min. Via hole size/diameter 0.15/0.25mm"
+via_diameter_min_mm = 0.25
+via_diameter_over_hole_mm = 0.10   # "Via diameter should be 0.1mm (0.15mm preferred) larger than Via hole size"
+npth_min_mm = 0.50              # "Min. Non-plated holes"
+drill_max_mm = 6.3              # "Drill Diameter 0.15 - 6.3 mm"
+via_hole_spacing_mm = 0.20      # "Via Hole-to-Hole Spacing"; taken as wall to wall (see [notes])
+pad_hole_spacing_mm = 0.45      # "Pad Hole-to-Hole Spacing"; taken as wall to wall
+plated_slot_min_2l_mm = 0.50    # "Min. Plated Slots Width"
+plated_slot_min_ml_mm = 0.35
+
+# "PTH annular ring" by layer count and outer copper weight: absolute minimum and recommended
+[[published.pth_ring]]
+layers = [1, 2]
+oz = 1.0
+min_mm = 0.18
+recommended_mm = 0.25
+
+[[published.pth_ring]]
+layers = [3, 32]
+oz = 1.0
+min_mm = 0.15
+recommended_mm = 0.20
+
+[[published.pth_ring]]
+layers = [1, 32]
+oz = 2.0
+min_mm = 0.254
+recommended_mm = 0.254
+
+# ---- clearances ("Traces" and "Outline" tables), from the hole wall or the copper edge -------------
+[published.clearance]
+via_hole_to_copper_mm = 0.20        # "Via hole to Track"
+pth_hole_to_copper_mm = 0.28        # "PTH to Track" (0.35 recommended)
+npth_hole_to_copper_mm = 0.20       # "NPTH to Track"
+inner_via_hole_to_copper_mm = 0.20  # "Inner layer via hole to copper clearance"
+inner_pth_hole_to_copper_mm = 0.30  # "Inner layer PTH pad hole to copper clearance"
+pad_to_track_mm = 0.10              # "Pad to track clearance (1oz)"
+bga_pad_to_track_mm = 0.09          # "Min. 0.09 mm locally for BGA pads"
+copper_to_edge_mm = 0.20            # "Copper clearance from routed board edges"
+copper_to_vcut_mm = 0.40
+
+[published.board]
+thickness_min_mm = 0.4
+thickness_max_mm = 4.5
+
+# ---- via covering ----------------------------------------------------------------------------------
+[published.via_cover]
+filled_default_from_layers = 6      # epoxy filled and capped "is the default for 6-layer and above"
+filled_via_min_mm = 0.15            # via diameters the filled-and-capped process accepts
+filled_via_max_mm = 0.55
+plugged_via_max_mm = 0.50           # soldermask-plugged vias
+plugged_to_opening_mm = 0.35        # plugged via to another mask opening
 
 [published.mask]
 web_mm = 0.10                   # "Soldermask bridge"
@@ -87,6 +145,50 @@ reflow_peak_economic_c = 255.0
 reflow_peak_tol_c = 5.0
 min_package_standard = "01005"
 min_package_economic = "0402"
+pin_pitch_standard_mm = 0.35        # "Minimum IC Pin Spacing"
+pin_pitch_economic_mm = 0.40
+bga_pitch_standard_mm = 0.30        # "Minimum BGA Spacing (center to center)"
+bga_pitch_economic_mm = 0.50
+double_sided_standard = true        # "Single & double sided placement"
+double_sided_economic = false       # "Single sided placement"
+fiducials_standard = true           # "Fiducials: Necessary" / "Not necessary"
+fiducials_economic = false
+rails_standard = true               # "Edge Rails: Necessary" / "Not necessary"
+rails_economic = false
+
+# ---- stencil ("PCB stencil" page) -----------------------------------------------------------------
+[published.stencil]
+thickness_mm = [0.10, 0.12, 0.15, 0.18, 0.20]   # standard thicknesses; the fabricator chooses one
+aperture_min_mm = 0.08                            # "Minimum Aperture Size > 0.08mm"
+
+# ---- spacing between SMD parts ("Minimum Spacing Requirements for SMD Components", recommended) ----
+# mm between two parts by package class; chip sizes by EIA code. The article's drawing of how the
+# distance is measured was not read: see [notes].
+[published.part_spacing]
+classes = ["0201", "0402", "0603", "0805", "1206", "QFN", "QFP", "SOP", "SOT", "BGA"]
+matrix = [
+    [0.15, 0.15, 0.18, 0.18, 0.25, 1.0, 0.5, 0.4, 0.2, 1.0],
+    [0.15, 0.15, 0.18, 0.18, 0.25, 1.0, 0.5, 0.4, 0.2, 1.0],
+    [0.18, 0.18, 0.18, 0.18, 0.25, 1.0, 0.5, 0.4, 0.2, 1.0],
+    [0.18, 0.18, 0.18, 0.18, 0.25, 1.0, 0.5, 0.4, 0.2, 1.0],
+    [0.25, 0.25, 0.25, 0.25, 0.35, 1.0, 0.5, 0.4, 0.2, 1.0],
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.5],
+    [0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 1.25, 1.25, 1.0, 1.5],
+    [0.4, 0.4, 0.4, 0.4, 0.4, 1.0, 1.25, 0.5, 0.4, 1.0],
+    [0.2, 0.2, 0.2, 0.2, 0.2, 1.0, 1.0, 0.4, 0.4, 1.0],
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 1.5, 1.0, 1.0, 2.0],
+]
+
+# ---- figures of a published standard, not of this fabricator ---------------------------------------
+[standard.stencil]
+area_ratio_min = 0.66               # IPC-7525: aperture area / aperture wall area
+aspect_ratio_min = 1.5              # IPC-7525: aperture width / stencil thickness
+
+[notes]
+hole_spacing = "the page does not say whether hole-to-hole spacing is wall to wall or centre to centre; wall to wall is used (centre to centre would let the smallest holes touch)"
+part_spacing = "the article's drawing of the measured distance was not read; the distance is measured between the pads of the two parts, so a part whose body is larger than its pads (a BGA) is closer than reported"
+smd_pad_min = "the page gives the smallest SMD pad as 0.25 x 0.25 mm; a pad is judged too small when it is below that in both directions (a 0.2 mm wide pad of a fine-pitch part, which the assembly service accepts, is not)"
+not_published = "drill aspect ratio, copper balance and warpage limits, fiducial count and size, part-to-board-edge spacing, maximum part height and mass"
 
 # ---- not published by the fabricator ------------------------------------------------------------
 [assumed.etch]

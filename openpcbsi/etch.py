@@ -1,32 +1,30 @@
-"""MF1 / MF2: places where etchant is held between copper of one net (acid traps, narrow same-net gaps).
+"""Copper geometry for the manufacturing review: spacing between nets (MF12), gaps in copper of one
+net (MF2) and acute corners (MF1, a ranking).
 
-Geometry. A ball of radius r (the reach of the etchant flow; by default half the fabricator's
-same-net spacing) is rolled through the space between copper. What it cannot reach is a pocket.
-Copper of a different net never closes a pocket: such gaps are ordinary clearance (KiCad's DRC), so a
-pocket counts only where every wall is copper of one net. Two kinds are reported:
+Everything here is measurement of drawn copper. Nothing models the etching process.
 
-  wedge  two edges of one net meeting at an angle. With E the distance from the wedge tip to the
-         nearest ball centre, the opening angle is 2 asin(r / E). Capillary criterion (Concus and
-         Finn, 1969): liquid with contact angle theta is held in a wedge whose half-angle alpha
-         satisfies alpha + theta < 90 deg, i.e. opening angle < 180 - 2 theta.
-  gap    a slot or channel narrower than 2 r between copper of one net (constant width).
+  spacing   Between the copper of two nets, the gap is the sum of the two distances from a point on
+            the border between their nearest-copper regions. Judged against the fabricator's
+            published spacing (track to track, pad to track, and the figures it accepts in a BGA).
+  pocket    A ball of radius r is rolled through the space between copper; what it cannot reach,
+            where every wall is copper of one net, is a pocket. r is a fixed measuring scale
+            (`ball_mm`), not a property of any process. A pocket of constant width is a gap,
+            judged against the fabricator's same-net spacing where a track bounds it. A pocket that
+            narrows to a point is a wedge: with E the distance from its tip to the nearest ball
+            centre, the opening angle is 2 asin(r / E), which does not depend on r.
+  corners   Wedges with an opening angle below `acute_deg` are listed, sharpest and thinnest track
+            first. That is the drafting rule of thumb about acute angles and nothing more: no
+            fabricator in the profile publishes a limit for it, so it is ranked, not judged.
 
-Flush time. For each pocket the mean time for a dissolved ion to diffuse out to the flowing etchant
-is solved on the pocket: D lap(tau) = -1, tau = 0 at the mouth, no flux through the copper walls.
-A dead-end slot of length L gives tau_max = L^2 / 2D; a sector of radius R gives R^2 / 4D. Exchange
-through the top of the resist channel is ignored, so tau ranks pockets against each other; it is not a
-prediction of the fabricator's process.
-
-The candidates are found on the board raster (25 um), then measured on a raster `hires_div` times
-finer, drawn from the vector data in 2 mm tiles.
+Candidates are found on the board raster (25 um) and measured on a raster `hires_div` times finer,
+drawn from the vector data in tiles.
 """
 import math
 
 import numpy as np
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 from scipy import ndimage
 
+from . import geom, par
 from .drc import finding, result
 
 EDT = ndimage.distance_transform_edt
@@ -35,7 +33,14 @@ PRE = 1.45          # a pocket is measured when its tip is further than PRE x r 
 SLOT_RATIO = 0.7    # width at depth / widest: a wedge narrows towards its tip (0.4), a slot does not (1.0)
 
 
-def pockets(lab, rp, want_masks=False):
+def fields(lab):
+    """Distance of every pixel to the nearest copper (pixels), that copper's index and its label."""
+    cu = lab != 0
+    D, ind = EDT(~cu, return_indices=True)
+    return D, ind, lab[ind[0], ind[1]]
+
+
+def pockets(lab, rp, want_masks=False, f=None):
     """Pockets of a net-label raster (0 = no copper) for a ball of radius `rp` pixels.
 
     Returns a list of dicts: i, j (tip, the pixel furthest from any ball centre), e (that distance,
@@ -44,8 +49,7 @@ def pockets(lab, rp, want_masks=False):
     cu = lab != 0
     if not cu.any() or cu.all():
         return ([], None, None) if want_masks else []
-    D, ind = EDT(~cu, return_indices=True)
-    n1 = lab[ind[0], ind[1]]
+    D, ind, n1 = f if f is not None else fields(lab)
     reach = D >= rp + 0.5
     E = EDT(~reach) if reach.any() else np.full(lab.shape, 1e6)
     pocket = ~cu & (E > rp)
@@ -101,42 +105,41 @@ def classify(p, rp):
     return "wedge", 2.0 * math.degrees(math.asin(s))
 
 
-def flush_time(lbl, gap, p, res_mm, diff):
-    """Largest and mean diffusion time out of a pocket (s); None if the pocket has no mouth."""
-    sl = p["sl"]
-    i0, i1 = max(sl[0].start - 1, 0), min(sl[0].stop + 1, lbl.shape[0])
-    j0, j1 = max(sl[1].start - 1, 0), min(sl[1].stop + 1, lbl.shape[1])
-    m = lbl[i0:i1, j0:j1] == p["label"]
-    g = gap[i0:i1, j0:j1]
-    n = int(m.sum())
-    idx = -np.ones(m.shape, np.int64)
-    idx[m] = np.arange(n)
-    diag = np.zeros(n)
-    rows, cols = [], []
-    mouth = False
-    for di, dj in ((0, 1), (1, 0)):
-        a_m, b_m = m[: m.shape[0] - di, : m.shape[1] - dj], m[di:, dj:]
-        a_g, b_g = g[: m.shape[0] - di, : m.shape[1] - dj], g[di:, dj:]
-        a_i, b_i = idx[: m.shape[0] - di, : m.shape[1] - dj], idx[di:, dj:]
-        both = a_m & b_m
-        rows += [a_i[both], b_i[both]]
-        cols += [b_i[both], a_i[both]]
-        np.add.at(diag, a_i[both], 1.0)
-        np.add.at(diag, b_i[both], 1.0)
-        for inside, other_gap, ii in ((a_m & ~b_m, b_g, a_i), (b_m & ~a_m, a_g, b_i)):
-            d = inside & other_gap                # a gap pixel outside the pocket: the mouth (tau = 0)
-            if d.any():
-                mouth = True
-                np.add.at(diag, ii[d], 1.0)
-    if not mouth:
-        return None, None
-    rows, cols = np.concatenate(rows), np.concatenate(cols)
-    A = sp.coo_matrix((-np.ones(len(rows)), (rows, cols)), shape=(n, n)).tocsr() + sp.diags(diag)
-    lone = diag == 0                              # a pixel with no neighbour at all (cannot happen with a mouth)
-    if lone.any():
-        A = A + sp.diags(lone.astype(float))
-    tau = spla.spsolve(A.tocsc(), np.full(n, (res_mm * 1e-3) ** 2 / diff))
-    return float(tau.max()), float(tau.mean())
+def close_pairs(lab, f, limit_px, smooth=7):
+    """Places where copper of two nets is closer than `limit_px`: arrays i, j (pixel on the border),
+    gap (px), the two labels, and the index (2, n) of the nearest copper pixel on each side.
+
+    At two adjacent pixels whose nearest copper belongs to different nets, the gap is the distance
+    between those two copper pixels less one pixel's extent in that direction. The readings scatter
+    by the pixel grid, so each is averaged with its neighbours along the border."""
+    D, ind, n1 = f
+    S, W = np.zeros(lab.shape), np.zeros(lab.shape)
+    recs = []
+    for a, b in (((slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+                 ((slice(None, -1), slice(None)), (slice(1, None), slice(None)))):
+        la, lb = n1[a], n1[b]                    # on copper, n1 is the pixel's own label and D is 0
+        m = (la != lb) & (D[a] + D[b] < limit_px + 3)
+        if not m.any():
+            continue
+        ii, jj = np.nonzero(m)
+        ia, ib = ind[:, a[0], a[1]][:, m], ind[:, b[0], b[1]][:, m]
+        dy, dx = (ia[0] - ib[0]).astype(float), (ia[1] - ib[1]).astype(float)
+        d = np.hypot(dx, dy)
+        # a copper pixel's centre lies up to one pixel extent inside the true edge (a full extent for an
+        # edge along the grid, less for an oblique one): 0.7 of it is taken off, which keeps the reading
+        # within one pixel of the drawn gap at any angle (validation cases)
+        s = np.where(d <= 1.0, 0.0, np.maximum(d - 0.7 * (np.abs(dx) + np.abs(dy)) / np.maximum(d, 1e-9), 0.0))
+        np.add.at(S, (ii, jj), s)
+        np.add.at(W, (ii, jj), 1.0)
+        recs.append((ii, jj, la[m], lb[m], ia, ib))
+    if not recs:
+        z = np.zeros(0, int)
+        return z, z, np.zeros(0), z, z, np.zeros((2, 0), int), np.zeros((2, 0), int)
+    Ss, Ws = ndimage.uniform_filter(S, smooth), ndimage.uniform_filter(W, smooth)
+    ii, jj, la, lb, ia, ib = (np.concatenate([r[k] for r in recs], axis=-1) for k in range(6))
+    val = Ss[ii, jj] / np.maximum(Ws[ii, jj], 1e-12)
+    keep = val < limit_px
+    return ii[keep], jj[keep], val[keep], la[keep], lb[keep], ia[:, keep], ib[:, keep]
 
 
 def _tiles(shape, size, halo):
@@ -147,30 +150,39 @@ def _tiles(shape, size, halo):
                    max(i - halo, 0), min(i + size + halo, ny), max(j - halo, 0), min(j + size + halo, nx))
 
 
-def candidates(b, li, rp_px, tile=1024):
-    """Stage 1 on the board raster: tip positions (mm) and extents of pockets worth measuring."""
+def candidates(b, li, rp_px, space_px=None, tile=1024):
+    """Stage 1 on the board raster: pockets worth measuring (tip and extent, mm) and, with `space_px`,
+    points where two nets come closer than that (x, y, estimated gap in mm)."""
     r = b.raster(li)
     g = b.grid()
     halo = int(math.ceil(6 * rp_px))
-    out = []
+    pk, sp = [], []
     for i0, i1, j0, j1, a0, a1, c0, c1 in _tiles(r.shape, tile, halo):
         lab = r[a0:a1, c0:c1]
         if not lab.any():
             continue
-        for p in pockets(lab, rp_px):
+        f = fields(lab)
+        for p in pockets(lab, rp_px, f=f):
             i, j = p["i"] + a0, p["j"] + c0
             if not (i0 <= i < i1 and j0 <= j < j1):
                 continue
             sl = p["sl"]
             x, y = g.xy(i, j)
-            out.append({"x": float(x), "y": float(y),
-                        "x0": g.x0 + (sl[1].start + c0) * g.res, "x1": g.x0 + (sl[1].stop + c0) * g.res,
-                        "y0": g.y0 + (sl[0].start + a0) * g.res, "y1": g.y0 + (sl[0].stop + a0) * g.res})
-    return out
+            pk.append({"x": float(x), "y": float(y),
+                       "x0": g.x0 + (sl[1].start + c0) * g.res, "x1": g.x0 + (sl[1].stop + c0) * g.res,
+                       "y0": g.y0 + (sl[0].start + a0) * g.res, "y1": g.y0 + (sl[0].stop + a0) * g.res})
+        if space_px is not None:
+            ii, jj, s = close_pairs(lab, f, space_px)[:3]
+            ii, jj = ii + a0, jj + c0
+            core = (ii >= i0) & (ii < i1) & (jj >= j0) & (jj < j1)
+            if core.any():
+                x, y = g.xy(ii[core], jj[core])
+                sp.append(np.c_[x, y, s[core] * g.res])
+    return pk, (np.vstack(sp) if sp else np.zeros((0, 3)))
 
 
-def measure(b, li, cands, rp_mm, res, tile_mm, diff):
-    """Stage 2: the tiles that hold a candidate, redrawn at `res` and measured."""
+def measure(b, li, cands, rp_mm, res, tile_mm):
+    """Stage 2 for pockets: the tiles that hold a candidate, redrawn at `res` and measured."""
     halo = 6 * rp_mm
     rp = rp_mm / res
     tiles = set()
@@ -182,22 +194,68 @@ def measure(b, li, cands, rp_mm, res, tile_mm, diff):
     for tx, ty in sorted(tiles):
         x0, y0 = tx * tile_mm, ty * tile_mm
         g, lab = b.raster_window(li, x0 - halo, y0 - halo, x0 + tile_mm + halo, y0 + tile_mm + halo, res)
-        ps, lbl, gap = pockets(lab, rp, want_masks=True)
-        for p in ps:
+        for p in pockets(lab, rp):
             x, y = g.xy(p["i"], p["j"])
             if not (x0 <= x < x0 + tile_mm and y0 <= y < y0 + tile_mm):
                 continue
             kind, val = classify(p, rp)
-            tmax, tmean = flush_time(lbl, gap, p, res, diff) if p["open"] and not p["cut"] else (None, None)
             sl = p["sl"]
             out.append({"kind": kind, "x": float(x), "y": float(y), "net": p["net"],
                         "angle_deg": val if kind == "wedge" else None,
                         "width_mm": val * res if kind == "gap" else None,
-                        "depth_mm": max(p["e"] - rp, 0.0) * res, "area_mm2": p["area"] * res * res,
-                        "tau_max_s": tmax, "tau_mean_s": tmean, "enclosed": not p["open"] and not p["cut"], "cut": p["cut"],
+                        "area_mm2": p["area"] * res * res,
+                        "enclosed": not p["open"] and not p["cut"], "cut": p["cut"],
                         "bbox": (g.x0 + sl[1].start * res, g.y0 + sl[0].start * res,
                                  g.x0 + sl[1].stop * res, g.y0 + sl[0].stop * res)})
     return out
+
+
+def measure_spacing(b, li, pts, limit_of, res, tile_mm, max_tiles, coarse_res, reach_mm=0.2):
+    """Stage 2 for spacing. `pts` are stage-1 points (x, y, estimated gap); `limit_of(x, y, pad_a,
+    pad_b)` gives (limit mm, kind, limit key) or None when the pair is not judged here. The tiles
+    with the smallest estimates are measured first; beyond `max_tiles` the estimate is kept.
+
+    Returns ({(net a, net b, kind): {gap_mm, x, y, n, limit, key, res}}, tiles measured, tiles left)."""
+    halo = reach_mm + 0.15
+    by = {}
+    for x, y, s in pts:
+        k = (int(math.floor(x / tile_mm)), int(math.floor(y / tile_mm)))
+        by[k] = min(by.get(k, 1e9), s)
+    order = sorted(by, key=by.get)
+    fine, rest = order[:max_tiles], set(order[max_tiles:])
+    found = {}
+
+    def add(na, nb, kind, gap, x, y, limit, key, r):
+        k = (min(na, nb), max(na, nb), kind)
+        e = found.setdefault(k, {"gap_mm": 1e9, "n": 0})
+        e["n"] += 1
+        if gap < e["gap_mm"]:
+            e.update(gap_mm=gap, x=float(x), y=float(y), limit=limit, key=key, res=r)
+
+    for tx, ty in fine:
+        x0, y0 = tx * tile_mm, ty * tile_mm
+        g, lab, pm = b.raster_window(li, x0 - halo, y0 - halo, x0 + tile_mm + halo, y0 + tile_mm + halo, res, pads=True)
+        ii, jj, s, la, lb, ia, ib = close_pairs(lab, fields(lab), reach_mm / res)
+        if not len(ii):
+            continue
+        x, y = g.xy(ii, jj)
+        core = (x >= x0) & (x < x0 + tile_mm) & (y >= y0) & (y < y0 + tile_mm)
+        pa, pb = pm[ia[0], ia[1]], pm[ib[0], ib[1]]
+        for k in np.flatnonzero(core):
+            lim = limit_of(x[k], y[k], bool(pa[k]), bool(pb[k]))
+            if lim is None:
+                continue
+            gap = s[k] * res
+            if gap < lim[0] - res:                  # one fine pixel: the reading's accuracy (validation; KiCad comparison)
+                add(int(la[k]), int(lb[k]), lim[1], gap, x[k], y[k], lim[0], lim[2], res)
+    if rest:                                            # not refined: only what is clear at the coarse resolution
+        for x, y, s in pts:
+            if (int(math.floor(x / tile_mm)), int(math.floor(y / tile_mm))) not in rest:
+                continue
+            lim = limit_of(x, y, False, False)
+            if lim is not None and s < lim[0] - 1.5 * coarse_res:
+                add(0, 0, lim[1] + " (coarse)", s, x, y, lim[0], lim[2], coarse_res)
+    return found, len(fine), len(rest)
 
 
 def _merge_gaps(gaps, tol):
@@ -227,68 +285,147 @@ def _merge_gaps(gaps, tol):
         w = min(g["width_mm"] for g in gs)
         area = sum(g["area_mm2"] for g in gs)
         worst = min(gs, key=lambda g: g["width_mm"])
-        taus = [g["tau_max_s"] for g in gs if g["tau_max_s"] is not None]
         out.append(dict(worst, width_mm=w, area_mm2=area, length_mm=area / max(w, 1e-6),
-                        tau_max_s=max(taus) if taus and len(gs) == 1 else None,
                         enclosed=all(g["enclosed"] for g in gs), cut=any(g["cut"] for g in gs), pieces=len(gs)))
     return out
 
 
-def run(ctx, fabr, log=print):
-    """Both rules over every copper layer. Returns [acid_trap result, same_net_gap result]."""
+def track_at(b, li, net, x, y, reach):
+    """Width of the narrowest track of `net` on layer `li` whose edge passes within `reach` of a point
+    (the track that forms a corner or bounds a gap there), or None if only pads and zones do."""
+    T = b.tracks
+    sel = np.flatnonzero((T["layer"] == li) & (T["net"] == net))
+    if not len(sel):
+        return None
+    d = geom.point_seg_dist(x, y, T["x1"][sel], T["y1"][sel], T["x2"][sel], T["y2"][sel])
+    near = np.abs(d - T["w"][sel] / 2) <= reach
+    return float(T["w"][sel][near].min()) if near.any() else None
+
+
+def run(ctx, fabr, in_bga, want=("gap", "acid", "space"), log=print):
+    """Spacing rule, same-net gap rule and the list of acute corners, over every copper layer.
+    `in_bga(x, y)` says whether a point is inside a BGA field (the fabricator's local figures apply).
+    Returns {"fab_space": result, "same_net_gap": result, "acid_trap": ranking}."""
     b, cfg = ctx.b, ctx.cfg
     p = cfg["dfm"]["acid"]
+    sp_cfg = cfg["dfm"]["space"]
     g = b.grid()
-    snet = fabr.get("same_net_spacing_mm")
-    rp_mm = p["ball_mm"] or (snet / 2 if snet else 0.125)
+    snet = fabr.get("same_net_spacing_mm") if fabr.judged("same_net_spacing_mm") else None
+    rp_mm = max(p["ball_mm"], (snet or 0.0) / 2)
     res = g.res / max(1, int(p["hires_div"]))
-    cf = 180.0 - 2.0 * p["contact_angle_deg"]
-    limit = min(cf, p["max_angle_deg"])
-    judge_at = limit - p["angle_tol_deg"]
-    areas = ctx.areas()
-    f_acid, f_gap = [], []
-    m_acid, m_gap = {}, {}
-    for li, lname in enumerate(b.layers):
-        cands = candidates(b, li, rp_mm / g.res)
-        found = measure(b, li, cands, rp_mm, res, p["tile_mm"], p["diffusivity_m2s"]) if cands else []
-        wedges = [f for f in found if f["kind"] == "wedge" and f["angle_deg"] < judge_at]
-        gaps = _merge_gaps([f for f in found if f["kind"] == "gap"], 2 * res)
-        gaps = [f for f in gaps if f["length_mm"] >= p["min_gap_len_mm"] and
-                (snet is None or f["width_mm"] < snet - res)]
-        for f in wedges:
-            net = b.net_names[f["net"]]
-            area = ctx.area_name(g.sample(areas, [f["x"]], [f["y"]])[0])
-            tau = f["tau_max_s"]
-            msg = (f"acute copper corner of {f['angle_deg']:.0f} deg (limit {limit:.0f} deg: liquid with a "
-                   f"{p['contact_angle_deg']:g} deg contact angle is held below it), {f['depth_mm'] * 1000:.0f} um deep"
-                   + (f", flush time {tau:.2f} s" if tau is not None else ""))
-            slow = tau is None or tau >= p["flush_warn_s"]
-            if not slow:
-                msg += f" (below the {p['flush_warn_s']:g} s from which a corner warns)"
-            f_acid.append(finding("acid_trap", "warning" if slow else "info", msg, net, lname, f["x"], f["y"], value=round(f["angle_deg"], 1),
-                                  limit=limit, unit="deg", area=area, depth_mm=round(f["depth_mm"], 4),
-                                  area_mm2=round(f["area_mm2"], 5), tau_s=None if tau is None else round(tau, 3)))
-        for f in gaps:
-            net = b.net_names[f["net"]]
-            area = ctx.area_name(g.sample(areas, [f["x"]], [f["y"]])[0])
-            what = "enclosed opening" if f["enclosed"] else "gap"
-            msg = (f"{what} of {f['width_mm'] * 1000:.0f} um in copper of one net, {'at least ' if f['cut'] else ''}{f['length_mm']:.2f} mm long"
-                   + (f" (same-net spacing {snet:g} mm, {fabr.src('same_net_spacing_mm')})" if snet else ""))
-            f_gap.append(finding("same_net_gap", "warning", msg, net, lname, f["x"], f["y"], value=round(f["width_mm"], 4),
-                                 limit=snet, unit="mm", area=area, length_mm=round(f["length_mm"], 3),
-                                 kind="enclosed" if f["enclosed"] else "gap"))
-        taus = [f["tau_max_s"] for f in wedges if f["tau_max_s"] is not None]
-        m_acid[lname] = {"candidates": len(cands), "wedges": len(wedges),
-                         "slow": sum(1 for f in wedges if f["tau_max_s"] is None or f["tau_max_s"] >= p["flush_warn_s"]),
-                         "min_angle_deg": round(min((f["angle_deg"] for f in wedges), default=0.0), 1) if wedges else None,
-                         "max_flush_s": round(max(taus), 3) if taus else None}
-        m_gap[lname] = {"gaps": len(gaps), "min_width_mm": round(min((f["width_mm"] for f in gaps), default=0.0), 4) if gaps else None}
-        log(f"  {lname:8s} {len(cands):5d} candidates  {len(wedges):4d} acute corners  {len(gaps):4d} narrow same-net gaps")
-    params = {"ball_mm": rp_mm, "res_mm": res, "limit_deg": limit, "judged_below_deg": judge_at, "flush_warn_s": p["flush_warn_s"],
-              "contact_angle_deg": p["contact_angle_deg"], "diffusivity_m2s": p["diffusivity_m2s"],
-              "same_net_spacing_mm": snet}
-    return [result("acid_trap", "MF1", "Acute corners in copper of one net (acid traps)", params, m_acid, f_acid),
-            result("same_net_gap", "MF2", "Gaps narrower than the same-net spacing", params, m_gap, f_gap)]
+    judge_at = p["acute_deg"] - p["angle_tol_deg"]
+    space = fabr.get("track_space_mm") if fabr.judged("track_space_mm") else None
+    padtrk = fabr.get("pad_to_track_mm") if fabr.judged("pad_to_track_mm") else None
+    bga_sp = fabr.get("bga_track_mm") if fabr.judged("bga_track_mm") else None
+    bga_pt = fabr.get("bga_pad_to_track_mm") if fabr.judged("bga_pad_to_track_mm") else None
+    do_space = "space" in want and (space is not None or padtrk is not None)
+
+    def limit_of(x, y, pad_a, pad_b):
+        bga = in_bga(x, y)
+        if pad_a and pad_b:
+            return None                                    # pad to pad: MF4
+        if pad_a or pad_b:
+            if padtrk is None:
+                return None
+            return (bga_pt, "pad to track in a BGA field", "bga_pad_to_track_mm") if bga and bga_pt is not None else \
+                   (padtrk, "pad to track", "pad_to_track_mm")
+        if space is None:
+            return None
+        return (bga_sp, "track spacing in a BGA field", "bga_track_mm") if bga and bga_sp is not None else \
+               (space, "track spacing", "track_space_mm")
+
+    space_px = (max(v for v in (space, padtrk) if v is not None) + 1.5 * g.res) / g.res if do_space else None
+    def layer(li):
+        lname = b.layers[li]
+        f_gap, f_sp, corners, counts = [], [], [], {"on_track": 0, "wide_copper": 0}
+        m_sp = None
+        cands, pts = candidates(b, li, rp_mm / g.res, space_px)
+        found = measure(b, li, cands, rp_mm, res, p["tile_mm"]) if cands and ("gap" in want or "acid" in want) else []
+        # ---- acute corners (ranking)
+        nw = 0
+        if "acid" in want:
+            for f in found:
+                if f["kind"] != "wedge" or f["angle_deg"] >= judge_at:
+                    continue
+                nw += 1
+                tw = track_at(b, li, f["net"], f["x"], f["y"], 0.04)
+                counts["on_track" if tw is not None else "wide_copper"] += 1
+                corners.append({"layer": lname, "x": round(f["x"], 3), "y": round(f["y"], 3), "net": b.net_names[f["net"]],
+                                "angle_deg": round(f["angle_deg"], 1), "track_mm": tw, "bga": bool(in_bga(f["x"], f["y"]))})
+        # ---- gaps in copper of one net
+        gaps = []
+        n_track = 0
+        if "gap" in want and snet is not None:
+            gaps = _merge_gaps([f for f in found if f["kind"] == "gap"], 2 * res)
+            gaps = [f for f in gaps if f["length_mm"] >= p["min_gap_len_mm"] and f["width_mm"] < snet - res]
+            for f in gaps:
+                tw = track_at(b, li, f["net"], f["x"], f["y"], f["width_mm"] + 0.06)
+                what = "enclosed opening" if f["enclosed"] else "gap"
+                msg = (f"{what} of {f['width_mm'] * 1000:.0f} um in copper of one net, {'at least ' if f['cut'] else ''}"
+                       f"{f['length_mm']:.2f} mm long")
+                if tw is not None:
+                    n_track += 1
+                    msg += f", beside a {tw:g} mm track (same-net track spacing {snet:g} mm, {fabr.src('same_net_spacing_mm')})"
+                else:
+                    msg += (f", between pads or pour copper only: the fabricator's {snet:g} mm figure is for tracks, "
+                            f"so this is listed, not judged")
+                f_gap.append(finding("same_net_gap", "warning" if tw is not None else "info", msg, b.net_names[f["net"]], lname,
+                                     f["x"], f["y"], value=round(f["width_mm"], 4), limit=snet, unit="mm",
+                                     length_mm=round(f["length_mm"], 3), kind="track" if tw is not None else "copper",
+                                     basis=fabr.src("same_net_spacing_mm"), field="BGA" if in_bga(f["x"], f["y"]) else ""))
+        m_gap = {"gaps": len(gaps), "beside_a_track": n_track,
+                        "min_width_mm": round(min(f["width_mm"] for f in gaps), 4) if gaps else None}
+        # ---- spacing between nets
+        n_fine = n_left = n_below = 0
+        if do_space:
+            fs, n_fine, n_left = measure_spacing(b, li, pts, limit_of, res, p["tile_mm"], sp_cfg["max_tiles"], g.res,
+                                                 max(v for v in (space, padtrk) if v is not None) + 0.02)
+            for (na, nb, kind), e in sorted(fs.items(), key=lambda kv: kv[1]["gap_mm"] - kv[1]["limit"]):
+                n_below += 1
+                names = f"{b.net_names[na]} / {b.net_names[nb]}" if na or nb else "nets not resolved"
+                f_sp.append(finding("fab_space", "error", f"{names}: {e['gap_mm'] * 1000:.0f} um apart, below the {e['limit'] * 1000:.0f} um "
+                                    f"minimum for {kind.replace(' (coarse)', '')} ({fabr.src(e['key'])}); "
+                                    f"{e['n'] * e['res']:.2f} mm of it, measured at {e['res'] * 1000:g} um",
+                                    b.net_names[na] if na else "", lname, e["x"], e["y"], value=round(e["gap_mm"], 4), limit=e["limit"],
+                                    unit="mm", aggressor=b.net_names[nb] if nb else "", kind=kind, basis=fabr.src(e["key"])))
+            est = pts[:, 2].min() if len(pts) else None
+            m_sp = {"min_gap_estimate_mm": None if est is None else round(float(est), 3), "tiles_measured": n_fine,
+                           "tiles_not_refined": n_left, "below_limit": n_below}
+        line = (f"  {lname:8s} {len(cands):5d} pockets  {nw:4d} acute corners  {len(gaps):4d} same-net gaps"
+                + (f"  {n_below:4d} spacings below the limit ({n_fine} tiles measured"
+                   + (f", {n_left} at 25 um only" if n_left else "") + ")" if do_space else ""))
+        return {"f_gap": f_gap, "f_sp": f_sp, "corners": corners, "counts": counts, "m_gap": m_gap, "m_sp": m_sp, "line": line}
+
+    for l in range(len(b.layers)):                 # loaded before the workers start, so they share them
+        b.raster(l)
+    b._window_index()
+    f_gap, f_sp, m_gap, m_sp, corners = [], [], {}, {}, []
+    counts = {"on_track": 0, "wide_copper": 0}
+    for li, o in enumerate(par.pmap(layer, range(len(b.layers)), par.workers(cfg))):
+        lname = b.layers[li]
+        f_gap += o["f_gap"]
+        f_sp += o["f_sp"]
+        corners += o["corners"]
+        for k in counts:
+            counts[k] += o["counts"][k]
+        m_gap[lname] = o["m_gap"]
+        if o["m_sp"] is not None:
+            m_sp[lname] = o["m_sp"]
+        log(o["line"])
+    corners.sort(key=lambda c: (c["track_mm"] is None, c["track_mm"] or 0.0, c["angle_deg"]))
+    params = {"ball_mm": rp_mm, "res_mm": res, "same_net_spacing_mm": snet, "min_gap_len_mm": p["min_gap_len_mm"]}
+    out = {}
+    if "gap" in want:
+        out["same_net_gap"] = result("same_net_gap", "MF2", "Gaps in copper of one net below the same-net track spacing", params, m_gap, f_gap)
+    if "space" in want:
+        out["fab_space"] = result("fab_space", "MF12", "Copper spacing between nets, measured", {
+            "track_space_mm": space, "pad_to_track_mm": padtrk, "bga_track_mm": bga_sp, "bga_pad_to_track_mm": bga_pt,
+            "res_mm": res, "tolerance_mm": round(res, 5)}, m_sp, f_sp)
+    if "acid" in want:
+        out["acid_trap"] = {"rule": "acid_trap", "spec": "MF1", "title": "Acute corners in copper of one net",
+                            "params": {"acute_deg": p["acute_deg"], "listed_below_deg": judge_at, "ball_mm": rp_mm, "res_mm": res},
+                            "summary": dict(counts, corners=len(corners)), "rows": corners, "findings": []}
+    return out
 
 
 # ------------------------------------------------------------------------------------------------
@@ -302,7 +439,8 @@ def _wedge(angle_deg, rot_deg, n=420, apex=(210.3, 210.6)):
 
 
 def validation_cases():
-    """Opening angles of drawn wedges, a slot's width, and the two closed-form flush times."""
+    """Measurement of drawn shapes: wedge angles, a slot's width, and the gap between two nets drawn
+    square-on and at an angle."""
     from .validate import _case
     out = []
     rp = 20.0
@@ -312,30 +450,21 @@ def validation_cases():
         ps = [p for p in pockets(lab, rp) if abs(p["i"] - 210) < 12 and abs(p["j"] - 210) < 12]
         val = classify(ps[0], rp)[1] if ps and classify(ps[0], rp)[0] == "wedge" else 0.0
         out.append(_case(f"wedge of {ang:g} deg drawn at {rot:g} deg: opening angle", "etch", val, ang, 6.0, "deg",
-                         "2 asin(r / E), exact for straight edges"))
-    # dead-end slot, 16 px wide and 300 px long, in copper of one net; diffusion time L^2 / 2D
+                         "drawn angle (2 asin(r / E) is exact for straight edges)"))
     n, w, L = 520, 16, 300
     lab = np.ones((n, n), np.int32)
     lab[:, :100] = 0
     lab[252:252 + w, 100:100 + L] = 0
-    ps, lbl, gap = pockets(lab, rp, want_masks=True)
+    ps = pockets(lab, rp)
     slot = max(ps, key=lambda p: p["area"]) if ps else None
     kind, val = classify(slot, rp) if slot else ("", 0.0)
-    out.append(_case("dead-end slot 16 px wide: width", "etch", val if kind == "gap" else 0.0, float(w), 7.0, "px",
-                     "drawn width"))
-    res, diff = 0.00625, 1e-9
-    tmax, _ = flush_time(lbl, gap, slot, res, diff) if slot else (0.0, 0.0)
-    ref = (L * res * 1e-3) ** 2 / (2 * diff)
-    out.append(_case("dead-end slot 300 px long: flush time", "etch", tmax or 0.0, ref, 5.0, "s",
-                     "L^2 / 2D (one-dimensional diffusion to the mouth)"))
-    # a quarter-disc pocket handed to the solver directly: tau_max = R^2 / 4D for any opening angle
-    R = 120
-    ii, jj = np.mgrid[0:R + 4, 0:R + 4]
-    rr = np.hypot(ii + 0.5, jj + 0.5)
-    lblq = (rr < R).astype(np.int32)
-    gapq = np.ones(lblq.shape, bool)
-    pq = {"sl": (slice(0, R + 4), slice(0, R + 4)), "label": 1}
-    tq, _ = flush_time(lblq, gapq, pq, res, diff)
-    out.append(_case("sector of radius 120 px: flush time", "etch", tq, (R * res * 1e-3) ** 2 / (4 * diff), 3.0, "s",
-                     "R^2 / 4D (radial diffusion in a sector with insulating walls)"))
+    out.append(_case("dead-end slot 16 px wide: width", "etch", val if kind == "gap" else 0.0, float(w), 7.0, "px", "drawn width"))
+    for rot, name in ((0.0, "square-on"), (17.0, "at 17 deg"), (30.0, "at 30 deg"), (45.0, "at 45 deg"), (68.0, "at 68 deg")):
+        ii, jj = np.mgrid[0:300, 0:300]
+        d = (jj - 150.0) * math.cos(math.radians(rot)) + (ii - 150.0) * math.sin(math.radians(rot))
+        gap_w = 14.4
+        lab = np.where(d < -gap_w / 2, 1, np.where(d > gap_w / 2, 2, 0)).astype(np.int32)
+        s = close_pairs(lab, fields(lab), 40.0)[2]
+        out.append(_case(f"gap of 14.4 px between two nets, {name}: narrowest reading", "etch", float(s.min()), gap_w, 7.0, "px",
+                         "drawn gap, to one pixel"))
     return out

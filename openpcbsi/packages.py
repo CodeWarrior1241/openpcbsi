@@ -110,3 +110,41 @@ def _area(ring):
     a = np.asarray(ring, dtype=float)
     x, y = a[:, 0], a[:, 1]
     return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+PART_CLASSES = (("BGA", "BGA"), ("CSP", "BGA"), ("LGA", "BGA"), ("QFN", "QFN"), ("DFN", "QFN"), ("QFP", "QFP"), ("SOIC", "SOP"),
+                ("SSOP", "SOP"), ("TSSOP", "SOP"), ("MSOP", "SOP"), ("SOP", "SOP"), ("SOT", "SOT"), ("SC-70", "SOT"), ("TSOT", "SOT"))
+
+
+def part_class(fp):
+    """Package class for the fabricator's part-spacing table: an EIA chip size, or QFN / QFP / SOP / SOT /
+    BGA from the footprint name; None when the name says neither."""
+    chip = chip_of(fp)
+    if chip:
+        return chip["code"]
+    name = (fp.get("fpid") or "").split(":")[-1].upper() + " " + str(fp.get("value") or "").upper()
+    for key, cls in PART_CLASSES:
+        if key in name:
+            return cls
+    return None
+
+
+def land_pattern(chip, pads):
+    """Geometry of a two-pad land pattern against the nominal body of the chip it is named for:
+    gap between the pads, their outer span along the part, toe (pad beyond the body end), pad width
+    over body width, and the larger pad's area over the smaller's."""
+    from . import geom
+    a = [np.vstack([np.asarray(r, dtype=float) for poly in p["poly"] for r in poly]) for p in pads]
+    cx = [(p["x"], p["y"]) for p in pads]
+    ux, uy = cx[1][0] - cx[0][0], cx[1][1] - cx[0][1]
+    n = (ux * ux + uy * uy) ** 0.5 or 1.0
+    ux, uy = ux / n, uy / n
+    along = [q[:, 0] * ux + q[:, 1] * uy for q in a]
+    across = [-q[:, 0] * uy + q[:, 1] * ux for q in a]
+    span = max(al.max() for al in along) - min(al.min() for al in along)
+    width = min(ac.max() - ac.min() for ac in across)
+    gap = geom.rings_distance([r for poly in pads[0]["poly"] for r in poly], [r for poly in pads[1]["poly"] for r in poly])
+    areas = [sum(abs(_area(r)) for poly in p["poly"] for r in poly) for p in pads]
+    return {"gap_mm": round(gap, 3), "span_mm": round(span, 3), "toe_mm": round((span - chip["L"]) / 2, 3),
+            "width_ratio": round(width / chip["W"], 2), "area_ratio": round(max(areas) / max(min(areas), 1e-9), 2),
+            "body": f"{chip['L']:g} x {chip['W']:g} mm"}

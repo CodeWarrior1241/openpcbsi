@@ -3,8 +3,8 @@
 Signal- and power-integrity checks for KiCad 10 boards: the electrical review that KiCad's DRC
 does not do. openpcbsi reads a `.kicad_pcb` and reports return-path problems, impedance,
 crosstalk, channel loss, supply drop, PDN impedance and board temperature, with every finding
-placed on the board. It can also compare two layouts of the same design, and check a layout against
-a fabricator's and an assembler's capabilities before the files are sent.
+placed on the board. It can also compare two layouts of the same design, and review a layout and its
+Gerber files against a fabricator's and an assembler's published limits before the files are sent.
 
 openpcbsi is research software. Its solvers are checked against closed-form reference cases, and
 its signal-integrity model has been checked against a real, fabricated board: Antmicro's open
@@ -43,10 +43,13 @@ measurements.
 - **Thermal**: a 2.5D board temperature map from part dissipation and I²R heating.
 - **EMC**: a ranked list of likely radiators, for review.
 - **KiCad DRC**: KiCad's own design-rule check and schematic parity, run as part of the evaluation.
-- **Manufacturing** (`dfm`, a separate command): against a fabricator profile, acute copper corners
-  that hold etchant (acid traps), gaps below the same-net spacing, track width, solder-mask webs and
-  copper inside or beside mask openings; for assembly, a reflow simulation of the board and, for
-  each two-terminal chip, how far apart in time its two joints melt (tombstoning).
+- **Manufacturing** (`dfm`, a separate command): against a fabricator's published limits, track
+  width, copper spacing, same-net gaps, holes and annular rings, hole and edge clearances, solder-mask
+  webs and openings, vias in pads, stencil apertures, land patterns, part spacing and what the
+  assembly service accepts; whether KiCad's own design rules are as strict as the fabricator's; and
+  whether the Gerber and drill files match the geometry that was checked. Separately, and without a
+  verdict, it ranks acute copper corners, each part's place in a modelled reflow, and how far apart in
+  time the two joints of each chip melt.
 
 ## Requirements
 
@@ -155,33 +158,47 @@ python3 -m openpcbsi verify-signoff runs/<board>_<hash>/signoff.json
 `signoff.json` ties the verdict to the SHA-256 of the board, its KiCad project files, the
 configuration and the waivers; `verify-signoff` fails if any of them changed since.
 
-### Manufacturing sign-off
+### Manufacturing review
 
 ```sh
-python3 -m openpcbsi dfm board.kicad_pcb [-c boards/board.toml] [--fab jlcpcb] [--waivers waivers.toml]
+python3 -m openpcbsi dfm board.kicad_pcb [-c boards/board.toml] [--fab jlcpcb] [--gerbers DIR] [--waivers waivers.toml]
 ```
 
-`dfm` checks the layout against a fabricator profile and writes `runs/<board>_<hash>/dfm/dfm.html`,
-with the same finding model, waiver format and exit codes as `evaluate`. The profile shipped,
+`dfm` reviews the layout against a fabricator profile and writes `runs/<board>_<hash>/dfm/dfm.html`.
+It is a review, not a sign-off: it cannot see what the fabricator's CAM does to the files, and the
+report lists what it does not check. The profile shipped,
 [openpcbsi/fabs/jlcpcb.toml](openpcbsi/fabs/jlcpcb.toml), holds JLCPCB's published capabilities as
-an exemplar; copy it for another fabricator and pass the file with `--fab`. Every limit in the
-report is marked as published by the fabricator, assumed, or set in the board configuration.
+an exemplar; copy it for another fabricator and pass the file with `--fab`.
 
-| Check | What it finds |
-|-------|---------------|
-| `fab_track` | Tracks narrower than the fabricator's minimum for the layer count and copper weight. |
-| `acid_trap` | Corners in copper of one net sharper than the angle below which liquid is held, with the depth of the pocket and its flush time. |
-| `same_net_gap` | Slots and openings in copper of one net narrower than the fabricator's same-net spacing. |
-| `mask_web` | Pads too close for a solder-mask web, webs below the minimum, openings that merge. |
-| `mask_exposed` | Copper of another net inside a pad's mask opening, or too close to it. |
-| `pad_balance` | Chips whose two pads differ in the copper leaving them, in a pour, or in a via. |
-| `reflow` | Peak temperature, time above liquidus, ramp and lag of every part through a convection oven. |
-| `tombstone` | The time between the two joints of a chip reaching liquidus. |
+The output has two parts, kept apart.
 
-The etching and reflow models are checked against closed forms only, not against fabricated boards
-or an assembler's defect data, and several limits are proposals to be calibrated; the scorecard says
-which inputs were assumed. Clearance, annular rings, copper slivers and starved thermals stay with
-KiCad's DRC, which `evaluate` runs. Models, limits and file formats: [docs/dfm.md](docs/dfm.md).
+**Rules** judge drawn geometry against a limit the fabricator publishes, an industry standard gives,
+or the board configuration sets. They alone give the verdict and the exit code (as for `evaluate`),
+they use the finding model and waiver format of `evaluate`, and they apply to the whole board,
+BGA fields included (with the figures the fabricator publishes for them).
+
+| Rule | What it judges |
+|------|----------------|
+| `rule_audit` | KiCad's board-setup rules against the fabricator's limits: whether a clean KiCad DRC is evidence at all. |
+| `output_match` | The Gerber and drill files (`--gerbers DIR`, else plotted now) against the copper, mask openings and holes that were checked. |
+| `fab_track`, `fab_space` | Track width; the measured gap between copper of different nets. |
+| `same_net_gap` | Gaps beside a track narrower than the fabricator's same-net track spacing. |
+| `fab_drill` | Via and hole sizes, annular rings, hole to hole, hole to copper on every layer, copper to the board edge. |
+| `mask_web`, `mask_exposed`, `via_pad` | Mask webs as drawn and at the fabricator's own expansion; copper inside or beside an opening; vias in or beside pads. |
+| `paste` | Stencil aperture area and aspect ratios (IPC-7525) and the stencil thickness that prints every aperture. |
+| `footprint`, `part_spacing`, `assembly` | Chip land patterns against the named package; spacing between parts; pin pitch, package size, sides and fiducials for the assembly service. |
+
+**Rankings** order places on the board by a measurement or a model that no published limit covers
+and that has not been compared with fabricated boards: acute corners in copper (`acid_trap`), copper
+share per layer, each part's distance from the board's median peak in a modelled reflow (`reflow`),
+and the modelled time between the two joints of each chip melting (`chips`), each with a range over
+the assumed inputs. A ranking never passes or fails and does not change the exit code. It gets a
+limit only when the configuration supplies one with its source (`[dfm.judge]`), and
+`--observed FILE` scores each ranking against defects seen on built boards.
+
+The spacing measurement is checked against KiCad's own DRC on boards the tests did not draw; the
+other rules are tested on generated boards with planted defects. Models, limits, what is not
+checked and the file formats: [docs/dfm.md](docs/dfm.md).
 
 ## Commands
 
@@ -190,7 +207,7 @@ KiCad's DRC, which `evaluate` runs. Models, limits and file formats: [docs/dfm.m
 | `evaluate BOARD [-c CFG] [--waivers FILE] [--families ...] [--checks ...] [--stage S] [--since EVAL] [--em none\|plan\|run] [--json OUT] [-o DIR] [--no-drc] [--no-markers]` | Every check plus KiCad DRC, a scorecard and an exit code. `--em plan` lists automatic 3D regions, `--em run` runs them (minutes each). |
 | `signoff BOARD [evaluate options] [--reviewer NAME]` | Evaluate and write `signoff.json`, tied to the exact inputs. |
 | `verify-signoff RECORD` | Check that a sign-off record still matches its board and files. |
-| `dfm BOARD [-c CFG] [--fab NAME\|FILE] [--checks track,etch,mask,balance,reflow,tombstone] [--waivers FILE] [--json OUT] [-o DIR] [--no-markers]` | Manufacturing sign-off against a fabricator profile: etching, solder mask and reflow checks, a scorecard and an exit code. |
+| `dfm BOARD [-c CFG] [--fab NAME\|FILE] [--gerbers DIR] [--observed FILE] [--checks audit,output,copper,drill,mask,paste,parts,reflow,chips] [--waivers FILE] [--json OUT] [-o DIR] [--no-markers]` | Manufacturing review against a fabricator profile: rules with a verdict and an exit code, and rankings without one. |
 | `plan BOARD --layer L (--zdiff Z [--gap G] \| --z0 Z)` | Track width for a target impedance on a layer of the board's stackup. |
 | `init BOARD [-o FILE] [--force]` | Draft a board configuration from the board. |
 | `check BOARD [-c CFG] [--checks ...] [--rules ...] [-o DIR] [--no-markers]` | Run checks and write the report, without scorecard or DRC. |
@@ -250,8 +267,8 @@ Each run writes a directory under `runs/` (or `-o DIR`):
 | `<board>_openpcbsi.kicad_pcb` | A copy of the board with errors and warnings as markers on layer User.9. |
 
 `compare` writes `compare.html` and `compare.json` to `runs/compare_<A>_vs_<B>/`. `dfm` writes
-`dfm.html`, `dfm.json`, its own layer images, `reflow_peak_top.png` and a marker board to the `dfm/`
-folder of the run ([docs/dfm.md](docs/dfm.md)).
+`dfm.html`, `dfm.json`, the Gerber and drill files it compared (`fab_files/`), its own layer images,
+`reflow_peak_top.png` and a marker board to the `dfm/` folder of the run ([docs/dfm.md](docs/dfm.md)).
 
 ## Configuration
 
@@ -376,10 +393,11 @@ Each check uses its own model:
 - DC drop: a resistive network of the copper;
 - PDN impedance: a cavity and capacitor network;
 - temperature: a 2.5D finite-volume model;
-- reflow: the same model with heat capacity, stepped through the oven's zones, and a finer window
-  around each chip for the lag of its two joints;
-- etching: a ball rolled through the space between copper of one net, on a 6.25 µm raster drawn
-  from the vector data, with a diffusion solve for each pocket it cannot reach.
+- manufacturing geometry: spacing, gaps and corners measured on a 6.25 µm raster drawn from the
+  vector data; holes, mask openings and paste apertures as polygons; the Gerber and drill files read
+  back and compared with that geometry;
+- reflow rankings: the temperature model with heat capacity, stepped through the oven's zones, and
+  a finer window around each chip whose edge follows the board model.
 
 Each finding carries a severity, a stable ID and a position, so waivers survive re-runs and two
 layouts can be compared finding by finding.

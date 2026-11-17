@@ -35,15 +35,20 @@ physics invariant). `blocked` means the test needs an input this machine does no
 | 27 | Planeless boards and split grounds: return path judged without planes; ground network solved | pass | planeless rule; AGND/DGND split crossing found; ground rise 32.8 mV (I R 32.8) |
 | 28 | Current and heat: IPC-2152 trace rise within 30 % of IPC-2221; via current judged | pass | rise 234 C (IPC-2221 234 C) |
 | 29 | Layout stage: an unrouted board gives 'pending', not fails | pass | unrouted connections are pending |
-| 30 | Speed: rule checks on a 100 x 100 mm 6-layer board in < 30 s; results written per check | pass | 11.3 s |
+| 30 | Speed: rule checks on a 100 x 100 mm 6-layer board in < 30 s; results written per check | pass | 12.5 s |
 | 31 | Guidance: DC drop budget sums to the total; fix hints; width for a target impedance | pass | budget sums; hint present; plan w=0.1195 mm |
 | 32 | Library API and live board: a snapshot, and the board open in KiCad, give the CLI's findings | pass | API = CLI (4 RP findings); live board through KiCad's IPC API = saved file (8 findings) |
 | 33 | Concurrent runs: a job lock and a shared thread budget; parallel runs agree | pass | 3 parallel runs agree, lock present |
 | 34 | Sign-off record: hashes and versions; a changed board invalidates it | pass | record written, verified, invalidated by a change |
 | 35 | Regression since the last sign-off: new / resolved findings by stable ID; waivers carried | pass | 8 resolved, all at the slot (4 fails), 0 new |
 | 36 | Packaging: pip install gives an `openpcbsi` command; cache location configurable | blocked | Linux install works; Windows and macOS need CI runners |
-| 37 | Acid traps and same-net gaps: a planted 45 deg pad exit and a 0.15 mm gap are found and measured; waivers apply | pass | corner 46 deg (planted 45), gap 147 um (planted 150); clean board clean; 2 waived |
-| 38 | Solder mask: pad spacing, thin web, merged openings, copper inside and beside an opening are each found | pass | 5 planted defects found with their values; clean board has none |
-| 39 | Fabricator profile: limits by layer count, each marked published / assumed / config; another profile changes the verdict | pass | 0.09 mm (4 layers) and 0.10 mm (2 layers) from the profile; FineFab profile and a config limit pass the same board |
-| 40 | Tombstoning: the joint without a via into the planes melts first; a symmetric chip shows no difference; a pad in a pour is flagged | pass | C1 0.23 s (track pad first), C3 0.16 s (track pad first), symmetric C2 0.000 s |
-| 41 | Reflow: closed-form cases pass; a heavy part lags and peaks lower; the profile meets the assembler's reflow temperature | pass | lag U1 66 s, R1 48 s, R2 32 s; peak 219 / 230 / 242 C; median 240 and 255 C by service |
+| 37 | Copper: planted spacing, pad-to-track and same-net gap are measured; copper without a net is checked; a corner is ranked, not judged | pass | spacing [0.0644, 0.0706, 0.0831] mm, same-net gap 0.147 mm, corner 46 deg ranked; clean board clean |
+| 38 | Solder mask: pad spacing, thin web, merged openings, copper inside and beside an opening, a via in a pad | pass | 6 planted defects found with their values; filled vias accepted in pads; clean board has none |
+| 39 | Fabricator profile: limits by layer count, marked published / standard / assumed / config; every published limit is read by a check | pass | 0.09 mm (4 layers) and 0.10 mm (2 layers); every published limit is read; FineFab profile and a config limit change the verdict |
+| 40 | Chips: ranked, not judged; the joint without a plane via melts first; symmetric chip shows none; lag difference agrees with a transient run | pass | C1 0.22 s (oven 0.23), C3 0.17 s (oven 0.18), C2 5.4e-05 s; ranked only; judged with a config limit; scored against an observed defect |
+| 41 | Reflow: closed-form cases pass; a heavy part ranks coldest in every model variant; nothing is judged without a limit | pass | U1 -14 C from the median (range -21 to -9), coldest in all 5 variants; not judged without a limit; median 240 and 255 C by service |
+| 42 | Holes: via hole, via ring, hole to hole, hole to copper, through-hole ring and copper to the edge, against published limits | pass | 6 planted hole defects found against JLCPCB's published figures; clean board clean |
+| 43 | Parts: stencil aperture ratios (IPC-7525), land pattern against the named chip, part spacing, pin pitch, package, sides, fiducials | pass | area ratio 0.55 warned (IPC-7525), land pattern failed, spacing and pitch found; economic service fails both sides and 0201 |
+| 44 | Audit: KiCad's design rules are compared with the fabricator's; looser or unset rules are reported | pass | unset, looser and ignored KiCad rules reported; rules equal to the fabricator's pass |
+| 45 | Output files: the Gerber and drill files are read and compared; an added flash and a removed hole are found; no-net copper is seen | pass | plotted and supplied files match the checked geometry; an added track, a removed hole and a missing layer are found |
+| 46 | Independent check: on boards the tests did not draw, measured spacing agrees with KiCad's own DRC at the same limit | pass | Antmicro SI test board at 0.4 mm: 2 net pairs reported by both, gaps within 1.9 um; none of KiCad's 2 clear violations missed, none reported here that KiCad lac |

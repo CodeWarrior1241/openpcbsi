@@ -11,9 +11,11 @@
   python3 -m openpcbsi whatif  BOARD -c CONFIG SPEC.toml
   python3 -m openpcbsi region  BOARD -c CONFIG REGION.toml       (G8, openEMS)
   python3 -m openpcbsi snapshot BOARD
-  python3 -m openpcbsi dfm     BOARD [-c CONFIG] [--fab jlcpcb|FILE] [--checks track,etch,mask,balance,reflow,tombstone]
+  python3 -m openpcbsi dfm     BOARD [-c CONFIG] [--fab jlcpcb|FILE] [--gerbers DIR] [--observed FILE]
+                                     [--checks audit,output,copper,drill,mask,paste,parts,reflow,chips]
                                      [--waivers FILE] [--json OUT] [-o OUT] [--no-markers]
-                                     (5.17: manufacturing sign-off against a fabricator profile; same exit codes)
+                                     (5.17: manufacturing review against a fabricator profile. Rules give the
+                                     verdict and the exit code; rankings order places and judge nothing)
 
 Checks: drc (G1), impedance (G6), dc (G10), pdn (G11/G12), crosstalk (G4), thermal (G13),
 vias (G9), si (G2/G3/G7), emc (G14). Outputs go to runs/<board>_<sha8>/ under the openpcbsi folder.
@@ -24,8 +26,9 @@ import os
 import sys
 
 # keep solver threads modest (other jobs share this machine) and caches off the root disk
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
-os.environ.setdefault("OMP_NUM_THREADS", "4")
+_T = "1" if "dfm" in sys.argv[1:2] else "4"     # dfm: many small sparse solves, in worker processes
+os.environ.setdefault("OPENBLAS_NUM_THREADS", _T)
+os.environ.setdefault("OMP_NUM_THREADS", _T)
 from .run import CACHE as _CACHE  # noqa: E402
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(_CACHE, "mpl"))
 
@@ -100,11 +103,13 @@ def main(argv=None):
     co.add_argument("--reference", default="antmicro_si")
     s = sub.add_parser("snapshot")
     s.add_argument("board")
-    dm = sub.add_parser("dfm", help="manufacturing sign-off: etching, solder mask and reflow checks against a fabricator profile")
+    dm = sub.add_parser("dfm", help="manufacturing review: rules against a fabricator profile, and rankings")
     dm.add_argument("board")
     dm.add_argument("-c", "--config")
     dm.add_argument("--fab", help="fabricator profile: a name (jlcpcb) or a TOML file; default from [dfm] fab")
-    dm.add_argument("--checks", default=None, help="track,etch,mask,balance,reflow,tombstone (default: all)")
+    dm.add_argument("--checks", default=None, help="audit,output,copper,drill,mask,paste,parts,reflow,chips (default: all)")
+    dm.add_argument("--gerbers", help="folder with the Gerber and drill files that will be sent (default: plot them now)")
+    dm.add_argument("--observed", help="TOML list of observed defects ([[defect]] ref, kind): score the rankings against it")
     dm.add_argument("--waivers")
     dm.add_argument("--json", dest="json_out")
     dm.add_argument("-o", "--out")
@@ -155,7 +160,7 @@ def main(argv=None):
         from .snapshot import InputError
         try:
             code, _ = dfm.run(a.board, a.config, a.fab, a.checks.split(",") if a.checks else None, a.out, a.waivers,
-                              a.json_out, markers=not a.no_markers)
+                              a.json_out, markers=not a.no_markers, gerbers=a.gerbers, observed=a.observed)
         except Exception as ex:  # 3 = could not evaluate
             if not isinstance(ex, (InputError, FileNotFoundError, ValueError)):
                 import traceback
