@@ -441,8 +441,19 @@ def net_abcd(ctx, lib, path, f, gap=None, vias_rep=None):
 # G3: linear transient from the frequency response
 
 def safe_name(net):
-    """A file and SPICE name for a net: KiCad's hierarchical names contain '/', and others '(' or '{'."""
-    return re.sub(r"[^A-Za-z0-9_.+\-]+", "_", net).strip("_") or "net"
+    """A file and SPICE name for a net: KiCad's hierarchical names contain '/', and others '(' or '{'.
+    No path separator survives, and no leading or trailing dot (so never '.' or '..')."""
+    return re.sub(r"[^A-Za-z0-9_.+\-]+", "_", str(net)).strip("_.") or "net"
+
+
+def inside(base, path):
+    """`path`, after checking that it resolves inside the folder `base` (symlinks followed): files named
+    after a net, part or job are written through this, so no name can reach outside its run folder."""
+    b = os.path.realpath(base)
+    p = os.path.realpath(path)
+    if p == b or os.path.commonpath([b, p]) != b:
+        raise ValueError(f"output path {path!r} is not inside {base!r}")
+    return path
 
 
 def step_response(M, f, rs, zl, rise_ps, tmax_ns):
@@ -555,10 +566,10 @@ def _one(ctx, lib, cfg, p, path, f, gap, vias, diff, name, neg, rows, sdir, mult
     rows.append(row)
     fn = safe_name(name) + (f"_to_{safe_name(path['to'])}" if multi else "")  # hierarchical KiCad nets: "/sheet/NET"
     row["files"] = f"nets/{fn}.sp, nets/{fn}.s2p"
-    with open(os.path.join(sdir, f"{fn}.sp"), "w") as fh:
+    with open(inside(sdir, os.path.join(sdir, f"{fn}.sp")), "w") as fh:
         fh.write(f"* openpcbsi G2: {name}{' (differential, odd-mode equivalent)' if diff else ''} {path['from']} -> {path['to']}\n")
         fh.write(f".subckt {fn} n0 n{nn}\n" + "\n".join(spice) + "\n.ends\n")
-    write_touchstone(os.path.join(sdir, f"{fn}.s2p"), f, S, z_ref)
+    write_touchstone(inside(sdir, os.path.join(sdir, f"{fn}.s2p")), f, S, z_ref)
 
 
 def first_line(path):

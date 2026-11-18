@@ -3,7 +3,9 @@
 repo = "https://github.com/drewsum/KiPI.git"
 tag = "v1.0.1"
 commit = "3ffce16aa5a0248ccdbdda8603c3c484ac99f570"
-python = "python3"            # system Python 3.12 (KiPI supports 3.10-3.13)
+python = "python3"            # system Python 3.12 (KiPI supports 3.10-3.13; its pinned wheels need 3.12+)
 venv = "kipi-venv"
-requirements = "KiPI/requirements-standalone.txt"
+pip = "requirements/kipi-pip.txt"       # pip itself, by hash, over the venv's bundled pip
+requirements = "requirements/kipi.txt"  # every distribution, by hash (pins: requirements/kipi.in)
+upstream = "KiPI/requirements-standalone.txt"   # KiPI's own ranges; the pins must satisfy them
 pinned_on = "2026-11-15"

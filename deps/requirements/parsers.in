@@ -1,0 +1,11 @@
+# kicad-monkey's dependencies, installed with --no-deps into deps/parsers-site (the host's numpy is
+# used; shapely needs numpy>=1.26, trimesh numpy>=1.21). Versions as in the working parsers-site.
+# Edit a version here, then run `python3 deps/pins.py hash` to regenerate parsers.txt.
+# pythons: 3.12 3.13
+colorama==0.4.6
+freetype-py==2.5.1
+msgspec==0.22.0
+shapely==2.2.0
+trimesh==5.2.1
+uharfbuzz==0.57.0
+zstandard==0.25.0

@@ -115,6 +115,9 @@ class Stackup:
         return rows
 
 
+MAX_RASTER_CELLS = 3e8       # cells per layer raster (int16: 0.6 GB); a 430 x 430 mm board at 25 um
+
+
 def pad_poly(p, layer):
     """A pad's polygons on one copper layer (by name): its padstack's shape there, else its one shape."""
     return (p.get("layer_poly") or {}).get(layer, p["poly"])
@@ -163,6 +166,25 @@ class Board:
         for p in self.pads:
             self.pads_by_ref.setdefault(p["ref"], []).append(p)
         self.zones = [z for z in snap["zones"] if not z.get("rule_area")]
+        for z in self.zones:
+            z["net_id"] = self.net_id.get(z["net"], 0)
+        # copper that is not a track, pad, via or zone: graphics and text on copper layers. Strokes (lines,
+        # arc chords with their circle, text strokes, discs as zero-length strokes) as arrays like the
+        # tracks'; filled shapes as polygons. Kept apart from the tracks: they are no part of a net's routing.
+        G = [(g, sg, None) for g in snap.get("copper_gfx", []) for sg in g["segs"]] + \
+            [(g, a[:5], a[5:8]) for g in snap.get("copper_gfx", []) for a in g["arcs"]]
+        G = [x for x in G if x[0]["layer"] in self.L]
+        self.gfx = {"x1": np.array([s_[0] for _, s_, _ in G], float), "y1": np.array([s_[1] for _, s_, _ in G], float),
+                    "x2": np.array([s_[2] for _, s_, _ in G], float), "y2": np.array([s_[3] for _, s_, _ in G], float),
+                    "w": np.array([s_[4] for _, s_, _ in G], float),
+                    "layer": np.array([self.L[g["layer"]] for g, _, _ in G], dtype=np.int64),
+                    "net": np.array([self.net_id.get(g["net"], 0) for g, _, _ in G], dtype=np.int64),
+                    "arc": np.array([c if c else (np.nan, np.nan, np.nan) for _, _, c in G], float).reshape(-1, 3),
+                    "exact": np.array([bool(g.get("exact", True)) for g, _, _ in G], bool),
+                    "item": np.array([id(g) for g, _, _ in G], dtype=np.int64)}
+        self.gfx_polys = [{"layer": self.L[g["layer"]], "net_id": self.net_id.get(g["net"], 0), "polys": g["polys"],
+                           "exact": bool(g.get("exact", True)), "item": id(g), "src": g.get("src", "")}
+                          for g in snap.get("copper_gfx", []) if g["polys"] and g["layer"] in self.L]
         ol = snap["outline"]
         pts = np.vstack([np.asarray(r) for poly in ol for r in poly]) if ol else np.zeros((0, 2))
         if len(pts):
@@ -188,6 +210,13 @@ class Board:
         res = res or (self.config.raster_res if self.config else 0.025)
         if self._grid is None or abs(self._grid.res - res) > 1e-12:
             x0, y0, x1, y1 = self.bbox
+            cells = ((x1 - x0 + 1) / res) * ((y1 - y0 + 1) / res)
+            cap = float(os.environ.get("OPENPCBSI_MAX_RASTER_CELLS", MAX_RASTER_CELLS))
+            if cells > cap:
+                from .snapshot import InputError
+                raise InputError(f"the board's extent ({x1 - x0:.0f} x {y1 - y0:.0f} mm) at {res * 1000:g} um is {cells / 1e6:.0f} million "
+                                 f"cells per layer, above the {cap / 1e6:.0f} million this run allows (about {2 * cap / 1e9:.1f} GB per "
+                                 f"layer): check the board outline, or raise OPENPCBSI_MAX_RASTER_CELLS")
             self._grid = geom.Grid(x0 - 0.5, y0 - 0.5, x1 + 0.5, y1 + 0.5, res)
         return self._grid
 
@@ -208,10 +237,13 @@ class Board:
         r = np.zeros(g.shape, dtype=np.int16)
         zs = sorted([z for z in self.zones if z["layer"] == lname], key=lambda z: z.get("priority", 0))
         for z in zs:
-            nid = self.net_id.get(z["net"], 0)
+            nid = z["net_id"]
             rings = [ring for poly in z["polys"] for ring in poly]
             m = geom.raster_rings(g, rings)
             r[m] = nid
+        for gp in self.gfx_polys:
+            if gp["layer"] == li:
+                r[geom.raster_rings(g, [ring for poly in gp["polys"] for ring in poly])] = gp["net_id"]
         for p in self.pads:
             if li in p["layer_ids"] and p["poly"]:
                 rings = [ring for poly in pad_poly(p, lname) for ring in poly]
@@ -225,6 +257,9 @@ class Board:
         for k in range(len(V["x"])):
             if li in self.via_flashed[k]:
                 geom.raster_capsule(g, r, V["x"][k], V["y"][k], V["x"][k], V["y"][k], V["d"][k] / 2, V["net"][k])
+        F = self.gfx
+        for k in np.flatnonzero(F["layer"] == li):
+            geom.raster_capsule(g, r, F["x1"][k], F["y1"][k], F["x2"][k], F["y2"][k], F["w"][k] / 2, F["net"][k])
         self._rasters[li] = r
         if cpath:                      # atomic: parallel runs never read a half-written cache (#33)
             tmp = f"{cpath}.{os.getpid()}.tmp.npy"
@@ -236,18 +271,111 @@ class Board:
         return [ring for poly in self.snap["outline"] for ring in poly]
 
     def label_nonet_pads(self):
-        """Give every pad without a net its own label, so that copper such as fiducials and mounting
-        pads is part of the rasters (the manufacturing checks need all copper, not only the nets).
-        The labels are appended to net_names as '<no net> REF.PAD'."""
+        """Give copper without a net a label of its own, so that it is copper for every check: pads
+        (fiducials, mounting pads), tracks, vias, zones and graphics or text on copper layers. Items
+        without a net that touch (on a layer, or through a pad or via) share one label, so they are not
+        judged against each other. Labels are appended to net_names: '<no net> REF.PAD' for a group with
+        a pad, else '<no net> <what> on <layer>'."""
         if getattr(self, "_nonet", False):
             return
-        for p in self.pads:
+        items = []                                         # (kind, index, layers, shapes per layer, name)
+        for k, p in enumerate(self.pads):
             if p["net_id"] == 0 and p["poly"] and p["layer_ids"] and p["kind"] != "npth":
-                name = f"<no net> {p['ref']}.{p['num']}"
-                if name not in self.net_id:
-                    self.net_id[name] = len(self.net_names)
-                    self.net_names.append(name)
-                p["net_id"] = self.net_id[name]
+                items.append(("pad", k, p["layer_ids"], f"{p['ref']}.{p['num']}"))
+        T = self.tracks
+        for k in np.flatnonzero(T["net"] == 0):
+            if T["layer"][k] >= 0:
+                items.append(("track", int(k), [int(T["layer"][k])],
+                              f"track on {self.layers[T['layer'][k]]} at ({T['x1'][k]:.2f}, {T['y1'][k]:.2f})"))
+        V = self.vias
+        for k in np.flatnonzero(V["net"] == 0):
+            items.append(("via", int(k), sorted(self.via_flashed[k]), f"via at ({V['x'][k]:.2f}, {V['y'][k]:.2f})"))
+        for k, z in enumerate(self.zones):
+            if z["net_id"] == 0 and z["layer"] in self.L:
+                items.append(("zone", k, [self.L[z["layer"]]], f"zone on {z['layer']}"))
+        F = self.gfx
+        by_item = {}
+        for k in np.flatnonzero(F["net"] == 0):
+            by_item.setdefault(int(F["item"][k]), []).append(int(k))
+        src = {gp["item"]: gp["src"] for gp in self.gfx_polys}
+        src.update({id(g): g.get("src", "") for g in self.snap.get("copper_gfx", [])})
+        for it, ks in by_item.items():
+            items.append(("gfx", it, [int(F["layer"][ks[0]])], f"{src.get(it, 'graphic')} on {self.layers[F['layer'][ks[0]]]} "
+                                                              f"at ({F['x1'][ks[0]]:.2f}, {F['y1'][ks[0]]:.2f})"))
+        for k, gp in enumerate(self.gfx_polys):
+            if gp["net_id"] == 0 and gp["item"] not in by_item:
+                items.append(("gpoly", k, [gp["layer"]], f"{gp['src'] or 'graphic'} on {self.layers[gp['layer']]}"))
+        parent = list(range(len(items)))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        if len(items) > 1:
+            try:
+                from .parse import use
+                use()
+                from shapely import geometry, ops, strtree
+                shapes = {}
+
+                def geo(kind, k, li):
+                    if kind == "pad":
+                        polys = pad_poly(self.pads[k], self.layers[li])
+                        return ops.unary_union([geometry.Polygon(pl[0], pl[1:]).buffer(0) for pl in polys if len(pl[0]) >= 3])
+                    if kind == "track":
+                        return geometry.LineString([(T["x1"][k], T["y1"][k]), (T["x2"][k], T["y2"][k])]).buffer(T["w"][k] / 2)
+                    if kind == "via":
+                        return geometry.Point(V["x"][k], V["y"][k]).buffer(V["d"][k] / 2)
+                    if kind == "zone":
+                        return ops.unary_union([geometry.Polygon(pl[0], pl[1:]).buffer(0) for pl in self.zones[k]["polys"] if len(pl[0]) >= 3])
+                    if kind == "gfx":
+                        parts = [geometry.LineString([(F["x1"][j], F["y1"][j]), (F["x2"][j], F["y2"][j])]).buffer(F["w"][j] / 2)
+                                 if (F["x1"][j], F["y1"][j]) != (F["x2"][j], F["y2"][j]) else
+                                 geometry.Point(F["x1"][j], F["y1"][j]).buffer(F["w"][j] / 2) for j in by_item[k]]
+                        parts += [geometry.Polygon(pl[0], pl[1:]).buffer(0) for gp in self.gfx_polys if gp["item"] == k for pl in gp["polys"]]
+                        return ops.unary_union(parts)
+                    return ops.unary_union([geometry.Polygon(pl[0], pl[1:]).buffer(0) for pl in self.gfx_polys[k]["polys"] if len(pl[0]) >= 3])
+                for li in range(len(self.layers)):
+                    idx = [i for i, it in enumerate(items) if li in it[2]]
+                    if len(idx) < 2:
+                        continue
+                    gs = [geo(items[i][0], items[i][1], li) for i in idx]
+                    tree = strtree.STRtree(gs)
+                    for a_, ga in enumerate(gs):
+                        for b_ in tree.query(ga):
+                            b_ = int(b_)
+                            if b_ > a_ and ga.intersects(gs[b_]):
+                                parent[find(idx[a_])] = find(idx[b_])
+            except ImportError:
+                pass                                       # no geometry library: every item is its own label
+        groups = {}
+        for i in range(len(items)):
+            groups.setdefault(find(i), []).append(items[i])
+        for members in groups.values():
+            pads_ = sorted(m[3] for m in members if m[0] == "pad")
+            name = f"<no net> {pads_[0] if pads_ else members[0][3]}"
+            while name in self.net_id:
+                name += "'"
+            nid = len(self.net_names)
+            self.net_id[name] = nid
+            self.net_names.append(name)
+            for kind, k, _, _ in members:
+                if kind == "pad":
+                    self.pads[k]["net_id"] = nid
+                elif kind == "track":
+                    T["net"][k] = nid
+                elif kind == "via":
+                    V["net"][k] = nid
+                elif kind == "zone":
+                    self.zones[k]["net_id"] = nid
+                elif kind == "gfx":
+                    F["net"][np.array(by_item[k])] = nid
+                    for gp in self.gfx_polys:
+                        if gp["item"] == k:
+                            gp["net_id"] = nid
+                else:
+                    self.gfx_polys[k]["net_id"] = nid
         self._nonet = True
         self._rasters = {}
         self._win = None
@@ -262,7 +390,12 @@ class Board:
                 if li is None or not len(segs):
                     continue
                 bb = (segs[:, [0, 2]].min(), segs[:, [1, 3]].min(), segs[:, [0, 2]].max(), segs[:, [1, 3]].max())
-                zs[li].append((self.net_id.get(z["net"], 0), segs, bb))
+                zs[li].append((z["net_id"], segs, bb))
+            for gp in self.gfx_polys:
+                segs = geom.ring_segments([ring for poly in gp["polys"] for ring in poly])
+                if len(segs):
+                    bb = (segs[:, [0, 2]].min(), segs[:, [1, 3]].min(), segs[:, [0, 2]].max(), segs[:, [1, 3]].max())
+                    zs[gp["layer"]].append((gp["net_id"], segs, bb))
             pb = np.full((len(self.pads), 4), np.nan)
             for k, p in enumerate(self.pads):
                 if p["poly"]:
@@ -308,6 +441,11 @@ class Board:
         for k in sel:
             if li in self.via_flashed[k]:
                 geom.raster_capsule(g, r, V["x"][k], V["y"][k], V["x"][k], V["y"][k], vr[k], V["net"][k])
+        F = self.gfx
+        hw = F["w"] / 2
+        for k in np.flatnonzero((F["layer"] == li) & (np.minimum(F["x1"], F["x2"]) - hw <= x1) & (np.maximum(F["x1"], F["x2"]) + hw >= x0)
+                                & (np.minimum(F["y1"], F["y2"]) - hw <= y1) & (np.maximum(F["y1"], F["y2"]) + hw >= y0)):
+            geom.raster_capsule(g, r, F["x1"][k], F["y1"][k], F["x2"][k], F["y2"][k], hw[k], F["net"][k])
         return (g, r, pm) if pads else (g, r)
 
     # -------------------------------------------------------------------------------------------

@@ -199,6 +199,10 @@ def rediff(run_a, run_b, label=None, log=print):
     from .run import load
     ra = json.load(open(os.path.join(run_a, "report.json")))
     rb = json.load(open(os.path.join(run_b, "report.json")))
+    # report.json holds paths relative to its run folder (openpcbsi.paths)
+    res = lambda run, p: p if (not p or os.path.isabs(p)) else os.path.normpath(os.path.join(run, p))
+    for run_, r_ in ((run_a, ra), (run_b, rb)):
+        r_["board"], r_["config"] = res(run_, r_["board"]), res(run_, r_["config"])
     ba, bb = load(ra["board"], ra["config"])[0], load(rb["board"], rb["config"])[0]
     if ra["config_hash"] != rb["config_hash"]:
         raise SystemExit("G15: the two runs used different configurations")

@@ -21,7 +21,8 @@ import sys
 
 from . import padgeom
 
-SNAPSHOT_VERSION = 11  # 11: coordinates kept to 1 nm (KiCad's unit), each standard pad's exact core and radius
+SNAPSHOT_VERSION = 12  # 12: copper graphics and text (copper_gfx); no-net copper is copper
+                       # 11: coordinates kept to 1 nm (KiCad's unit), each standard pad's exact core and radius
                        #     (padgeom.core), each arc chord with its arc's centre and radius, padstacks per layer
                        # 10: footprint body outline (convex hull of its fabrication-layer shapes)
                        # 9: pad shape, anchor size kept apart, sizes measured from the pad's polygon, paste
@@ -320,6 +321,7 @@ def extract(board_path):
     snap["footprints"] = fps
     snap["pads"] = pads
     snap["mask_shapes"] = _mask_shapes(pcbnew, b)
+    snap["copper_gfx"] = _copper_gfx(pcbnew, b, lid2name)
     return snap
 
 
@@ -416,6 +418,80 @@ def _protect(pcbnew, v, ds):
                             one(v.GetBackPluggingMode(), pcbnew.PLUGGING_MODE_PLUGGED, pcbnew.PLUGGING_MODE_NOT_PLUGGED, ds.m_PlugViasBack)]}
     except AttributeError:                    # KiCad before 9
         return {"filled": None, "capped": None, "plugged": [None, None]}
+
+
+def _copper_gfx(pcbnew, b, lid2name):
+    """Copper that is not a track, pad, via or zone: graphic shapes and text on copper layers, board
+    and footprint level. Each item: {layer, net, src, segs: [[x1, y1, x2, y2, width]], arcs: [[x1, y1,
+    x2, y2, width, cx, cy, r]], polys, exact}. Lines, arcs and circles are exact strokes (a filled
+    circle is a zero-length stroke as wide as the disc); filled rectangles and polygons are their exact
+    outline plus the stroke; text is KiCad's own polygons (2 um inside the true strokes), not exact."""
+    out = []
+    items = [(d, "") for d in b.GetDrawings()]
+    for f in b.GetFootprints():
+        ref = f.GetReference()
+        items += [(d, ref) for d in f.GraphicalItems()]
+        items += [(fl, ref) for fl in f.GetFields() if fl.IsVisible()]
+    for d, ref in items:
+        lid = d.GetLayer()
+        if lid not in lid2name:
+            continue
+        cls = d.GetClass()
+        net = d.GetNetname() if hasattr(d, "GetNetname") else ""
+        it = {"layer": lid2name[lid], "net": net or "", "src": (f"{ref} " if ref else "") + cls, "segs": [], "arcs": [], "polys": [],
+              "exact": True}
+        if cls in ("PCB_SHAPE", "FP_SHAPE"):
+            w = d.GetWidth() * NM
+            st = d.GetShape()
+            P = lambda v: (v.x * NM, v.y * NM)
+            if st == pcbnew.SHAPE_T_SEGMENT:
+                (x1, y1), (x2, y2) = P(d.GetStart()), P(d.GetEnd())
+                it["segs"].append([x1, y1, x2, y2, w])
+            elif st == pcbnew.SHAPE_T_ARC:
+                a, m, e = P(d.GetStart()), P(d.GetArcMid()), P(d.GetEnd())
+                circ = _arc_circle(a, m, e)
+                pts = _arc_points(a, m, e)
+                for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+                    it["arcs" if circ else "segs"].append([x1, y1, x2, y2, w] + (list(circ) if circ else []))
+            elif st == pcbnew.SHAPE_T_CIRCLE:
+                cx, cy = P(d.GetCenter())
+                r = d.GetRadius() * NM
+                if d.IsAnyFill():
+                    it["segs"].append([cx, cy, cx, cy, 2 * r + w])
+                else:
+                    pts = [(cx + r * math.cos(2 * math.pi * k / 72), cy + r * math.sin(2 * math.pi * k / 72)) for k in range(73)]
+                    for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+                        it["arcs"].append([x1, y1, x2, y2, w, cx, cy, r])
+            else:
+                # rectangle, polygon, curve: the outline as strokes, and the filled area as a polygon
+                if st == pcbnew.SHAPE_T_RECTANGLE:
+                    ring = [P(v) for v in d.GetRectCorners()]
+                elif st == pcbnew.SHAPE_T_POLY:
+                    ring = _chain_pts(d.GetPolyShape().Outline(0))
+                else:
+                    ring = [P(v) for v in d.GetBezierPoints()]
+                    it["exact"] = False
+                closed = st != pcbnew.SHAPE_T_BEZIER
+                edges = list(zip(ring, ring[1:] + (ring[:1] if closed else [])))
+                if w > 0:
+                    it["segs"] += [[a[0], a[1], c[0], c[1], w] for a, c in edges]
+                if d.IsAnyFill() and closed:
+                    it["polys"].append([[(round(x, 6), round(y, 6)) for x, y in ring]])
+        elif cls in ("PCB_TEXT", "PCB_FIELD", "FP_TEXT", "PCB_TEXTBOX"):
+            if hasattr(d, "IsVisible") and not d.IsVisible():
+                continue
+            s = pcbnew.SHAPE_POLY_SET()
+            if getattr(d, "IsKnockout", lambda: False)():
+                d.TransformShapeToPolygon(s, lid, 0, 1000, pcbnew.ERROR_INSIDE)
+            else:
+                d.TransformTextToPolySet(s, 0, 1000, pcbnew.ERROR_INSIDE)
+            it["polys"] = _polyset(s)
+            it["exact"] = False
+        else:
+            continue
+        if it["segs"] or it["arcs"] or it["polys"]:
+            out.append(it)
+    return out
 
 
 def _mask_shapes(pcbnew, b):
@@ -573,6 +649,9 @@ def maybe_downgrade(board_path, workdir):
         p = subprocess.run(["kicad-cli", "pcb", "downgrade", "--target", "10.0", "-o", out, board_path],
                            capture_output=True, text=True)
         if p.returncode == 0 and os.path.exists(out):
+            if (file_version(out) or 0) > FILE_VERSION_MAX:
+                raise InputError(f"kicad-cli's downgrade of {os.path.basename(board_path)} is still file version {file_version(out)}")
+            _check_constructs(out)
             print(f"openpcbsi: board file version {ver} downgraded to KiCad 10.0 -> {out}", file=sys.stderr)
             return out
     raise InputError(
@@ -596,19 +675,40 @@ def reader_name(reader=None):
     return r
 
 
+# constructs of KiCad files newer than 10.0 that the file reader does not read (a file holding one is
+# refused, also after a downgrade that left it in: KiCad 10.99 places footprints with `(transform ...)`,
+# which read as missing would put every footprint at (0, 0))
+NEWER_CONSTRUCTS = (r"\(transform\b",)
+
+
+def _check_constructs(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    hit = [re.sub(r"[^a-z_]", "", c.replace("\\b", "")) for c in NEWER_CONSTRUCTS if re.search(c, text)]
+    if hit:
+        gen = re.search(r'\(generator_version "([^"]+)"\)', text[:2000])
+        raise InputError(f"{os.path.basename(path)} uses {', '.join(hit)} (a KiCad newer than 10.0"
+                         + (f"; generator {gen.group(1)}" if gen else "") + "), which this openpcbsi does not read. "
+                         f"Save the board as KiCad 10.0 with KiCad 10.0 itself, and run again")
+
+
 def _file_downgrade(board_path, workdir):
     """Input contract (#1) without pcbnew: a file newer than KiCad 10.0 is downgraded by kicad-cli when
-    it can, else refused."""
+    it can, else refused; a file (or a downgraded copy) that still holds a newer construct is refused."""
     ver = file_version(board_path)
     if ver is None:
         raise InputError(f"{board_path} is not a KiCad board file (no '(version N)' header)")
     if ver <= FILE_VERSION_MAX:
+        _check_constructs(board_path)
         return board_path
     if _cli_has_downgrade():
         os.makedirs(workdir, exist_ok=True)
         out = os.path.join(workdir, "downgraded_" + os.path.basename(board_path))
         p = subprocess.run(["kicad-cli", "pcb", "downgrade", "--target", "10.0", "-o", out, board_path], capture_output=True, text=True)
         if p.returncode == 0 and os.path.exists(out):
+            if (file_version(out) or 0) > FILE_VERSION_MAX:
+                raise InputError(f"kicad-cli's downgrade of {os.path.basename(board_path)} is still file version {file_version(out)}")
+            _check_constructs(out)
             print(f"openpcbsi: board file version {ver} downgraded to KiCad 10.0 -> {out}", file=sys.stderr)
             return out
     raise InputError(
@@ -627,6 +727,51 @@ def extract_file(board_path, cache_dir):
     return snap
 
 
+_CLI_VERSION = None
+
+
+def kicad_cli_version():
+    """The version of the kicad-cli on the PATH (it refills zones and downgrades files), or "none"."""
+    global _CLI_VERSION
+    if _CLI_VERSION is None:
+        try:
+            p = subprocess.run(["kicad-cli", "version"], capture_output=True, text=True, timeout=60)
+            _CLI_VERSION = (p.stdout or p.stderr).strip().splitlines()[0] if p.returncode == 0 and (p.stdout or p.stderr).strip() else "unknown"
+        except (OSError, subprocess.TimeoutExpired):
+            _CLI_VERSION = "none"
+    return _CLI_VERSION
+
+
+def cache_tag(rd):
+    """What a cached reading depends on besides the board's bytes: the reader, whether zones were
+    refilled, and the kicad-cli that refilled or downgraded them. A run with other settings reads the
+    board again instead of reusing (or poisoning) another's reading."""
+    refill = "norefill" if os.environ.get("OPENPCBSI_NO_REFILL") == "1" else "refill"
+    cli = re.sub(r"[^0-9A-Za-z.]+", "-", kicad_cli_version())[:40]
+    return f"{rd}_{refill}_cli{cli}"
+
+
+def _check_placement(snap):
+    """A reading in which most footprints sit far from their own pads (or all at the origin) is wrong:
+    refused, not reviewed. (A construct the reader does not know can drop positions silently.)"""
+    fps = snap.get("footprints") or []
+    pads = {}
+    for p in snap.get("pads") or []:
+        pads.setdefault(p["ref"], []).append(p)
+    far = origin = n = 0
+    for f in fps:
+        ps = pads.get(f["ref"])
+        if not ps:
+            continue
+        n += 1
+        cx, cy = sum(p["x"] for p in ps) / len(ps), sum(p["y"] for p in ps) / len(ps)
+        far += math.hypot(cx - f["x"], cy - f["y"]) > 50.0
+        origin += abs(f["x"]) < 1e-9 and abs(f["y"]) < 1e-9
+    if n >= 4 and (far > n / 2 or origin > n / 2):
+        raise InputError(f"the reading places {max(far, origin)} of {n} footprints far from their own pads or at the origin: "
+                         f"the board uses something the reader does not read (a newer KiCad?); not reviewed")
+
+
 def load_or_extract(board_path, cache_dir, refresh=False, reader=None):
     """Return the snapshot dict, reading the board only if the cache is stale. Parallel runs on one
     board take a per-board lock, so the board is read once and the others reuse it (#33)."""
@@ -637,14 +782,14 @@ def load_or_extract(board_path, cache_dir, refresh=False, reader=None):
     rd = reader_name(reader)
     sha = file_sha256(board_path)
     os.makedirs(cache_dir, exist_ok=True)
-    cpath = os.path.join(cache_dir, f"snapshot_{sha[:16]}_{rd}.json.gz")
+    cpath = os.path.join(cache_dir, f"snapshot_{sha[:16]}_{cache_tag(rd)}.json.gz")
     with open(cpath + ".lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         try:
             if os.path.exists(cpath) and not refresh:
                 with gzip.open(cpath, "rt") as f:
                     snap = json.load(f)
-                if snap.get("version") == SNAPSHOT_VERSION:
+                if snap.get("version") == SNAPSHOT_VERSION and snap.get("cache_tag") == cache_tag(rd):
                     snap["board"] = board_path
                     return snap
             if rd == "pcbnew":
@@ -658,6 +803,8 @@ def load_or_extract(board_path, cache_dir, refresh=False, reader=None):
             snap["sha256"] = sha
             snap["downgraded"] = src if src != board_path else None   # G22: the report records it
             snap["kicad_file_version"] = file_version(board_path)
+            snap["cache_tag"] = cache_tag(rd)
+            _check_placement(snap)
             tmp = f"{cpath}.{os.getpid()}.tmp"
             with gzip.open(tmp, "wt") as f:
                 json.dump(snap, f)
@@ -677,7 +824,7 @@ def cross_check(snap, cache_dir):
     fields that parser reads (openpcbsi.parse.kicadfiles). Cached by the board's SHA-256.
     Returns {"reader", "compared", "problems", "not_cross_checked"}."""
     sha = snap["sha256"]
-    cp = os.path.join(cache_dir, f"crosscheck_{sha[:16]}_v{SNAPSHOT_VERSION}.json")
+    cp = os.path.join(cache_dir, f"crosscheck_{sha[:16]}_v{SNAPSHOT_VERSION}_{snap.get('cache_tag', 'x')}.json")
     if os.path.exists(cp):
         try:
             return json.load(open(cp))

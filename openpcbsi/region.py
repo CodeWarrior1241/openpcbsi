@@ -25,8 +25,8 @@ import sys
 
 import numpy as np
 
-# Python of an environment with openEMS and CSXCAD installed
-VENV_PY = os.environ.get("OPENPCBSI_OPENEMS_PYTHON", "/media/fpgadev/Dev_Tools/OpenEMS/install/venv/bin/python")
+# the Python of an environment with openEMS and CSXCAD installed comes from OPENPCBSI_OPENEMS_PYTHON
+# (region3d.openems_python: no default)
 
 
 def _bbox_hit(pts, box, m=0.2):
@@ -143,7 +143,9 @@ def build_job(ctx, spec):
 def run(ctx, spec, cache_dir, runs_dir, log=print, wait=True):
     job = build_job(ctx, spec)
     h = hashlib.sha256(json.dumps(job, sort_keys=True).encode()).hexdigest()[:16]
-    od = os.path.join(runs_dir, "em", f"{spec.get('name', 'region')}_{h}")
+    from .si import inside, safe_name
+    em_dir = os.path.join(runs_dir, "em")
+    od = inside(em_dir, os.path.join(em_dir, f"{safe_name(spec.get('name') or 'region')}_{h}"))
     os.makedirs(od, exist_ok=True)
     res_path = os.path.join(od, "result.json")
     if os.path.exists(res_path):
@@ -164,7 +166,8 @@ def run(ctx, spec, cache_dir, runs_dir, log=print, wait=True):
             json.dump(job_cmp, f)
     runner = os.path.join(os.path.dirname(os.path.abspath(__file__)), "em_runner.py")
     env = dict(os.environ, OMP_NUM_THREADS=str(job["threads"]))
-    cmd = [VENV_PY, "-I", runner, od]
+    from .region3d import openems_python
+    cmd = [openems_python(), "-I", runner, od]
     if not wait:
         return {"started": cmd, "dir": od}
     p = subprocess.run(cmd, env=env, capture_output=True, text=True)

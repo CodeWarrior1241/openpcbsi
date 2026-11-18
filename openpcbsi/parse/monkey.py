@@ -82,6 +82,140 @@ def _filled(g):
     return str(getattr(f, "value", f) or "").lower() in ("yes", "solid", "true")
 
 
+def _gfx_width(g):
+    w = getattr(getattr(g, "stroke", None), "width", None)
+    if w is None:
+        w = getattr(g, "width", 0.0)
+    return float(w or 0.0)
+
+
+def _copper_gfx(pcb, copper):
+    """Copper that is not a track, pad, via or zone: graphic shapes and text on copper layers, board and
+    footprint level, as snapshot._copper_gfx describes (same fields). Text is KiCad's stroke font,
+    stroke by stroke (kicad-monkey's renderer, checked against KiCad's polygons); text in an outline font
+    is its render cache (KiCad's own polygons). Knockout text, and outline-font text with no render
+    cache, are refused (InputError): the review would otherwise not see that copper."""
+    from kicad_monkey.kicad_stroke_font import get_renderer
+    from ..snapshot import _arc_circle, _arc_points, InputError
+    out = []
+
+    def net_of(g):
+        n = getattr(g, "net", None)
+        return (getattr(n, "name", n) or "") if n is not None else ""
+
+    def shape(g, layer, src, t):
+        kind = type(g).__name__.lower()
+        w = _gfx_width(g)
+        it = {"layer": layer, "net": net_of(g), "src": src, "segs": [], "arcs": [], "polys": [], "exact": True}
+        if "line" in kind:
+            (x1, y1), (x2, y2) = t(g.start_x, g.start_y), t(g.end_x, g.end_y)
+            it["segs"].append([x1, y1, x2, y2, w])
+        elif "arc" in kind:
+            a, m, e = t(g.start_x, g.start_y), t(g.mid_x, g.mid_y), t(g.end_x, g.end_y)
+            circ = _arc_circle(a, m, e)
+            pts = _arc_points(a, m, e)
+            for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+                it["arcs" if circ else "segs"].append([x1, y1, x2, y2, w] + (list(circ) if circ else []))
+        elif "circle" in kind:
+            cx, cy = t(g.center_x, g.center_y)
+            r = math.hypot(g.end_x - g.center_x, g.end_y - g.center_y)
+            if _filled(g):
+                it["segs"].append([cx, cy, cx, cy, 2 * r + w])
+            else:
+                pts = [(cx + r * math.cos(2 * math.pi * k / 72), cy + r * math.sin(2 * math.pi * k / 72)) for k in range(73)]
+                for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+                    it["arcs"].append([x1, y1, x2, y2, w, cx, cy, r])
+        elif "rect" in kind or "poly" in kind or "curve" in kind:
+            if "rect" in kind:
+                x0, y0, x1, y1 = g.start_x, g.start_y, g.end_x, g.end_y
+                ring = [t(x0, y0), t(x1, y0), t(x1, y1), t(x0, y1)]
+            else:
+                ring = [t(x, y) for x, y in (g.points or [])]
+                it["exact"] = "curve" not in kind
+            closed = "curve" not in kind
+            if len(ring) < 2:
+                return None
+            edges = list(zip(ring, ring[1:] + (ring[:1] if closed else [])))
+            if w > 0:
+                it["segs"] += [[a[0], a[1], c[0], c[1], w] for a, c in edges]
+            if _filled(g) and closed and len(ring) >= 3:
+                it["polys"].append([[(round(x, 6), round(y, 6)) for x, y in ring]])
+        else:
+            return None
+        return it
+
+    def text(g, layer, src, t, fp_angle=0.0):
+        eff = getattr(g, "effects", None)
+        if getattr(g, "hide", False) or (eff is not None and getattr(eff, "hide", False)) or not str(getattr(g, "text", getattr(g, "value", "")) or ""):
+            return None
+        if getattr(g, "knockout", False):
+            raise InputError(f"{src} on {layer}: knockout text on a copper layer is not read by the file reader; "
+                             f"run with OPENPCBSI_READER=pcbnew")
+        font = getattr(eff, "font", None)
+        it = {"layer": layer, "net": "", "src": src, "segs": [], "arcs": [], "polys": [], "exact": True}
+        if font is not None and getattr(font, "face", None):
+            rc = getattr(g, "render_cache", None)
+            if not rc or not rc.polygons:
+                raise InputError(f"{src} on {layer}: text in an outline font with no render cache on a copper layer; "
+                                 f"open and save the board in KiCad, or run with OPENPCBSI_READER=pcbnew")
+            for poly in rc.polygons:
+                rings = [[(round(x, 6), round(y, 6)) for x, y in (getattr(c, "points", c))] for c in poly.contours]
+                rings = [r for r in rings if len(r) >= 3]
+                if rings:
+                    it["polys"].append(rings)
+            it["exact"] = False
+            return it
+        sx = float(getattr(font, "size_x", 1.27) or 1.27)
+        sy = float(getattr(font, "size_y", 1.27) or 1.27)
+        th = getattr(font, "effective_thickness", None) or getattr(font, "thickness", None) or sx / 8.0
+        just = [str(j).lower() for j in (getattr(eff, "justify", None) or [])]
+        h = "left" if "left" in just else "right" if "right" in just else "center"
+        v = "top" if "top" in just else "bottom" if "bottom" in just else "center"
+        x, y = t(g.at_x, g.at_y)
+        pl = get_renderer().render_text_polylines(str(getattr(g, "text", None) or getattr(g, "value", "")), x, y, sx, sy,
+                                                  angle=float(g.at_angle or 0.0), h_align=h, v_align=v, mirror="mirror" in just,
+                                                  italic=bool(getattr(font, "italic", False)))
+        for line in pl:
+            if len(line) == 1:
+                it["segs"].append([line[0][0], line[0][1], line[0][0], line[0][1], float(th)])
+            for (x1, y1), (x2, y2) in zip(line[:-1], line[1:]):
+                it["segs"].append([x1, y1, x2, y2, float(th)])
+        return it
+
+    ident = lambda x, y: (x, y)
+    for coll in ("gr_lines", "gr_arcs", "gr_circles", "gr_rects", "gr_polys", "gr_curves"):
+        for g in getattr(pcb, coll, []) or []:
+            if getattr(g, "layer", None) in copper:
+                it = shape(g, g.layer, coll[:-1], ident)
+                if it:
+                    out.append(it)
+    for g in getattr(pcb, "gr_texts", []) or []:
+        if getattr(g, "layer", None) in copper:
+            it = text(g, g.layer, "gr_text", ident)
+            if it:
+                out.append(it)
+    for g in getattr(pcb, "gr_text_boxes", []) or []:
+        if getattr(g, "layer", None) in copper:
+            raise InputError(f"a text box on {g.layer}: not read by the file reader; run with OPENPCBSI_READER=pcbnew")
+    for fp in pcb.footprints:
+        tf = _xform(fp)
+        ref = fp.get_property_value("Reference") or ""
+        for g in fp.fp_lines + fp.fp_arcs + fp.fp_rects + fp.fp_circles + fp.fp_polys + list(getattr(fp, "fp_curves", []) or []):
+            if getattr(g, "layer", None) in copper:
+                it = shape(g, g.layer, f"{ref} {type(g).__name__}", tf)
+                if it:
+                    out.append(it)
+        for g in list(getattr(fp, "fp_texts", []) or []) + [q for q in (fp.properties or []) if getattr(q, "graphical", True)]:
+            if getattr(g, "layer", None) in copper:
+                it = text(g, g.layer, f"{ref} {type(g).__name__}", tf)
+                if it:
+                    out.append(it)
+        for g in getattr(fp, "fp_text_boxes", []) or []:
+            if getattr(g, "layer", None) in copper:
+                raise InputError(f"{ref}: a text box on {g.layer}: not read by the file reader; run with OPENPCBSI_READER=pcbnew")
+    return out
+
+
 def refilled_copy(board_path, workdir):
     """A copy of the board (with its project files) whose zone fills KiCad has just recomputed:
     `kicad-cli pcb drc --refill-zones --save-board` on the copy. The user's file is never written.
@@ -367,4 +501,5 @@ def extract(board_path, refill_dir=None):
     snap["footprints"] = fps
     snap["pads"] = pads
     snap["mask_shapes"] = mask_shapes
+    snap["copper_gfx"] = _copper_gfx(pcb, copper)
     return snap

@@ -40,6 +40,76 @@ def result(rule, spec, title, params, metrics, findings, summary=None):
 # ==============================================================================================
 # PC1 / PC2 / unreferenced: reference-plane continuity, split and gap crossings
 
+PAD_VOID_MARGIN_MM = 0.15   # the void pad_plane asks for under a wide pad: the pad + 0.15 mm (its fix hint)
+
+
+def _wide_pads(ctx, net):
+    """The pads of `net` that pad_plane judges: SMD and connector pads wider than `ratio` x the track that
+    enters them. [(pad, track width, pad width)]"""
+    b, T = ctx.b, ctx.b.tracks
+    p = ctx.cfg["rules"]["pad_plane"]
+    ks = b.tracks_of(net)
+    out = []
+    for pad in b.pads_of(net):
+        if pad["kind"] not in ("smd", "conn") or not pad["layer_ids"]:
+            continue
+        li = pad["layer_ids"][0]
+        near = [k for k in ks if T["layer"][k] == li and min(
+            math.hypot(T["x1"][k] - pad["x"], T["y1"][k] - pad["y"]),
+            math.hypot(T["x2"][k] - pad["x"], T["y2"][k] - pad["y"])) <= max(pad["sx"], pad["sy"])]
+        tw = float(np.median(T["w"][near])) if near else (float(np.median(T["w"][ks])) if len(ks) else 0)
+        pw = min(pad["sx"], pad["sy"])
+        if not tw or pw <= p["ratio"] * tw:
+            continue
+        out.append((pad, tw, pw))
+    return out
+
+
+def _own_pad_voids(ctx, net, li, pad_nets):
+    """The voids ref_plane does not count against `net`'s track on layer `li`: under each of the net's own
+    pads on that layer for which pad_plane asks for a void (a wide pad on a class it judges, Nyquist at or
+    above its fast_ghz), the pad's outline grown by the margin pad_plane recommends plus one raster cell
+    (the fill edge's quantisation). [(outer ring as an (n, 2) array, grow distance mm)]"""
+    p = ctx.cfg["rules"]["pad_plane"]
+    if not p.get("enabled", True) or net not in pad_nets:
+        return []
+    nyq = ctx.cparam(net, "nyquist_ghz", None)
+    if nyq is None or nyq < p.get("fast_ghz", 3.0):
+        return []
+    d = p.get("void_margin_mm", PAD_VOID_MARGIN_MM) + ctx.g.res
+    out = []
+    for pad, tw, pw in _wide_pads(ctx, net):
+        if li not in pad["layer_ids"]:
+            continue
+        for poly in pad["poly"] or []:
+            if poly and len(poly[0]) >= 3:
+                out.append((np.asarray(poly[0], float), d))
+    return out
+
+
+def _in_grown(px, py, rings):
+    """Points (any shape) inside a ring grown by its distance, for [(ring, d)] (pads: small rings)."""
+    hit = np.zeros(np.shape(px), bool)
+    for ring, d in rings:
+        x0, y0 = ring.min(axis=0) - d
+        x1, y1 = ring.max(axis=0) + d
+        cand = ~hit & (px >= x0) & (px <= x1) & (py >= y0) & (py <= y1)
+        if not cand.any():
+            continue
+        x, y = px[cand], py[cand]
+        inside = np.zeros(x.shape, bool)
+        dmin = np.full(x.shape, np.inf)
+        for (xa, ya), (xb, yb) in zip(ring, np.roll(ring, -1, axis=0)):
+            if yb != ya:
+                inside ^= ((ya > y) != (yb > y)) & (x < xa + (y - ya) * (xb - xa) / (yb - ya))
+            ex, ey = xb - xa, yb - ya
+            L2 = ex * ex + ey * ey
+            t = np.clip(((x - xa) * ex + (y - ya) * ey) / L2, 0, 1) if L2 > 0 else np.zeros(x.shape)
+            dmin = np.minimum(dmin, np.hypot(x - xa - t * ex, y - ya - t * ey))
+        hit[cand] = inside | (dmin <= d)
+    return hit
+
+
 def rule_ref_plane(ctx):
     b, cfg, g = ctx.b, ctx.cfg, ctx.g
     p = cfg["rules"]["ref_plane"]
@@ -47,11 +117,16 @@ def rule_ref_plane(ctx):
     step = p["step"]
     metrics, finds = {}, []
     split_metrics, split_finds = {}, []
+    pad_nets = set(ctx.nets("pad_plane"))
     for net in ctx.nets("ref_plane"):
-        m = {"uncovered_mm": 0.0, "uncovered_in_areas_mm": 0.0, "length_mm": 0.0}
+        m = {"uncovered_mm": 0.0, "uncovered_in_areas_mm": 0.0, "length_mm": 0.0, "excused_own_pad_void_mm": 0.0}
         sm = {"gap_crossings": 0, "split_crossings": 0, "gap_crossings_in_areas": 0, "split_crossings_in_areas": 0}
         for li in sorted(set(b.tracks["layer"][b.tracks_of(net)].tolist())):
             refs = ctx.ref_layers(li)
+            # pad_plane asks for the reference to be voided under the net's own wide pads: the track that
+            # enters such a pad runs over that void by design, so it is not failed for it here (any other
+            # void, and any part of this one beyond the pad + the recommended margin, still is)
+            own_voids = _own_pad_voids(ctx, net, li, pad_nets)
             for path in ctx.path_samples(net, li, step):
                 x, y, w, dl = path["x"], path["y"], path["w"], path["dl"]
                 m["length_mm"] += path["length"]
@@ -70,6 +145,12 @@ def rule_ref_plane(ctx):
                     py = y[:, None] + ny_[:, None] * half[:, None] * u[None, :]
                     rm = ctx.refmask(rli)
                     cov = g.sample(rm.view(np.uint8), px, py).astype(bool)
+                    excused = np.zeros(cov.shape, bool)
+                    if own_voids:
+                        excused = ~cov & _in_grown(px, py, own_voids)
+                        m["excused_own_pad_void_mm"] += float(dl[excused.any(axis=1)].sum())
+                    centre_real = cov[:, nacross // 2]
+                    cov = cov | excused
                     full = cov.all(axis=1)
                     centre = cov[:, nacross // 2]
                     rast = b.raster(rli)
@@ -91,13 +172,16 @@ def rule_ref_plane(ctx):
                                              f"{L:.2f} mm without solid reference on {b.layers[rli]} ({kind})",
                                              net, b.layers[li], x[a0], y[a0], x[a1 - 1], y[a1 - 1], L,
                                              p["limit_mm"], "mm", ar, ref_layer=b.layers[rli], kind=kind))
-                    # PC2: crossings of the centreline: ref -> (void|other) -> ref
-                    state = np.where(centre, 1, np.where(under != 0, 2, 0))
+                    # PC2: crossings of the centreline: ref -> (void|other) -> ref. Over the void pad_plane asks
+                    # for under the net's own pad (state 3) the track is not on its plane: a run that ends
+                    # there ends off the plane; a run of nothing else is no crossing
+                    state = np.where(centre_real, 1, np.where(excused[:, nacross // 2], 3, np.where(under != 0, 2, 0)))
                     for a0, a1 in runs(state != 1):
                         if a0 == 0 or a1 >= len(state):
                             continue          # starts or ends off the plane: not a crossing
-                        L = float(dl[a0:a1].sum())
-                        if L < ps["min_gap_mm"]:
+                        real = state[a0:a1] != 3
+                        L = float(dl[a0:a1][real].sum())
+                        if not real.any() or L < ps["min_gap_mm"]:
                             continue
                         kind = "split" if (state[a0:a1] == 2).any() else "gap"
                         ar = ctx.area_name(area[(a0 + a1) // 2])
@@ -553,23 +637,11 @@ def _pad_mask(g, pad):
 def rule_pad_plane(ctx):
     b, cfg, g = ctx.b, ctx.cfg, ctx.g
     p = cfg["rules"]["pad_plane"]
-    T = b.tracks
     metrics, finds = {}, []
     for net in ctx.nets("pad_plane"):
         rows = []
-        nid = b.net_id[net]
-        ks = b.tracks_of(net)
-        for pad in b.pads_of(net):
-            if pad["kind"] not in ("smd", "conn") or not pad["layer_ids"]:
-                continue
+        for pad, tw, pw in _wide_pads(ctx, net):
             li = pad["layer_ids"][0]
-            near = [k for k in ks if T["layer"][k] == li and min(
-                math.hypot(T["x1"][k] - pad["x"], T["y1"][k] - pad["y"]),
-                math.hypot(T["x2"][k] - pad["x"], T["y2"][k] - pad["y"])) <= max(pad["sx"], pad["sy"])]
-            tw = float(np.median(T["w"][near])) if near else (float(np.median(T["w"][ks])) if len(ks) else 0)
-            pw = min(pad["sx"], pad["sy"])
-            if not tw or pw <= p["ratio"] * tw:
-                continue
             m, sl = _pad_mask(g, pad)
             if m is None or not m.any():
                 continue

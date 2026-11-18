@@ -81,6 +81,7 @@ class Fab:
     def __init__(self, prof):
         self.name = prof.get("fab", {}).get("name", "?")
         self.retrieved = prof.get("fab", {}).get("retrieved")
+        self.verified = prof.get("fab", {}).get("verified")
         self.pages = prof.get("fab", {}).get("pages", {})
         self.sources = sorted(set(self.pages.values())) or prof.get("fab", {}).get("sources", [])
         self.path, self.hash = prof.get("_path"), prof.get("_hash")
@@ -319,3 +320,123 @@ def resolve(prof, board, cfg):
         if e["source"] in ("assumed", "guidance") and e.get("use", "limit") == "limit":
             e["use"] = "input"
     return fab
+
+
+# ------------------------------------------------------------------------------------------------
+# freshness: are the quoted figures still on the fabricator's pages?
+
+STALE_DAYS = 180       # a profile read longer ago than this is reported as a warning by the review
+
+
+def _quotes(prof):
+    """Every (where, page key, quote) of a profile: published values, guidance and notes that cite a page."""
+    out = []
+
+    def walk(x, where):
+        if isinstance(x, dict):
+            if isinstance(x.get("quote"), str) and x.get("page"):
+                out.append((where, x["page"], x["quote"]))
+            for qk in [k for k in x if k.endswith("_quote") and isinstance(x[k], str)]:
+                pk = qk[:-len("_quote")] + "_page"
+                out.append((f"{where}.{qk}", x.get(pk) or x.get("page"), x[qk]))
+            for k, v in x.items():
+                walk(v, f"{where}.{k}" if where else k)
+        elif isinstance(x, list):
+            for i, v in enumerate(x):
+                walk(v, f"{where}[{i}]")
+    walk(prof, "")
+    return [q for q in out if q[1]]
+
+
+def _norm(x):
+    import html
+    import re
+    x = html.unescape(re.sub(r"<[^>]+>", " ", x))
+    for a, b in (("\u2013", "-"), ("\u2014", "-"), ("\u00a0", " "), ("\u00b1", "+/-"), ("\u2009", " "), ("\u2019", "'"),
+                 ("\uff08", "("), ("\uff09", ")"), ("\u2265", ">="), ("\u2267", ">=")):
+        x = x.replace(a, b)
+    return re.sub(r"\s+", " ", x).lower()
+
+
+def find_quote(page_text, quote):
+    """How a quote appears in a page's text: "exact", "spacing" (only white space differs), "label+value"
+    (a "label: value" quote whose value follows its label within a table row), "parts" (a quote the
+    profile joined from several places with "; " or "...", each part found), or None. A trailing
+    column label in parentheses that is not on the page ("(Standard PCBA)") is the profile's note of
+    the table column and is not looked for."""
+    import re
+    how = _find_one(page_text, quote)
+    if how:
+        return how
+    parts = [p.strip() for p in re.split(r";\s+|\s+\.\.\.\s+", quote) if p.strip()]
+    if len(parts) > 1 and all(_find_one(page_text, p) for p in parts):
+        return "parts"
+    return None
+
+
+def _find_one(page_text, quote):
+    import re
+    x = _norm(page_text)
+    for q in (_norm(quote), _norm(re.sub(r"\s*\([^()]*\)\s*$", "", quote))):
+        how = _match(x, q)
+        if how:
+            return how
+    return None
+
+
+def _match(x, q):
+    import re
+    if not q.strip():
+        return None
+    if q in x:
+        return "exact"
+    squash = lambda s: re.sub(r"\s+", "", s)
+    if squash(q) in squash(x):
+        return "spacing"
+    if ":" in q:
+        lab, val = q.split(":", 1)
+        lab, val = lab.strip(), squash(val)
+        for m in re.finditer(re.escape(lab), x):
+            if val and val in squash(x[m.end():m.end() + 400]):
+                return "label+value"
+    return None
+
+
+def check_pages(name_or_path, fetch=None, timeout=60):
+    """Fetch every page a profile cites and look for each quote on it. Returns {name, retrieved, pages:
+    {key: {url, error}}, quotes: [{where, page, quote, found}], missing}. `fetch(url) -> text` may be
+    given (tests); by default the page is read over HTTPS with a generic client name."""
+    import urllib.request
+    prof = load(name_or_path)
+    pages = prof.get("fab", {}).get("pages", {})
+
+    def get(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "openpcbsi-fab-check"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    fetch = fetch or get
+    texts, status = {}, {}
+    for key, url in pages.items():
+        try:
+            texts[key] = fetch(url)
+            status[key] = {"url": url, "error": None}
+        except Exception as e:
+            status[key] = {"url": url, "error": str(e)[:200]}
+    res = []
+    for where, page, quote in _quotes(prof):
+        if page not in texts:
+            res.append({"where": where, "page": page, "quote": quote, "found": None,
+                        "note": "page not read" if page in pages else f"page key '{page}' is not in [fab.pages]"})
+            continue
+        res.append({"where": where, "page": page, "quote": quote, "found": find_quote(texts[page], quote)})
+    return {"name": prof.get("fab", {}).get("name"), "retrieved": prof.get("fab", {}).get("retrieved"), "pages": status,
+            "quotes": res, "missing": [r for r in res if not r["found"]]}
+
+
+def age_days(retrieved, today=None):
+    import datetime
+    try:
+        d = datetime.date.fromisoformat(str(retrieved))
+    except ValueError:
+        return None
+    return ((today or datetime.date.today()) - d).days

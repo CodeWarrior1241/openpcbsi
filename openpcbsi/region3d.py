@@ -46,8 +46,21 @@ import numpy as np
 
 from . import tdr as T
 
-VENV_PY = os.environ.get("OPENPCBSI_OPENEMS_PYTHON", "/media/fpgadev/Dev_Tools/OpenEMS/install/venv/bin/python")
+OPENEMS_ENV = "OPENPCBSI_OPENEMS_PYTHON"
 C0 = 299792458.0
+
+
+def openems_python():
+    """The Python of an environment with openEMS and CSXCAD, from OPENPCBSI_OPENEMS_PYTHON. There is no
+    default: openpcbsi never runs an interpreter it was not pointed at."""
+    from .snapshot import InputError
+    py = os.environ.get(OPENEMS_ENV, "").strip()
+    if not py:
+        raise InputError(f"3D regions need openEMS: set {OPENEMS_ENV} to the Python of an environment that has "
+                         "openEMS and CSXCAD installed (e.g. <venv>/bin/python)")
+    if not os.path.isfile(py) or not os.access(py, os.X_OK):
+        raise InputError(f"{OPENEMS_ENV}={py} is not an executable Python")
+    return py
 # Grid-to-grid tolerances. The absolute impedance level of a run moves with the mesh by up to ~2.5 %
 # (seen on three grids of one pair: 98.95, 101.09, 99.9 ohm against 99.6 ohm in 2D, the box-to-lead ratio
 # constant to 0.1 %), so the line impedance may differ by 3 % between grids, the TDR's shape by 2 %, and
@@ -57,6 +70,7 @@ SHAPE_TOL_PCT = 2.0
 PASSIVE_TOL = 1.05
 T_RUN_S = 0.5e-9      # a series C whose 100 ohm time constant exceeds this is left out of the FDTD model
 PML_CELLS = 8
+KEEP_H = 5.0          # pre-flight clearance from the absorbing boundary: at least this many field heights
 AIR_UM = 1000.0
 
 
@@ -126,13 +140,16 @@ def capsule(x1, y1, x2, y2, w, n=6):
 
 
 def pip(x, y, ring):
-    inside = False
-    n = len(ring)
-    for i in range(n):
-        (xa, ya), (xb, yb) = ring[i - 1], ring[i]
-        if (ya > y) != (yb > y) and x < xa + (y - ya) * (xb - xa) / (yb - ya):
-            inside = not inside
-    return inside
+    """Point in polygon (even-odd), vectorised over the ring's edges (zone outlines have thousands)."""
+    r = np.asarray(ring, dtype=float)
+    if len(r) < 3:
+        return False
+    xb, yb = r[:, 0], r[:, 1]
+    xa, ya = np.roll(xb, 1), np.roll(yb, 1)
+    span = (ya > y) != (yb > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cross = span & (x < xa + (y - ya) * (xb - xa) / (yb - ya))
+    return bool(np.count_nonzero(cross) % 2)
 
 
 def seg_cross(x1, y1, x2, y2, side, c):
@@ -156,12 +173,16 @@ def mesh_axis(lo, hi, fixed, zones, hmax, ratio=1.3, min_space=5.0):
         hf = max(min_space, min(gaps + [hmax]))
         zs.append((f, f, hf))
 
+    ZA = np.array([z[0] for z in zs], float)
+    ZB = np.array([z[1] for z in zs], float)
+    ZH = np.array([z[2] for z in zs], float)
+
     def target(x):
+        # geometric growth: n cells of h * ratio^k cover h (ratio^n - 1)/(ratio - 1) of distance
         t = hmax
-        for a, b, h in zs:
-            d = max(a - x, 0.0, x - b)
-            # geometric growth: n cells of h * ratio^k cover h (ratio^n - 1)/(ratio - 1) of distance
-            t = min(t, h + (ratio - 1.0) * d)
+        if len(ZH):
+            d = np.maximum(np.maximum(ZA - x, 0.0), x - ZB)
+            t = min(t, float(np.min(ZH + (ratio - 1.0) * d)))
         return max(t, min_space)
     fx = sorted(set(round(f, 3) for f in fixed if lo < f < hi))
     fset = set(fx) | {round(lo, 3), round(hi, 3)}
@@ -380,7 +401,10 @@ class Region:
                 ring = capsule(xa, ya, xb, yb, w)
             cr = clip_ring(ring, box)
             if cr:
-                sheets.append({"layer": ln, "z": Z[ln], "pts": cr, "metal": True, "prio": 50, "thick": thick[ln], "kind": "track"})
+                # the uncut centreline goes with the sheet: the pre-flight judges how the track meets the
+                # absorbing boundary (crosses it, ends near it, runs along it), which the clipped outline hides
+                sheets.append({"layer": ln, "z": Z[ln], "pts": cr, "metal": True, "prio": 50, "thick": thick[ln], "kind": "track",
+                               "net": b.net_names[int(T_["net"][k])], "seg": [round(v, 3) for v in (xa, ya, xb, yb)], "w": w})
                 tm = mask_t.get(ln, 0.0)
                 if tm:
                     if abs(ya - yb) < 1e-6 or abs(xa - xb) < 1e-6:
@@ -681,12 +705,20 @@ class Region:
             if el.get("body"):
                 zfix += [el["body"]["z0"], el["body"]["z1"]]
         Zl = mesh_axis(zb - AIR_UM, zt + AIR_UM, zfix, zones_z, hmax * 0.8, ratio=1.4, min_space=10.0)
+        # field height: the largest spacing from a layer with signal copper in the box to its nearest
+        # neighbouring copper (the dielectric that holds its field); the pre-flight's clearance floor
+        field_h = 0.0
+        for zs in {s["z"] for s in sheets if s["metal"] and s["kind"] in ("track", "pad")}:
+            adj = [d["z1"] - d["z0"] for d in diel if min(abs(d["z0"] - zs), abs(d["z1"] - zs)) < 1.0]
+            if adj:
+                field_h = max(field_h, min(adj))
         self.model = {"domain": dom, "box": list(box), "z_sheets": Z, "dielectrics": diel, "mask": mask,
                       "sheets": sheets, "vias": vias, "lumped": lumped, "ports": leads, "groups": order,
                       "mesh": {"x": X, "y": Y, "z": Zl}, "fmax": self.fmax, "lossy": bool(self.spec.get("lossy", False)),
                       "end_criteria": float(self.spec.get("end_criteria", 1e-4)),
                       "max_timesteps": int(self.spec.get("max_timesteps", 400000)),
                       "pml_cells": PML_CELLS, "fine_um": fine, "w_min_um": w_min, "gap_min_um": gap_min,
+                      "field_h_um": round(field_h, 2),
                       "excite_mode": self.spec.get("excite_mode", "odd"),
                       "problems": self.problems}
         return self.model
@@ -728,55 +760,82 @@ class Region:
                 "min_spacing_um": round(float(sp.min()), 2), "fine_um": m["fine_um"]}
 
     def preflight(self):
+        """Refuse a model whose result the absorbing boundaries would spoil.
+
+        Ports need a reference plane and a lead longer than the PML plus the feed and measurement planes.
+        Copper near the PML (closer than `keep`: the PML plus 8 cells, at least KEEP_H field heights): the
+        PML absorbs a wave that runs INTO it, and a line that passes through it is terminated there like a
+        matched load, so a track
+        that crosses the absorbing side cleanly is benign, whatever its net and at any angle steeper than
+        30 degrees to the side (a 45-degree track included; the PML's absorption falls off only at grazing
+        incidence). What spoils a result is copper that ENDS near or inside the PML (an open end, a pad, a
+        via: its fringing field reaches into the absorber, which then loads or reflects it unlike the real
+        board) and copper that RUNS ALONG the PML (a line parallel to the absorber couples to it over its
+        whole length: an unphysical loss). So, per side, every track's copper within `keep` must belong to
+        a chain of segments (one net, one layer, joined end to end inside the band) that reaches an
+        absorbing side of the box, has no free end inside the band, has no segment within 30 degrees of
+        parallel to the side for more than 2 cells, and spans along the side no more than a 30-degree
+        crossing would. Pads keep the rule they had (a pad is accepted only where it is cut by the box edge
+        and spans under 2 mm along it); vias within `keep` are refused."""
         m = self.model
         X, Y = np.array(m["mesh"]["x"]), np.array(m["mesh"]["y"])
         dom = m["domain"]
-        why = []
+        box = m["box"]
+        why = []                                   # (side or None, message)
         pml = {"xmin": X[PML_CELLS] - X[0], "xmax": X[-1] - X[-1 - PML_CELLS],
                "ymin": Y[PML_CELLS] - Y[0], "ymax": Y[-1] - Y[-1 - PML_CELLS]}
         cell = {"xmin": X[1] - X[0], "xmax": X[-1] - X[-2], "ymin": Y[1] - Y[0], "ymax": Y[-1] - Y[-2]}
-        keep = {s: pml[s] + 8 * cell[s] for s in pml}
+        # the clearance: the PML plus 8 cells, and never less than KEEP_H field heights. The cell count
+        # alone shrinks as copper comes closer to the edge (the mesh refines around it, so the PML and its
+        # 8 cells get thinner): a box moved towards a track would pass for that reason only. A line's
+        # fringing field reaches a few dielectric heights sideways (coupling ~ 1 / (1 + (d/h)^2): 4 % at 5 h).
+        floor = KEEP_H * float(m.get("field_h_um") or 0.0)
+        keep = {s: max(pml[s] + 8 * cell[s], floor) for s in pml}
         if not m["ports"]:
-            why.append("no port: no region net crosses the box edge")
+            why.append((None, "no port: no region net crosses the box edge"))
         for p in m["ports"]:
             if p.get("ref") is None:
-                why.append(f"port {p['net']} ({p['side']}) has no reference plane")
+                why.append((None, f"port {p['net']} ({p['side']}) has no reference plane"))
             la = p["lead"]
             L = abs(la[2] - la[0]) if p["side"][0] == "x" else abs(la[3] - la[1])
             need = pml[p["side"]] + 4 * cell[p["side"]] + 300.0
             if L < need:
-                why.append(f"port {p['net']} ({p['side']}): lead {L:.0f} um shorter than the PML plus the feed and measurement planes ({need:.0f} um)")
-        # copper must cross a side (a line into the absorbing layer) or keep 8 cells clear of the PML
+                why.append((p["side"], f"port {p['net']} ({p['side']}): lead {L:.0f} um shorter than the PML plus the feed and measurement planes ({need:.0f} um)"))
+        why += _track_band_problems(m, keep, cell)
+        # pads (and any other signal copper that is not a track): cut by the box edge, or 8 cells clear of the PML
         for s in m["sheets"]:
-            if not s["metal"] or s["kind"] == "plane":
+            if not s["metal"] or s["kind"] in ("plane", "track"):
                 continue
             xs, ys = [p[0] for p in s["pts"]], [p[1] for p in s["pts"]]
-            for side, inside, crosses in (
-                    ("xmin", min(xs) - dom[0] < keep["xmin"], min(xs) <= m["box"][0] + 1e-3),
-                    ("xmax", dom[2] - max(xs) < keep["xmax"], max(xs) >= m["box"][2] - 1e-3),
-                    ("ymin", min(ys) - dom[1] < keep["ymin"], min(ys) <= m["box"][1] + 1e-3),
-                    ("ymax", dom[3] - max(ys) < keep["ymax"], max(ys) >= m["box"][3] - 1e-3)):
-                if not inside:
+            for side, d, crosses in (
+                    ("xmin", min(xs) - dom[0], min(xs) <= box[0] + 1e-3),
+                    ("xmax", dom[2] - max(xs), max(xs) >= box[2] - 1e-3),
+                    ("ymin", min(ys) - dom[1], min(ys) <= box[1] + 1e-3),
+                    ("ymax", dom[3] - max(ys), max(ys) >= box[3] - 1e-3)):
+                if d >= keep[side]:
                     continue
                 along = (max(ys) - min(ys)) if side[0] == "x" else (max(xs) - min(xs))
                 if crosses and along < 2000.0:
                     continue
-                why.append(f"{s['kind']} on {s['layer']} within {keep[side]:.0f} um of the {side} absorbing boundary")
+                why.append((side, f"{s['kind']} on {s['layer']} at {(min(xs) + max(xs)) / 2000:.2f}, {(min(ys) + max(ys)) / 2000:.2f} mm: "
+                                  f"{max(d, 0):.0f} um from the {side} absorbing boundary (keep {keep[side]:.0f} um)"))
                 break
         for v in m["vias"]:
             for side, d in (("xmin", v["x"] - dom[0]), ("xmax", dom[2] - v["x"]), ("ymin", v["y"] - dom[1]), ("ymax", dom[3] - v["y"])):
                 if d - v["pad_r"] < keep[side]:
-                    why.append(f"via at ({v['x'] / 1000:.2f}, {v['y'] / 1000:.2f}) mm within {keep[side]:.0f} um of the {side} boundary")
+                    why.append((side, f"via at ({v['x'] / 1000:.2f}, {v['y'] / 1000:.2f}) mm within {keep[side]:.0f} um of the {side} boundary"))
         for g in m["groups"]:
             if g["kind"] == "pair" and self.spec.get("excite_mode") != "common":
                 e = [p["excite"] for p in g["ports"]]
                 if e[0] != -e[1]:
-                    why.append(f"pair {g['ports'][0]['net']}/{g['ports'][1]['net']} not driven with opposite polarity")
-        uniq = []
-        for w in why:
+                    why.append((None, f"pair {g['ports'][0]['net']}/{g['ports'][1]['net']} not driven with opposite polarity"))
+        uniq, sides = [], {}
+        for side, w in why:
             if w not in uniq:
                 uniq.append(w)
-        return {"ok": not uniq, "problems": uniq[:20], "pml_um": {k: round(v, 1) for k, v in pml.items()}}
+                sides.setdefault(side or "other", []).append(w)
+        return {"ok": not uniq, "problems": uniq[:20], "n_problems": len(uniq), "by_side": sides,
+                "keep_um": {k: round(v, 1) for k, v in keep.items()}, "pml_um": {k: round(v, 1) for k, v in pml.items()}}
 
     def path_connected(self):
         """Port-to-port connectivity of the model: the region nets' clipped tracks, joined through vias and
@@ -861,18 +920,174 @@ def _clip_seg(x1, y1, x2, y2, box):
     return (x1 + t0 * dx, y1 + t0 * dy, x1 + t1 * dx, y1 + t1 * dy)
 
 
+STEEP_SIN = 0.5           # a track meets a side at 30 degrees or more: it crosses it (below: it runs along it)
+
+
+def _track_band_problems(m, keep, cell):
+    """Tracks within `keep` of an absorbing side (see Region.preflight): [(side, message)].
+
+    Per side, the tracks whose copper comes within `keep` of the domain edge are grouped into chains
+    (one net, one layer, segments joined end to end inside the band). A chain is benign when it reaches a
+    side of the box that is the domain edge (it passes into the PML and is terminated there), has no free
+    end inside the band (an end joined to no other segment, or an end cut at a port-side box edge), has no
+    segment within 30 degrees of parallel to the side for more than 2 cells, and spans along the side no
+    more than a 30-degree crossing does."""
+    box, dom = m["box"], m["domain"]
+    sides = {"xmin": (0, dom[0], +1), "xmax": (0, dom[2], -1), "ymin": (1, dom[1], +1), "ymax": (1, dom[3], -1)}
+    edge = {"xmin": box[0], "xmax": box[2], "ymin": box[1], "ymax": box[3]}
+    absorbing = {s: abs(edge[s] - sides[s][1]) < 1e-6 for s in sides}   # no port lead: the box edge is the PML's
+    tracks = [s for s in m["sheets"] if s.get("kind") == "track" and s.get("metal") and s.get("seg")]
+    key = lambda s, x, y: (s["layer"], s["net"], round(x), round(y))
+    joints = {}
+    for s in tracks:
+        xa, ya, xb, yb = s["seg"]
+        if math.hypot(xb - xa, yb - ya) > 1e-6:
+            for x, y in ((xa, ya), (xb, yb)):
+                joints[key(s, x, y)] = joints.get(key(s, x, y), 0) + 1
+
+    def on_edge(x, y):
+        """The box side a clipped end lies on, or None (the end is the track's own)."""
+        for s, (ax, _, _) in sides.items():
+            if abs((x, y)[ax] - edge[s]) < 1e-3:
+                return s
+        return None
+    out = []
+    for side, (ax, d0, sg) in sides.items():
+        k, c = keep[side], cell[side]
+        dist = lambda p: (p[ax] - d0) * sg                # from the domain edge, inwards
+        items = []
+        for s in tracks:
+            w = s["w"]
+            cl = _clip_seg(*s["seg"], box)
+            if cl is None:                                   # centreline outside, copper inside: a sliver
+                dmin = min(dist(p) for p in s["pts"])        # cut lengthwise by the box edge
+                if dmin < k:
+                    out.append((side, f"track of {s['net'] or 'no net'} on {s['layer']} is cut lengthwise by the box edge, "
+                                      f"{max(dmin, 0):.0f} um from the {side} absorbing boundary (keep {k:.0f} um)"))
+                continue
+            lim = d0 + sg * (k + w / 2)
+            band = list(box)                                 # the box within keep (+ half the track) of this side
+            if sg > 0:
+                band[ax + 2] = min(band[ax + 2], lim)
+            else:
+                band[ax] = max(band[ax], lim)
+            if band[0] > band[2] or band[1] > band[3]:
+                continue
+            part = _clip_seg(*cl, band)
+            if part is None:
+                continue
+            xa, ya, xb, yb = s["seg"]
+            L = math.hypot(xb - xa, yb - ya)
+            steep = L > 1e-6 and abs((xb - xa, yb - ya)[ax]) / L >= STEEP_SIN
+            items.append({"s": s, "cl": cl, "part": part, "steep": steep, "L": L})
+        if not items:
+            continue
+        # chains: segments of one net and layer joined at an end inside the band
+        par = list(range(len(items)))
+
+        def find(i):
+            while par[i] != i:
+                par[i] = par[par[i]]
+                i = par[i]
+            return i
+        at = {}
+        for i, it in enumerate(items):
+            xa, ya, xb, yb = it["s"]["seg"]
+            for x, y in ((xa, ya), (xb, yb)):
+                kk = key(it["s"], x, y)
+                if kk in at:
+                    par[find(i)] = find(at[kk])
+                else:
+                    at[kk] = i
+        chains = {}
+        for i in range(len(items)):
+            chains.setdefault(find(i), []).append(items[i])
+        for ch in chains.values():
+            s0 = ch[0]["s"]
+            wmax = max(it["s"]["w"] for it in ch)
+            what, reaches = [], False
+            near = min(min(dist(it["part"][:2]), dist(it["part"][2:])) - it["s"]["w"] / 2 for it in ch)
+            for it in ch:
+                s, w = it["s"], it["s"]["w"]
+                if it["L"] <= 1e-6:
+                    what.append("is a dot of copper")
+                    continue
+                xa, ya, xb, yb = s["seg"]
+                cl = it["cl"]
+                for (ox, oy), (cx, cy) in (((xa, ya), cl[:2]), ((xb, yb), cl[2:])):
+                    if math.hypot(ox - cx, oy - cy) > 1e-3:            # cut at the box edge
+                        e = on_edge(cx, cy)
+                        if e and absorbing[e]:
+                            reaches = True
+                        elif dist((cx, cy)) < k + w / 2:
+                            what.append("is cut at the box edge beside a port lead")
+                    elif dist((ox, oy)) < k + w / 2 and joints.get(key(s, ox, oy), 0) < 2:
+                        what.append("ends")
+                pl = math.hypot(it["part"][2] - it["part"][0], it["part"][3] - it["part"][1])
+                if not it["steep"] and pl > 2 * c:
+                    what.append(f"runs along it for {pl:.0f} um")
+            ta = 1 - ax
+            span = [v for it in ch for v in (it["part"][ta], it["part"][ta + 2])]
+            if max(span) - min(span) > 1.8 * k + 2 * wmax + c:
+                what.append(f"spans {max(span) - min(span):.0f} um along it")
+            if not reaches and not what:
+                what.append("does not reach an absorbing side of the box")
+            if what:
+                uniq = list(dict.fromkeys(what))
+                out.append((side, f"track of {s0['net'] or 'no net'} on {s0['layer']} {', '.join(uniq)}, "
+                                  f"{max(near, 0):.0f} um from the {side} absorbing boundary (keep {k:.0f} um)"))
+    return out
+
+
 # ---- running ---------------------------------------------------------------------------------------
+RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "em3d.py")
+
+
+def grid_key(model):
+    """Hash of everything one grid's solve depends on: the model (geometry, materials, mesh, ports,
+    excitation, boundaries, end criterion and time-step limit) and the runner that turns it into openEMS."""
+    h = hashlib.sha256(json.dumps(model, sort_keys=True, default=str).encode())
+    h.update(open(RUNNER, "rb").read())
+    return h.hexdigest()
+
+
+def _reuse_grid(gdir, key):
+    """A finished grid of an earlier (possibly interrupted) run of the same region: its record says it
+    completed, its inputs hash the same, and its port waves are complete. None otherwise."""
+    try:
+        done = json.load(open(os.path.join(gdir, "done.json")))
+        if done.get("key") != key:
+            return None
+        ports = json.load(open(os.path.join(gdir, "ports.json")))
+        if hashlib.sha256(open(os.path.join(gdir, "ports.json"), "rb").read()).hexdigest() != done.get("ports_sha256"):
+            return None
+        if not ports.get("ports") or any(len(v.get("a_re", [])) != len(ports["freq_hz"]) for v in ports["ports"].values()):
+            return None
+        return {"ports": ports, "ended_by": done["ended_by"], "seconds": done["seconds"], "cells": ports["cells"], "reused": True}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _run_grid(model, od, gi, threads, log):
-    gdir = os.path.join(od, f"grid{gi}")
+    from .si import inside
+    gdir = inside(od, os.path.join(od, f"grid{gi}"))
     os.makedirs(gdir, exist_ok=True)
+    key = grid_key(model)
+    old = _reuse_grid(gdir, key)
+    if old:
+        log(f"  grid {gi}: reused the finished solve in {gdir} ({old['cells']} cells, ended by {old['ended_by']})")
+        return old
+    for f in ("done.json", "ports.json"):           # a stale or partial grid: solved again from scratch
+        if os.path.exists(os.path.join(gdir, f)):
+            os.remove(os.path.join(gdir, f))
+    py = openems_python()
     mp = os.path.join(gdir, "model.json")
     json.dump(model, open(mp, "w"))
-    runner = os.path.join(os.path.dirname(os.path.abspath(__file__)), "em3d.py")
     t0 = time.time()
     from . import jobs
     with jobs.slot("openems", log) as share:
         th = threads or share
-        p = subprocess.run([VENV_PY, "-I", runner, mp, gdir, str(th)], capture_output=True, text=True,
+        p = subprocess.run([py, "-I", RUNNER, mp, gdir, str(th)], capture_output=True, text=True,
                            env=dict(os.environ, OMP_NUM_THREADS=str(th)))
     logtxt = p.stdout + "\n" + p.stderr
     open(os.path.join(gdir, "runner.log"), "w").write(logtxt)
@@ -882,8 +1097,17 @@ def _run_grid(model, od, gi, threads, log):
     # openEMS prints "Max. number of timesteps: N" at the start of every run; only this warning means
     # the run stopped on the limit
     ended = "timesteps" if re.search(r"number of timesteps was reached", logtxt) else "end_criteria"
-    log(f"  grid {gi}: {ports['cells']} cells, {time.time() - t0:.0f} s, ended by {ended}")
-    return {"ports": ports, "ended_by": ended, "seconds": round(time.time() - t0, 1), "cells": ports["cells"]}
+    secs = round(time.time() - t0, 1)
+    log(f"  grid {gi}: {ports['cells']} cells, {secs:.0f} s, ended by {ended}")
+    # written last, atomically: its presence means this grid finished (an interrupted run leaves none)
+    rec = {"key": key, "ended_by": ended, "seconds": secs, "cells": ports["cells"],
+           "ports_sha256": hashlib.sha256(open(os.path.join(gdir, "ports.json"), "rb").read()).hexdigest(),
+           "date": time.strftime("%Y-%m-%d %H:%M:%S")}
+    tmp = os.path.join(gdir, f"done.json.{os.getpid()}.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(rec, fh, indent=1)
+    os.replace(tmp, os.path.join(gdir, "done.json"))
+    return {"ports": ports, "ended_by": ended, "seconds": secs, "cells": ports["cells"]}
 
 
 def _post(model, run):
@@ -985,8 +1209,14 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
     pf = reg.preflight()
     mesh = reg.mesh_report()
     conn, conn_by = reg.path_connected()
-    key = hashlib.sha256(json.dumps({"m": model, "s": spec}, sort_keys=True, default=str).encode()).hexdigest()[:16]
-    od = os.path.join(runs_dir, "em", f"{spec.get('name', 'region')}_{key}")
+    # the run folder: the region's name (from net and part names: through safe_name, so a hierarchical
+    # "/sheet/NET" or a "../" in a name cannot leave runs/em) and a hash of what the result depends on
+    # (not the thread count or whether this call only checks: a rerun finds the grids an earlier one finished)
+    from .si import inside, safe_name
+    hspec = {k: v for k, v in spec.items() if k not in ("preflight_only", "threads")}
+    key = hashlib.sha256(json.dumps({"m": model, "s": hspec}, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    em_dir = os.path.join(runs_dir, "em")
+    od = inside(em_dir, os.path.join(em_dir, f"{safe_name(spec.get('name') or 'region')}_{key}"))
     os.makedirs(od, exist_ok=True)
     res = {"name": spec.get("name"), "board": ctx.b.path, "box_mm": spec["box"], "nets": reg.nets,
            "ports_kind": "line", "boundaries": ["PML_8"] * 4 + ["MUR", "MUR"], "preflight": pf, "mesh": mesh,

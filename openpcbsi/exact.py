@@ -52,6 +52,17 @@ def seg_segs(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2):
     return np.where((o1 * o2 < 0) & (o3 * o4 < 0), 0.0, d)
 
 
+def seg_seg_pairs(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2):
+    """Distance between segments A[k] and B[k], elementwise (a segment may be a point); 0 where they cross."""
+    d = np.minimum.reduce([geom.point_seg_dist(ax1, ay1, bx1, by1, bx2, by2), geom.point_seg_dist(ax2, ay2, bx1, by1, bx2, by2),
+                           geom.point_seg_dist(bx1, by1, ax1, ay1, ax2, ay2), geom.point_seg_dist(bx2, by2, ax1, ay1, ax2, ay2)])
+    o1 = _cross(ax2 - ax1, ay2 - ay1, bx1 - ax1, by1 - ay1)
+    o2 = _cross(ax2 - ax1, ay2 - ay1, bx2 - ax1, by2 - ay1)
+    o3 = _cross(bx2 - bx1, by2 - by1, ax1 - bx1, ay1 - by1)
+    o4 = _cross(bx2 - bx1, by2 - by1, ax2 - bx1, ay2 - by1)
+    return np.where((o1 * o2 < 0) & (o3 * o4 < 0), 0.0, d)
+
+
 def _in_wedge(vx, vy, ax, ay, bx, by):
     """Whether direction v lies within the minor arc's angle from a to b (all from the centre)."""
     s = _cross(ax, ay, bx, by)
@@ -137,10 +148,18 @@ class Copper:
         sel = np.flatnonzero(T["layer"] == li)
         arcs = [b.snap["tracks"][k].get("arc") for k in sel]
         is_arc = np.array([isinstance(a, (list, tuple)) for a in arcs], bool)
-        self.t = {k: T[k][sel] for k in ("x1", "y1", "x2", "y2", "net")}
-        self.t["r"] = T["w"][sel] / 2
-        self.t["arc"] = is_arc
-        self.t["c"] = np.array([a if isinstance(a, (list, tuple)) else (0.0, 0.0, 0.0) for a in arcs], float).reshape(-1, 3)
+        # tracks, and the strokes of graphics and text on the layer (copper all the same)
+        F = getattr(b, "gfx", None)
+        fs = np.flatnonzero(F["layer"] == li) if F is not None else np.zeros(0, int)
+        self.t = {k: np.r_[T[k][sel], F[k][fs] if len(fs) else np.zeros(0)] for k in ("x1", "y1", "x2", "y2")}
+        self.t["net"] = np.r_[T["net"][sel], F["net"][fs] if len(fs) else np.zeros(0, int)].astype(np.int64)
+        self.t["r"] = np.r_[T["w"][sel] / 2, F["w"][fs] / 2 if len(fs) else np.zeros(0)]
+        f_arc = ~np.isnan(F["arc"][fs, 0]) if len(fs) else np.zeros(0, bool)
+        self.t["arc"] = np.r_[is_arc, f_arc]
+        self.t["c"] = np.r_[np.array([a if isinstance(a, (list, tuple)) else (0.0, 0.0, 0.0) for a in arcs], float).reshape(-1, 3),
+                            np.nan_to_num(F["arc"][fs]) if len(fs) else np.zeros((0, 3))]
+        self.t["err"] = np.r_[np.zeros(len(sel)), np.where(F["exact"][fs], 0.0, POLY_ERR) if len(fs) else np.zeros(0)]
+        self.t["gfx"] = np.r_[np.zeros(len(sel), bool), np.ones(len(fs), bool)]
         V = b.vias
         vs = np.array([k for k in range(len(V["x"])) if li in b.via_flashed[k]], int)
         self.v = {"x": V["x"][vs], "y": V["y"][vs], "r": V["d"][vs] / 2, "net": V["net"][vs]} if len(vs) else None
@@ -160,17 +179,27 @@ class Copper:
                 item = ("poly", [np.asarray(r, float) for pl in poly for r in pl], 0.0, 0.0 if core else POLY_ERR)
             self.pads.append((bb, p["net_id"], item, p))
         self.pad_bb = np.array([x[0] for x in self.pads]).reshape(-1, 4)
-        segs, nets = [], []
+        segs, nets, errs = [], [], []
         for z in b.zones:
             if z["layer"] != b.layers[li]:
                 continue
             s_ = geom.ring_segments([ring for poly in z["polys"] for ring in poly])
             if len(s_):
                 segs.append(s_)
-                nets.append(np.full(len(s_), b.net_id.get(z["net"], 0)))
+                nets.append(np.full(len(s_), z.get("net_id", b.net_id.get(z["net"], 0))))
+                errs.append(np.zeros(len(s_)))
+        for gp in getattr(b, "gfx_polys", []):                 # filled graphics and text polygons
+            if gp["layer"] != li:
+                continue
+            s_ = geom.ring_segments([ring for poly in gp["polys"] for ring in poly])
+            if len(s_):
+                segs.append(s_)
+                nets.append(np.full(len(s_), gp["net_id"]))
+                errs.append(np.full(len(s_), 0.0 if gp["exact"] else POLY_ERR))
         segs = np.vstack(segs) if segs else np.zeros((0, 4))
         self.z, src = _pieces(segs)
         self.z_net = np.concatenate(nets)[src] if nets else np.zeros(0, int)
+        self.z_err = np.concatenate(errs)[src] if errs else np.zeros(0)
         self.z_tree = cKDTree(np.c_[(self.z[:, 0] + self.z[:, 2]) / 2, (self.z[:, 1] + self.z[:, 3]) / 2]) if len(self.z) else None
 
     def clearance(self, ax1, ay1, ax2, ay2, rh, nid, reach):
@@ -199,8 +228,8 @@ class Copper:
                     c = t["c"][k[ka]]
                     d[ka] = seg_arcs(ax1, ay1, ax2, ay2, t["x1"][k[ka]], t["y1"][k[ka]], t["x2"][k[ka]], t["y2"][k[ka]], c[:, 0], c[:, 1], c[:, 2])
                 d = d - rh - t["r"][k]
-                j = int(np.argmin(d))
-                take(d[j], d[j], t["net"][k[j]], (t["x1"][k[j]] + t["x2"][k[j]]) / 2, (t["y1"][k[j]] + t["y2"][k[j]]) / 2)
+                j = int(np.argmin(d - t["err"][k]))
+                take(d[j] - t["err"][k[j]], d[j], t["net"][k[j]], (t["x1"][k[j]] + t["x2"][k[j]]) / 2, (t["y1"][k[j]] + t["y2"][k[j]]) / 2)
         # vias
         v = self.v
         if v is not None:
@@ -234,8 +263,8 @@ class Copper:
                 k = k[other(self.z_net[k])]
             if len(k):
                 d = seg_segs(ax1, ay1, ax2, ay2, self.z[k, 0], self.z[k, 1], self.z[k, 2], self.z[k, 3]) - rh
-                j = int(np.argmin(d))
-                take(d[j], d[j], self.z_net[k[j]], (self.z[k[j], 0] + self.z[k[j], 2]) / 2, (self.z[k[j], 1] + self.z[k[j], 3]) / 2)
+                j = int(np.argmin(d - self.z_err[k]))
+                take(d[j] - self.z_err[k[j]], d[j], self.z_net[k[j]], (self.z[k[j], 0] + self.z[k[j], 2]) / 2, (self.z[k[j], 1] + self.z[k[j], 3]) / 2)
         g = self.b.grid()
         i, jj = g.ij((ax1 + ax2) / 2, (ay1 + ay2) / 2)
         r_ = self.b.raster(self.li)
@@ -308,7 +337,7 @@ class Copper:
                         R = t["c"][k, 2]
                         sag = R - math.sqrt(max(R * R - (half[k] - t["r"][k]) ** 2, 0.0))
                     d = closest(t["x1"][k], t["y1"][k], t["x2"][k], t["y2"][k], ks) - t["r"][k]
-                    take(d - sag - last_err[0], d, t["net"][k], *at(t["x1"][k], t["y1"][k], t["x2"][k], t["y2"][k]))
+                    take(d - sag - last_err[0] - t["err"][k], d, t["net"][k], *at(t["x1"][k], t["y1"][k], t["x2"][k], t["y2"][k]))
         v = self.v
         if v is not None:
             for k, ks in enumerate(tree.query_ball_point(np.c_[v["x"], v["y"]], reach + v["r"])):
@@ -349,7 +378,7 @@ class Copper:
                         d, e_ = 0.0, 0.0
                     else:
                         d = closest(z[k, 0], z[k, 1], z[k, 2], z[k, 3], ks)
-                        e_ = last_err[0]
+                        e_ = last_err[0] + self.z_err[k]
                     take(d - e_, d, self.z_net[k], mx[k], my[k])
         return best
 
@@ -368,3 +397,93 @@ def outline_index(b):
     if "outline_arcs" not in b.snap:
         err[:] = EDGE_ERR                          # an older snapshot: no arc information, the general bound
     return O, (cKDTree(np.c_[(O[:, 0] + O[:, 2]) / 2, (O[:, 1] + O[:, 3]) / 2]) if len(O) else None), err[src] if len(src) else np.zeros(0)
+
+
+# ------------------------------------------------------------------------------------------------
+# spacing between nets (MF12), exactly
+
+def _sagitta(c, x1, y1, x2, y2):
+    R = c[:, 2]
+    half = np.hypot(x2 - x1, y2 - y1) / 2
+    return np.where(R > 0, R - np.sqrt(np.maximum(R * R - half * half, 0.0)), 0.0)
+
+
+def elements(cu, x0, y0, x1, y1):
+    """The copper items of a layer within a window, as elements: a segment (a point when its ends meet)
+    and a radius, the net, whether it is pad copper, its error bound, and its arc circle (nan if
+    straight). Long segments are cut into pieces (the same lines: exact)."""
+    rows = []                                   # x1 y1 x2 y2 r net pad err cx cy R
+    t = cu.t
+    if len(t["x1"]):
+        m = (np.minimum(t["x1"], t["x2"]) - t["r"] <= x1) & (np.maximum(t["x1"], t["x2"]) + t["r"] >= x0) \
+            & (np.minimum(t["y1"], t["y2"]) - t["r"] <= y1) & (np.maximum(t["y1"], t["y2"]) + t["r"] >= y0)
+        k = np.flatnonzero(m)
+        if len(k):
+            segs = np.c_[t["x1"][k], t["y1"][k], t["x2"][k], t["y2"][k]]
+            P, src = _pieces(segs)
+            k = k[src]
+            c = np.where(t["arc"][k][:, None], t["c"][k], np.nan)
+            rows.append(np.c_[P, t["r"][k], t["net"][k], np.zeros(len(k)), t["err"][k], c])
+    v = cu.v
+    if v is not None:
+        k = np.flatnonzero((v["x"] - v["r"] <= x1) & (v["x"] + v["r"] >= x0) & (v["y"] - v["r"] <= y1) & (v["y"] + v["r"] >= y0))
+        if len(k):
+            rows.append(np.c_[v["x"][k], v["y"][k], v["x"][k], v["y"][k], v["r"][k], v["net"][k], np.zeros(len(k)), np.zeros(len(k)),
+                              np.full((len(k), 3), np.nan)])
+    if len(cu.pad_bb):
+        pb = cu.pad_bb
+        for j in np.flatnonzero((pb[:, 0] <= x1) & (pb[:, 2] >= x0) & (pb[:, 1] <= y1) & (pb[:, 3] >= y0)):
+            _, n, (kind, data, r, err), p = cu.pads[j]
+            if kind == "core":
+                P = np.asarray(data, float)
+                es = [(P[0], P[-1])] if len(P) <= 2 else [(P[i], P[(i + 1) % len(P)]) for i in range(len(P))]
+            else:
+                es = [(q[i], q[(i + 1) % len(q)]) for q in data for i in range(len(q))]
+            for a_, c_ in es:
+                rows.append(np.array([[a_[0], a_[1], c_[0], c_[1], r, n, 1.0, err, np.nan, np.nan, np.nan]]))
+    if len(cu.z):
+        z = cu.z
+        k = np.flatnonzero((np.minimum(z[:, 0], z[:, 2]) <= x1) & (np.maximum(z[:, 0], z[:, 2]) >= x0)
+                           & (np.minimum(z[:, 1], z[:, 3]) <= y1) & (np.maximum(z[:, 1], z[:, 3]) >= y0))
+        if len(k):
+            rows.append(np.c_[z[k], np.zeros(len(k)), cu.z_net[k], np.zeros(len(k)), cu.z_err[k], np.full((len(k), 3), np.nan)])
+    return np.vstack(rows) if rows else np.zeros((0, 11))
+
+
+def gaps(cu, x0, y0, x1, y1, reach, core=None):
+    """Every pair of copper elements of different nets within `reach` of each other in a window:
+    arrays (net a, net b, pad a, pad b, lo, hi, x, y), the gap's bounds (equal where both elements are
+    exact) and the midpoint between the two elements. `core` (x0, y0, x1, y1) keeps only pairs whose
+    midpoint lies in it (so that tiles do not count a pair twice)."""
+    E = elements(cu, x0 - reach, y0 - reach, x1 + reach, y1 + reach)
+    if len(E) < 2:
+        return None
+    mx, my = (E[:, 0] + E[:, 2]) / 2, (E[:, 1] + E[:, 3]) / 2
+    half = np.hypot(E[:, 2] - E[:, 0], E[:, 3] - E[:, 1]) / 2
+    tree = cKDTree(np.c_[mx, my])
+    P = np.array(sorted(tree.query_pairs(2 * float(half.max()) + 2 * float(E[:, 4].max()) + reach)), int).reshape(-1, 2)
+    if not len(P):
+        return None
+    i, j = P[:, 0], P[:, 1]
+    keep = (E[i, 5] != E[j, 5]) & ~((E[i, 6] > 0) & (E[j, 6] > 0))       # other nets; pad to pad is MF4
+    i, j = i[keep], j[keep]
+    if not len(i):
+        return None
+    d = seg_seg_pairs(E[i, 0], E[i, 1], E[i, 2], E[i, 3], E[j, 0], E[j, 1], E[j, 2], E[j, 3])
+    arc_i, arc_j = ~np.isnan(E[i, 10]), ~np.isnan(E[j, 10])
+    bound = np.zeros(len(i))
+    for n_ in np.flatnonzero(arc_i ^ arc_j):              # a line against an arc: exact
+        a, b_ = (E[j[n_]], E[i[n_]]) if arc_i[n_] else (E[i[n_]], E[j[n_]])
+        d[n_] = seg_arcs(a[0], a[1], a[2], a[3], b_[0:1], b_[1:2], b_[2:3], b_[3:4], b_[8:9], b_[9:10], b_[10:11])[0]
+    both = arc_i & arc_j                                   # two arcs: their chords, with both sagittas as the bound
+    if both.any():
+        bound[both] = (_sagitta(E[i[both]][:, 8:11], E[i[both], 0], E[i[both], 1], E[i[both], 2], E[i[both], 3])
+                       + _sagitta(E[j[both]][:, 8:11], E[j[both], 0], E[j[both], 1], E[j[both], 2], E[j[both], 3]))
+    gap = d - E[i, 4] - E[j, 4]
+    lo = gap - E[i, 7] - E[j, 7] - bound
+    hi = gap + bound
+    x, y = (mx[i] + mx[j]) / 2, (my[i] + my[j]) / 2
+    if core is not None:
+        c = (x >= core[0]) & (x < core[2]) & (y >= core[1]) & (y < core[3])
+        i, j, lo, hi, x, y = i[c], j[c], lo[c], hi[c], x[c], y[c]
+    return E[i, 5].astype(int), E[j, 5].astype(int), E[i, 6] > 0, E[j, 6] > 0, lo, hi, x, y

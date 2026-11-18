@@ -35,6 +35,7 @@ ovens, infrared heating, the temperature inside a part (a part is as warm as the
 panels, and the second pass of a double-sided board.
 """
 import math
+import os
 
 import numpy as np
 import scipy.sparse as sp
@@ -50,7 +51,7 @@ from .thermal import K_CU, K_FR4_IN, K_FR4_THRU, RHOC_CU, RHOC_FR4
 # (packages.body_of: its fabrication outline and a typical height for its class), marked "estimated",
 # and the estimated bodies are varied x0.5 and x2.
 VARIANTS = (("film coefficient x 0.6", 0.6, 1.0), ("film coefficient x 1.6", 1.6, 1.0),
-            ("estimated bodies x 0.5", 1.0, 0.5), ("estimated bodies x 2", 1.0, 2.0))
+            ("model and estimated bodies x 0.5", 1.0, 0.5), ("model and estimated bodies x 2", 1.0, 2.0))
 
 
 def _lu(A):
@@ -136,6 +137,14 @@ def build_model(ctx, fabr, h_scale=1.0, body_scale=1.0):
     extra = np.zeros(N)
     parts, rows, cols, vals = [], [], [], []
     left_out = []
+    models = ctx.__dict__.get("_reflow_models")
+    if models is None:
+        from . import bodies
+        from .run import CACHE
+        try:
+            models = ctx._reflow_models = bodies.bodies(b.path, b.cache_dir or CACHE)
+        except Exception:
+            models = ctx._reflow_models = {}
     for ref, fp in b.fps.items():
         if fp.get("dnp") or not any(p["kind"] == "smd" for p in b.pads_by_ref.get(ref, [])):
             continue
@@ -146,8 +155,14 @@ def build_model(ctx, fabr, h_scale=1.0, body_scale=1.0):
         cov = _part_cover(ctx, mesh, fp)
         if cov.sum() <= 0:
             continue
-        body = packages.body_of(fp, cfg)
-        scale = body_scale if body["assumed"] else 1.0
+        body = packages.body_of(fp, cfg, models.get(ref))
+        if body is None:
+            left_out.append({"ref": ref, "why": "no body data: no 3D model (or its file is missing), no Mass or Height field, and no "
+                                                "package class to estimate one; give its mass or height in [reflow.parts." + ref + "]"})
+            continue
+        # the body variants vary every body not measured: estimates by class and 3D-model volumes (whose
+        # material is not known)
+        scale = body_scale if (body["assumed"] or body.get("model")) else 1.0
         l = 0 if fp["side"] == "F" else L - 1
         w = cov / cov.sum()
         C[l] += body["C"] * scale * w
@@ -240,7 +255,8 @@ def board(ctx, fabr, out_dir, log=print):
         row = {"ref": p["ref"], "x": p["x"], "y": p["y"], "side": "F" if p["layer"] == 0 else "B",
                "peak_c": round(float(T.max()), 1), "d_peak_c": round(ds[0], 1), "d_range_c": [round(min(ds), 1), round(max(ds), 1)],
                "tal_s": round(float(above.sum() * dt), 0), "lag_s": round(float(M["W"][k] @ tau), 1),
-               "body": p["body"]["source"], "assumed": p["body"]["assumed"], "estimated": p["body"]["assumed"]}
+               "body": p["body"]["source"], "assumed": p["body"]["assumed"], "estimated": p["body"]["assumed"],
+               "from_model": bool(p["body"].get("model"))}
         if node_peak is not None and len(p["nodes"]) >= 4:
             row["within_c"] = round(float(node_peak[p["nodes"]].max() - node_peak[p["nodes"]].min()), 1)
         rows.append(row)
@@ -727,6 +743,13 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
                     if abs(oven - est) > max(spread, 0.05):
                         probs.append(f"{fp['ref']}: the oven transient gives {oven:.3g} s, the lag difference plus the belt term "
                                      f"{est:.3g} s (travel {trav}): they differ by more than the parameter sensitivity ({spread:.2g} s)")
+                        # the two computations disagree: the value is not resolved; its range covers both
+                        res["oven_check"]["agrees"] = False
+                        d_ = oven - est
+                        res["dt_range_s"] = [_sig(min(res["dt_range_s"][0], res["dt_range_s"][0] + d_)),
+                                             _sig(max(res["dt_range_s"][1], res["dt_range_s"][1] + d_))]
+                    else:
+                        res["oven_check"]["agrees"] = True
             except Exception as e:
                 probs.append(f"{fp['ref']} (transient): {e}")
         return res, probs
@@ -740,6 +763,31 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
     for x in out:
         x["dt_s"] = _sig(x["dt_s"])
         x["lag_s"] = _sig(x["lag_s"])
+    # the order the model can resolve: each row's range of ranks given its sensitivity (a row without a
+    # range uses its value); rows whose ranges overlap are not ordered by this ranking
+    lo = np.array([(x.get("dt_range_s") or [x["dt_s"]] * 2)[0] for x in out])
+    hi = np.array([(x.get("dt_range_s") or [x["dt_s"]] * 2)[1] for x in out])
+    for i, x in enumerate(out):
+        x["rank"] = i + 1
+        x["rank_range"] = [int(1 + (lo > hi[i]).sum()), int((hi >= lo[i]).sum())]
+    resolved = sum(1 for x in out[:p["detail"]] if x["rank_range"][0] == x["rank_range"][1])
+    # what explains the ranking: the concordance of each listed geometry feature with dt (0.5 = none,
+    # 1 = the feature alone orders the chips as the model does)
+    feats = {"a plane via at one pad only": [float(bool(q["pads"][0]["plane_vias"]) != bool(q["pads"][1]["plane_vias"])) for q in out],
+             "copper leaving the pads, ratio": [max(e["entry_mm"] for e in q["pads"]) / max(min(e["entry_mm"] for e in q["pads"]), 0.1) for q in out],
+             "toe of the pads": [q["land"]["toe_mm"] for q in out]}
+    dts = np.array([x["dt_s"] for x in out])
+
+    def conc(f):
+        f = np.asarray(f, float)
+        num = den = 0.0
+        for i in range(len(f)):
+            dd, ff = dts[i + 1:] - dts[i], f[i + 1:] - f[i]
+            m = dd != 0
+            num += float(((dd[m] * ff[m]) > 0).sum() + 0.5 * (ff[m] == 0).sum())
+            den += float(m.sum())
+        return round(num / den, 2) if den else None
+    explained = {k: conc(v) for k, v in feats.items()} if len(out) > 2 else {}
     fs = []
     j = cfg["dfm"]["judge"]
     if j.get("source") and j.get("joint_dt_s") is not None:
@@ -763,6 +811,8 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
         if not r["travel"]:
             log("  the belt direction is not stated ([reflow] travel): the time between the joints excludes the belt term, and its "
                 "range covers the four directions")
+        log(f"  {resolved} of the first {min(p['detail'], len(out))} rows have a rank of their own; what explains the order: "
+            + ", ".join(f"{k} {v}" for k, v in explained.items() if v is not None))
     for msg in problems[:5]:
         log(f"  problem: {msg}")
     params = {"cell_mm": p["cell_mm"], "coarse": p["coarse"], "margin_mm": p["margin_mm"], "paste_k": p["paste_k"],
@@ -771,7 +821,13 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
               "travel": r["travel"] or "not stated: the value excludes the belt term; the range covers the four directions"}
     return {"rule": "chips", "spec": "MF8", "title": "Chips: time between the two joints reaching liquidus (model), with the land geometry",
             "params": params, "findings": fs, "rows": out, "problems": problems,
-            "summary": {"chips": len(rows), "layouts": len(out), "not_solved": skipped + len(problems)}}
+            "summary": {"chips": len(rows), "layouts": len(out), "not_solved": skipped + len(problems),
+                        "top_resolved": f"{resolved} of the first {min(p['detail'], len(out))} rows have a rank of their own; the others "
+                                        f"overlap within their sensitivity (rank_range)",
+                        "explained_by": explained,
+                        "explained_note": "concordance of each feature with dt over all layouts (0.5 none, 1 the feature alone gives the "
+                                          "model's order): where a simple feature explains it, the model adds little beyond it",
+                        "unresolved": [x["refs"][0] for x in out if x.get("oven_check") and x["oven_check"].get("agrees") is False]}}
 
 
 # ------------------------------------------------------------------------------------------------

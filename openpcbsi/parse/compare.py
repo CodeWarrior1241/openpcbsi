@@ -36,7 +36,7 @@ def _area(polys):
     return tot
 
 
-ALL = ("nets", "tracks", "vias", "zones", "footprints", "pads", "pad_polys", "mask", "paste", "outline", "stackup", "flash", "core", "protect")
+ALL = ("nets", "tracks", "vias", "zones", "footprints", "pads", "pad_polys", "mask", "paste", "outline", "stackup", "flash", "core", "protect", "gfx")
 # exact shapes (pad cores) come from the same numbers in both readers: they must agree to 10 nm
 CORE_TOL = 1e-5
 
@@ -208,6 +208,37 @@ def differences(a, b, fields=None, limit=12):
                         ax, ay = _area(x.get("paste_poly", {}).get(m)), _area(y.get("paste_poly", {}).get(m))
                         if abs(ax - ay) > max(1e-4, AREA_REL * max(ax, ay)):
                             add(f"pad {k} ({x.get('shape')}): {m} aperture {ax:.4f} against {ay:.4f} mm2")
+    if "gfx" in want and ("copper_gfx" in a or "copper_gfx" in b):
+        # graphics and text on copper: the copper they make, per layer (strokes as capsules, filled shapes
+        # and text polygons as polygons); KiCad's text polygons lie up to 2 um inside the strokes
+        try:
+            from . import use
+            use()
+            from shapely import geometry, ops
+
+            def layer_geo(snap):
+                out = {}
+                for g in snap.get("copper_gfx", []):
+                    parts = []
+                    for x1, y1, x2, y2, w, *_ in g["segs"] + g["arcs"]:
+                        parts.append((geometry.LineString([(x1, y1), (x2, y2)]) if (x1, y1) != (x2, y2) else geometry.Point(x1, y1)).buffer(w / 2, quad_segs=16))
+                    parts += [geometry.Polygon(pl[0], pl[1:]).buffer(0) for pl in g["polys"] if len(pl[0]) >= 3]
+                    if parts:
+                        out.setdefault(g["layer"], []).extend(parts)
+                return {k: ops.unary_union(v) for k, v in out.items()}
+            ga, gb = layer_geo(a), layer_geo(b)
+            counts["copper graphics layers"] = (len(ga), len(gb))
+            for ln in set(ga) | set(gb):
+                A, B = ga.get(ln), gb.get(ln)
+                compared["copper graphics"] += 1
+                if A is None or B is None:
+                    add(f"copper graphics on {ln} only in {'the first' if B is None else 'the second'} reading")
+                    continue
+                tol = max(1e-3, AREA_REL * max(A.area, B.area), max(A.length, B.length) * MASK_GROW)
+                if A.symmetric_difference(B).area > tol:
+                    add(f"copper graphics on {ln}: {A.area:.4f} against {B.area:.4f} mm2 ({A.symmetric_difference(B).area:.4f} mm2 differ)")
+        except ImportError:
+            pass
     if "outline" in want:
         oa, ob = _area(a["outline"]), _area(b["outline"])
         counts["outline mm2"] = (round(oa, 3), round(ob, 3))

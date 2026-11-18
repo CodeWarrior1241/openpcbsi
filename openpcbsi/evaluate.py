@@ -510,17 +510,30 @@ def run(board, cfg_path=None, waivers=None, families=None, checks=None, out_dir=
     em_jobs = None
     if em in ("plan", "run"):                    # #19: automatic 3D regions with fix variants
         from . import emplan, region3d
-        em_jobs = emplan.plan(ctx, rep, cfg.data.get("em", {}).get("fast_ghz", 3.0))
-        os.makedirs(os.path.join(od, "em_jobs"), exist_ok=True)
+        from .si import inside, safe_name
+        em_jobs = emplan.plan(ctx, rep, cfg.data.get("em", {}).get("fast_ghz", 3.0), log=log)
+        jd = os.path.join(od, "em_jobs")
+        os.makedirs(jd, exist_ok=True)
         for j in em_jobs:
-            json.dump(j, open(os.path.join(od, "em_jobs", j["name"] + ".json"), "w"), indent=1)
-        log(f"3D regions: {len(em_jobs)} planned" + (" (running: minutes each)" if em == "run" else ""))
+            # job names come from net and part names ("/sheet/NET"): a file name only through safe_name
+            with open(inside(jd, os.path.join(jd, safe_name(j["name"]) + ".json")), "w") as fh:
+                json.dump(j, fh, indent=1)
+        nfit = sum(1 for j in em_jobs if j.get("fit", {}).get("ok"))
+        log(f"3D regions: {len(em_jobs)} planned, {nfit} with a box that passes pre-flight"
+            + (" (running: minutes each)" if em == "run" else ""))
+        for j in em_jobs:
+            if not j.get("fit", {}).get("ok"):
+                msg = f"{j['name']}: no box passes the 3D pre-flight: {j.get('fit', {}).get('why', '')}"
+                log("  " + msg)
+                if em == "plan":
+                    findings.append(_f("em_region", "FS", "FS9", "info", msg, j["nets"], j.get("parts", []), extra=j["name"]))
         if em == "run":
             for j in em_jobs:
-                base = region3d.run(ctx, {k: v for k, v in j.items() if k != "variant"}, runmod.CACHE, runmod.RUNS, log)
+                spec = emplan.region_spec(j)
+                base = region3d.run(ctx, spec, runmod.CACHE, runmod.RUNS, log)
                 j["result"] = {k: base.get(k) for k in ("dir", "ran", "convergence", "calibration", "z_line_ohm", "preflight")}
                 if j.get("variant"):
-                    var = region3d.run(ctx, j, runmod.CACHE, runmod.RUNS, log)
+                    var = region3d.run(ctx, emplan.region_spec(j, variant=True), runmod.CACHE, runmod.RUNS, log)
                     j["variant_result"] = {k: var.get(k) for k in ("dir", "ran", "convergence", "z_line_ohm")}
                 for sev, msg in emplan.judge(j, base):
                     findings.append(_f("em_region", "FS", "FS9", sev, msg, j["nets"], j.get("parts", []), extra=j["name"]))
@@ -552,12 +565,14 @@ def run(board, cfg_path=None, waivers=None, families=None, checks=None, out_dir=
         "findings": findings, "report": os.path.join(od, "report.json"),
     }
     path = os.path.join(od, "evaluation.json")
+    from .paths import portable
+    plain = json.loads(json.dumps(ev, default=str))
     with open(path, "w") as fh:
-        json.dump(ev, fh, indent=1, default=str)
+        json.dump(portable(plain, od), fh, indent=1)
     if json_out:
         with open(json_out, "w") as fh:
-            json.dump(ev, fh, indent=1, default=str)
-    write_html(ev, os.path.join(od, "evaluation.html"))
+            json.dump(portable(plain, os.path.dirname(os.path.abspath(json_out))), fh, indent=1)
+    write_html(portable(plain, od), os.path.join(od, "evaluation.html"))
     log("")
     log(f"scorecard ({'config ' + rep['config'] if cfg.path else 'config detected from the board'}):")
     for F in famcard:

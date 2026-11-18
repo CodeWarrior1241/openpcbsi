@@ -161,7 +161,10 @@ python3 -m openpcbsi verify-signoff runs/<board>_<hash>/signoff.json
 ```
 
 `signoff.json` ties the verdict to the SHA-256 of the board, its KiCad project files, the
-configuration and the waivers; `verify-signoff` fails if any of them changed since.
+configuration and the waivers; `verify-signoff` fails if any of them changed since, and recomputes the
+verdict, counts and blockers from the evaluation instead of trusting the record. `--sign-key KEY` signs
+the record with an SSH key and `verify-signoff --allowed-signers FILE` checks it: only that
+authenticates the reviewer. `--rerun` evaluates the board again.
 
 ### Manufacturing review
 
@@ -178,7 +181,8 @@ an exemplar; copy it for another fabricator and pass the file with `--fab`.
 The output has two parts, kept apart.
 
 **Rules** judge drawn geometry against a limit the fabricator publishes, an industry standard gives,
-or the board configuration sets. They alone give the verdict and the exit code (as for `evaluate`),
+or the board configuration sets. They alone give the verdict and the exit code (0 pass, 1 warn, 2
+fail, 3 could not check, 4 pass with assumptions),
 they use the finding model and waiver format of `evaluate`, and they apply to the whole board,
 BGA fields included (with the figures the fabricator publishes for them).
 
@@ -210,8 +214,9 @@ checked and the file formats: [docs/dfm.md](docs/dfm.md).
 | Command | What it does |
 |---------|--------------|
 | `evaluate BOARD [-c CFG] [--waivers FILE] [--families ...] [--checks ...] [--stage S] [--since EVAL] [--em none\|plan\|run] [--json OUT] [-o DIR] [--no-drc] [--no-markers]` | Every check plus KiCad DRC, a scorecard and an exit code. `--em plan` lists automatic 3D regions, `--em run` runs them (minutes each). |
-| `signoff BOARD [evaluate options] [--reviewer NAME]` | Evaluate and write `signoff.json`, tied to the exact inputs. |
-| `verify-signoff RECORD` | Check that a sign-off record still matches its board and files. |
+| `signoff BOARD [evaluate options] [--reviewer NAME] [--sign-key KEY]` | Evaluate and write `signoff.json`, tied to the exact inputs (and signed). |
+| `verify-signoff RECORD [--allowed-signers FILE] [--rerun]` | Check that a sign-off record still matches its board, files and evaluation (and its signature). |
+| `fab-check [PROFILE]` | Read a fabricator profile's pages again and check that every quoted figure is still there. |
 | `dfm BOARD [-c CFG] [--fab NAME\|FILE] [--gerbers DIR] [--observed FILE] [--checks audit,output,copper,drill,mask,paste,parts,reflow,chips] [--waivers FILE] [--json OUT] [-o DIR] [--no-markers]` | Manufacturing review against a fabricator profile: rules with a verdict and an exit code, and rankings without one. |
 | `plan BOARD --layer L (--zdiff Z [--gap G] \| --z0 Z)` | Track width for a target impedance on a layer of the board's stackup. |
 | `init BOARD [-o FILE] [--force]` | Draft a board configuration from the board. |

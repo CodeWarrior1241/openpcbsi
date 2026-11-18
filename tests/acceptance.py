@@ -851,23 +851,53 @@ def t33_conc():
 # =================================================================================================
 # F. Sign-off
 # =================================================================================================
-@case(34, "Sign-off record: hashes and versions; a changed board invalidates it")
+@case(34, "Sign-off record: hashes and versions; a changed board, an edited verdict, blockers or counts invalidate it; a signature authenticates the reviewer; no absolute paths")
 def t34_signoff():
     d = out_dir("t34")
-    b = boards.pair_over_plane(d, "so")
+    b = boards.pair_over_plane(d, "so", slot=True)              # fails (the slot): the verdict is "blocked: failures"
     o = os.path.join(d, "so_run")
-    rc, so, se, dt = run(["signoff", b, "--checks", "drc", "--no-drc", "-o", o])
+    key = os.path.join(d, "key")
+    for f in (key, key + ".pub"):
+        if os.path.exists(f):
+            os.remove(f)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "reviewer", "-f", key], check=True)
+    allowed = os.path.join(d, "allowed_signers")
+    kt, kb = open(key + ".pub").read().split()[:2]
+    open(allowed, "w").write(f"reviewer@example.org {kt} {kb}\n")
+    rc, so, se, dt = run(["signoff", b, "--checks", "drc", "--no-drc", "-o", o, "--reviewer", "reviewer@example.org", "--sign-key", key])
     rec = os.path.join(o, "signoff.json")
     need(os.path.exists(rec), f"no signoff.json (rc {rc}): {(se or so)[-300:]}")
     s = _load(rec)
-    for k in ("board_sha256", "project_files", "openpcbsi_version", "kicad_file_version", "checks", "verdict"):
+    for k in ("board_sha256", "project_files", "openpcbsi_version", "kicad_file_version", "checks", "verdict", "blockers"):
         need(k in s, f"signoff.json lacks {k}")
+    txt = open(rec).read()
+    need(os.path.abspath(d) not in txt and os.path.expanduser("~") not in txt, "signoff.json holds absolute paths")
+    rc, so, se, dt = run(["verify-signoff", rec, "--allowed-signers", allowed])
+    need(rc == 0 and "signed by" in so, f"verify-signoff fails on an untouched, signed record: {so + se}")
+    need(s["verdict"] == "blocked: failures" and s["blockers"], f"the slot board's record: {s['verdict']}")
+    orig = open(rec).read()
+    # the audit's edit: verdict to release, blockers emptied -> recomputed from the evaluation, refused
+    t = json.loads(orig)
+    t["verdict"], t["blockers"] = "release", []
+    t["counts"]["fail"] = 0
+    open(rec, "w").write(json.dumps(t, indent=1))
+    os.remove(rec + ".sig")
     rc, so, se, dt = run(["verify-signoff", rec])
-    need(rc == 0, f"verify-signoff fails on an untouched board: {so + se}")
+    need(rc != 0 and "the evaluation gives" in so, f"an edited verdict verifies: {so[-300:]}")
+    # only the reviewer changed: the derived fields still hold, the signature does not
+    open(rec, "w").write(orig)
+    subprocess.run(["ssh-keygen", "-Y", "sign", "-f", key, "-n", "openpcbsi-signoff", rec], check=True, capture_output=True)
+    t = json.loads(orig)
+    t["reviewer"] = "someone@example.org"
+    open(rec, "w").write(json.dumps(t, indent=1))
+    rc, so, se, dt = run(["verify-signoff", rec, "--allowed-signers", allowed])
+    need(rc != 0 and "signature does not verify" in so, f"a changed reviewer verifies against the signature: {so[-300:]}")
+    open(rec, "w").write(orig)
     open(b, "a").write("\n")
     rc, so, se, dt = run(["verify-signoff", rec])
     need(rc != 0, "verify-signoff passes after the board changed")
-    return ok("record written, verified, invalidated by a change")
+    return ok("record written and signed; edited verdict/blockers/counts refused (recomputed from the evaluation); changed reviewer "
+              "refused by the signature; changed board refused; relative paths only")
 
 
 @case(35, "Regression since the last sign-off: new / resolved findings by stable ID; waivers carried")
@@ -1056,6 +1086,11 @@ def t40_chips():
              f"{ref}: the range {x['dt_range_s']} does not cover the belt term of +/-{x['belt_max_s']} s around {x['dt_s']} s")
         need("dt_oven_s" not in x, f"{ref}: a second timing figure is reported")
     need(not _rule(r["ev"], "chips")["problems"], f"chip model problems: {_rule(r['ev'], 'chips')['problems'][:3]}")
+    # each row's rank range, and what explains the order (the plane-via flag orders C1 above C2)
+    rk = {x["refs"][0]: x["rank_range"] for x in _rule(r["ev"], "chips")["rows"]}
+    sm = _rule(r["ev"], "chips")["summary"]
+    need(all(len(v) == 2 and v[0] <= v[1] for v in rk.values()) and "a plane via at one pad only" in sm["explained_by"],
+         f"rank ranges {rk}, explained by {sm.get('explained_by')}")
     need(t["C1"]["pads"][1]["plane_vias"] == 1 and t["C3"]["pads"][0]["share"] > 0.6 and "toe_mm" in t["C1"]["land"], "the geometry columns are missing")
     need(not ev_findings(r["ev"], "chips") and _chk(r["ev"], "chips")["status"] == "ranked" and r["rc"] == 0,
          f"the chip ranking is judged or changes the exit code (exit {r['rc']})")
@@ -1098,7 +1133,7 @@ def t40_chips():
               f"ranked only; judged with a config limit (checked source); one defect gives no score; 6 of 20 scored with an interval")
 
 
-@case(41, "Reflow: closed-form cases pass; a heavy part ranks coldest; a part without body data is ranked with an estimated body, marked and varied; fiducials are left out and listed; nothing is judged without a limit")
+@case(41, "Reflow: closed-form cases pass; a heavy part ranks coldest; a body from the part's 3D model; a classed part without data gets a marked, varied estimate; a part with nothing is left out and listed; fiducials too; nothing is judged without a limit")
 def t41_reflow():
     sys.path.insert(0, ROOT)
     from openpcbsi import etch, reflow
@@ -1120,7 +1155,15 @@ def t41_reflow():
     need("U2" in p and p["U2"]["estimated"] and "fabrication-layer outline" in p["U2"]["body"] and "QFN" in p["U2"]["body"],
          f"the QFN without body data: {p.get('U2', 'left out')}")
     need(not p["U1"]["estimated"] and not p["R1"]["estimated"], "parts with body data are marked estimated")
-    need(p["U2"]["d_range_c"][1] - p["U2"]["d_range_c"][0] > 0, f"no sensitivity range around the estimated body: {p['U2']['d_range_c']}")
+    # U3's body from KiCad's 3D model of a 3 x 3 x 0.75 mm QFN (about 6.8 mm3); J9 (no data, no model, no class) left out
+    need("U3" in p and p["U3"]["from_model"] and "3D model" in p["U3"]["body"], f"the QFN with a 3D model: {p.get('U3')}")
+    vol = float(re.search(r"([\d.]+) mm3", p["U3"]["body"]).group(1))
+    need(4.0 < vol < 9.0, f"U3's model volume {vol} mm3, want about 6.8")
+    lo_ = {x["ref"]: x["why"] for x in rule["summary"]["left_out"]}
+    need("J9" not in p and "J9" in lo_ and "no body data" in lo_["J9"], f"the connector with no data: ranked {('J9' in p)}, left out {lo_.get('J9')}")
+    # (the median part reads 0 in every variant: one of U2 and U3 is not it)
+    need(max(p[r]["d_range_c"][1] - p[r]["d_range_c"][0] for r in ("U2", "U3")) > 0,
+         f"no sensitivity range around the estimated or model bodies: {p['U2']['d_range_c']}, {p['U3']['d_range_c']}")
     # a fiducial is not a soldered part: it is left out of the ranking and listed
     rf = dfm(boards.order_board(d, "fid", via_in_pad=False), "--checks", "reflow")
     rr = _rule(rf["ev"], "reflow")
@@ -1128,14 +1171,14 @@ def t41_reflow():
          f"fiducial in the reflow ranking: {[x['ref'] for x in rr['rows']]}, left out {rr['summary']['left_out']}")
     need(not ev_findings(r["ev"], "reflow") and r["rc"] == 0 and _chk(r["ev"], "reflow")["status"] == "ranked",
          f"the reflow ranking is judged (exit {r['rc']})")
-    cfg = toml(os.path.join(d, "cfg.toml"), '[dfm]\nassembly_service = "economic"\n[dfm.judge]\nsource = { kind = \"assembler\", document = \"test data\", date = \"2026-11-16\" }\nreflow_cold_c = 10.0\n')
+    cfg = toml(os.path.join(d, "cfg.toml"), '[dfm]\nassembly_service = "economic"\n[dfm.judge]\nsource = { kind = \"assembler\", document = \"test data\", date = \"2026-11-16\" }\nreflow_cold_c = 20.0\n')
     r2 = dfm(b, "--checks", "reflow", "-c", cfg)
     m2 = _rule(r2["ev"], "reflow")["summary"]["median_peak_c"]
     need(abs(m2 - 255.0) <= 0.6, f"economic service: median peak {m2} C, want 255")
     hit = {f["refs"][0] for f in ev_findings(r2["ev"], "reflow", ("warn",))}
     need(hit == {"U1"} and r2["rc"] == 1, f"with a limit from the board config: warned {sorted(hit)}")
     return ok(f"U1 {p['U1']['d_peak_c']:+.0f} C from the median (sensitivity {p['U1']['d_range_c'][0]:+.0f} to {p['U1']['d_range_c'][1]:+.0f}), "
-              f"coldest; U2 estimated ({p['U2']['d_range_c'][0]:+.1f} to {p['U2']['d_range_c'][1]:+.1f}); a fiducial left out and listed; "
+              f"coldest; U2 estimated, U3 from its 3D model ({vol:.1f} mm3), J9 left out; a fiducial left out and listed; "
               f"not judged without a limit; median 240 and 255 C by service")
 
 
@@ -1242,7 +1285,7 @@ def t45_output():
     b = boards.chip_board(d)
     r = dfm(b, "--checks", "output")
     # without --gerbers KiCad's plot checks the reader, and the verdict assumes those files are sent: not a pass
-    need(r["ev"] and r["rc"] == 1 and r["ev"]["status"] == "pass with assumptions"
+    need(r["ev"] and r["rc"] == 4 and r["ev"]["status"] == "pass with assumptions"
          and _chk(r["ev"], "output_match")["status"] == "pass with assumptions"
          and any("files sent" in a["assumption"] for a in r["ev"]["assumptions"]),
          f"plotted files: exit {r['rc']}, {r['ev']['status'] if r['ev'] else ''}, {_chk(r['ev'], 'output_match')['status'] if r['ev'] else ''}: {r['err'][-200:]}")
@@ -1425,7 +1468,7 @@ def t48_order():
     need(ev["status"] == "warn" and r["rc"] == 1 and rng_ and rng_[0]["refs"] == ["U1"] and len(ev["assumptions"]) == 2,
          f"status {ev['status']}, exit {r['rc']}, range warnings {[f['reason'][:90] for f in rng_]}: {ev['assumptions']}")
     r0 = dfm(boards.order_board(d, "inpad0402", layers=6), "--checks", "mask,paste")
-    need(r0["ev"]["status"] == "pass with assumptions" and r0["rc"] == 1 and len(r0["ev"]["assumptions"]) == 2,
+    need(r0["ev"]["status"] == "pass with assumptions" and r0["rc"] == 4 and len(r0["ev"]["assumptions"]) == 2,
          f"0402 chips and a via in a pad: {r0['ev']['status']}, exit {r0['rc']}: {r0['ev']['assumptions']}")
     chk = {c["item"]: c for c in ev["order_checklist"]}
     need("via covering" in chk and "1 vias are in SMD pads" in chk["via covering"]["state"] and "which vias should be filled" in chk["via covering"]["state"],
@@ -1582,7 +1625,7 @@ def t52_markers():
     return ok(f"marker board opens in kicad-cli; {n} markers; its reading equals the board's")
 
 
-@case(53, "Both readers against KiCad on every pad shape: padstacks (front/inner/back and per layer), turned oval, rounded, trapezoid and chamfered pads, custom, paste-only and mask-only pads, arc tracks, via filling and plugging; exact pad shapes equal KiCad's polygons; KiCad's plot agrees with the reading")
+@case(53, "Both readers against KiCad on every pad shape: padstacks (front/inner/back and per layer), turned oval, rounded, trapezoid and chamfered pads, custom, paste-only and mask-only pads, arc tracks, via filling and plugging, graphics and turned text on copper; exact pad shapes equal KiCad's polygons; KiCad's plot agrees with the reading")
 def t53_reader_shapes():
     d = out_dir("t53")
     b = boards.reader_board(d)
@@ -1600,6 +1643,7 @@ def t53_reader_shapes():
     gold = json.load(gzip.open(os.path.join(d, "gold.json.gz"), "rt"))
     diff = compare.differences(gold, snap)
     need(not diff["problems"], f"the file reader differs from KiCad's pcbnew: {diff['problems'][:4]}")
+    need(diff["compared"].get("copper graphics", 0) >= 2, f"copper graphics not compared: {diff['compared']}")
     stacks = sorted((q["ref"], q["num"], len(q["layer_poly"])) for q in snap["pads"] if q.get("layer_poly"))
     need(len(stacks) == 2 and all(n == 4 for _, _, n in stacks), f"padstack pads not read per layer: {stacks}")
     # the exact cores against KiCad's own polygons (pcbnew, independent of openpcbsi's shapes): every
@@ -1648,6 +1692,122 @@ def t54_at_limit():
     m = _rule(r["ev"], "fab_drill")["metrics"]["hole_copper"]
     need(m["bounded_not_exact"] == 0, f"measured with an error bound: {m}")
     return ok(f"exact at the limit: 4 of 4 places 0.5 um inside fail, the 4 at the limit pass; {m['candidates_measured_exactly']} measured exactly")
+
+
+@case(55, "Spacing at the limit, exactly: tracks 0.090 mm apart pass and 0.088, 0.085, 0.080 mm fail against 0.09 mm; a graphic line, a track with no net and copper text are copper; KiCad's plot agrees")
+def t55_spacing():
+    d = out_dir("t55")
+    b = boards.spacing_board(d)
+    r = dfm(b, "--checks", "copper,output")
+    need(r["ev"], f"no dfm.json: {r['err'][-300:]}")
+    fs = ev_findings(r["ev"], "fab_space", ("fail", "warn"))
+    need(not [f for f in fs if f["severity"] == "warn"], f"a marginal band remains: {[f['reason'][:90] for f in fs if f['severity'] == 'warn']}")
+    got = {}
+    for f in fs:
+        got[(f["nets"] or [""])[0]] = (f["value"], f["reason"])
+    for net, gap in (("A1", 0.088), ("A2", 0.085), ("A3", 0.080)):
+        need(net in got and abs(got[net][0] - gap) < 1e-6, f"{net}: want a fail at {gap} mm, got {got.get(net)}")
+    need("A0" not in got, f"tracks exactly 0.090 mm apart fail: {got.get('A0')}")
+    for net, what in (("C", "gr_line"), ("D", "track on F.Cu"), ("E", "gr_text")):
+        need(net in got and abs(got[net][0] - 0.04) < 1e-4 and what in got[net][1],
+             f"{what} 0.04 mm from {net}: {got.get(net)}")
+    need(not any(k.endswith("_ok") for k in got), f"copper 0.2 mm apart reported: {[k for k in got if k.endswith('_ok')]}")
+    om = _chk(r["ev"], "output_match")
+    need(om["status"] != "could not check", f"KiCad's plot and the reading differ: {om['note']}")
+    return ok("0.090 mm passes; 0.088 / 0.085 / 0.080 mm fail at their exact values; a graphic line, a no-net track and copper "
+              "text 40 um from a track fail; the 0.2 mm versions pass; KiCad's plot agrees with the reading")
+
+
+@case(56, "Input and profile: a board using a KiCad 10.99 construct is refused (also when its header says 10.0); a reading with footprints away from their pads is refused; cached readings are keyed by refill and kicad-cli; fab-check finds a profile's quotes and reports a changed one")
+def t56_input_profile():
+    d = out_dir("t56")
+    sys.path.insert(0, ROOT)
+    from openpcbsi import snapshot, fab
+    b = boards.chip_board(d, "inp")
+    txt = open(b).read()
+    bad = os.path.join(d, "bad.kicad_pcb")
+    # a 10.99-style placement: (transform ...) in a footprint, the header left at 10.0
+    open(bad, "w").write(txt.replace("(footprint ", "(footprint (transform (xyz 0 0 0)) ", 1))
+    try:
+        snapshot.load_or_extract(bad, os.path.join(d, "c"))
+        need(False, "a board with a (transform ...) construct was read")
+    except snapshot.InputError as e:
+        need("transform" in str(e), f"refused for another reason: {e}")
+    snap = {"footprints": [{"ref": f"R{k}", "x": 0.0, "y": 0.0} for k in range(6)],
+            "pads": [{"ref": f"R{k}", "x": 100.0 + k, "y": 100.0} for k in range(6)]}
+    try:
+        snapshot._check_placement(snap)
+        need(False, "footprints at the origin, away from their pads, were accepted")
+    except snapshot.InputError:
+        pass
+    t1 = snapshot.cache_tag("file")
+    os.environ["OPENPCBSI_NO_REFILL"] = "1"
+    try:
+        t2 = snapshot.cache_tag("file")
+    finally:
+        os.environ.pop("OPENPCBSI_NO_REFILL")
+    need(t1 != t2 and "cli" in t1, f"cache tags {t1} / {t2}")
+    # fab-check, offline: the profile's own quotes on stub pages; one figure changed on a page
+    prof = fab.load("jlcpcb")
+    pages = {}
+    for where, page, quote in fab._quotes(prof):
+        pages.setdefault(page, []).append(quote)
+    stub = {prof["fab"]["pages"][k]: " ".join(v) for k, v in pages.items() if k in prof["fab"]["pages"]}
+    r1 = fab.check_pages("jlcpcb", fetch=lambda u: stub.get(u, ""))
+    need(not r1["missing"], f"quotes not found on pages that hold them: {[m['quote'][:60] for m in r1['missing']][:3]}")
+    main = prof["fab"]["pages"]["main"]
+    stub2 = dict(stub, **{main: stub[main].replace("Via Hole-to-Hole Spacing: 0.2mm", "Via Hole-to-Hole Spacing: 0.25mm")})
+    r2 = fab.check_pages("jlcpcb", fetch=lambda u: stub2.get(u, ""))
+    need([m for m in r2["missing"] if "Hole-to-Hole" in m["quote"]], f"a changed figure is not reported: {[m['quote'][:50] for m in r2['missing']]}")
+    return ok(f"10.99 construct refused; misplaced reading refused; cache keyed {t1} / {t2}; fab-check: {len(r1['quotes'])} quotes found, "
+              f"a changed figure reported")
+
+
+@case(57, "The plot folder: openpcbsi empties only a folder it made; a folder of other files is refused, not cleared")
+def t57_plot_folder():
+    d = out_dir("t57")
+    b = boards.chip_board(d, "pf")
+    od = os.path.join(d, "out")
+    os.makedirs(os.path.join(od, "fab_files"), exist_ok=True)
+    keep = os.path.join(od, "fab_files", "release_notes.txt")
+    open(keep, "w").write("not openpcbsi's")
+    rc, so, se, dt = run(["dfm", b, "-o", od, "--no-markers", "--checks", "output"])
+    need(os.path.exists(keep), "a file openpcbsi did not make was deleted")
+    ev_ = _load(os.path.join(od, "dfm.json"))
+    need(ev_ and any("not made by openpcbsi" in f["reason"] for f in ev_["findings"]) and _chk(ev_, "output_match")["status"] == "could not check",
+         f"the refusal is not reported: {[f['reason'][:100] for f in (ev_ or {}).get('findings', [])]}")
+    os.remove(keep)
+    rc, so, se, dt = run(["dfm", b, "-o", od, "--no-markers", "--checks", "output"])
+    need(os.path.exists(os.path.join(od, "fab_files", ".openpcbsi-plot")), "the plot folder is not marked")
+    rc, so, se, dt = run(["dfm", b, "-o", od, "--no-markers", "--checks", "output"])
+    need(rc in (0, 4), f"a second run into openpcbsi's own folder: exit {rc}: {(so + se)[-200:]}")
+    return ok("a foreign file kept and the run refused; openpcbsi's own folder marked and reused")
+
+
+# ---- the 3D-region and pad-void tests (tests/acceptance_em.py), registered here ------------------
+def _em_case(item, name, slow=False):
+    def fn():
+        import acceptance_em
+        f = getattr(acceptance_em, name)
+        try:
+            note = f()
+        except AssertionError as e:
+            raise Fail(str(e))
+        if isinstance(note, dict):
+            return note
+        if isinstance(note, str) and note.lower().startswith("blocked"):
+            return blocked(note)
+        return ok(note)
+    fn.__name__ = name
+    sys.path.insert(0, HERE)
+    import acceptance_em as _m
+    case(item, (getattr(_m, name).__doc__ or name).strip().splitlines()[0], slow=slow)(fn)
+
+
+for _item, _name, _slow in ((58, "t_em_names", False), (59, "t_em_preflight_crossings", False), (60, "t_em_fit", False),
+                            (61, "t_em_grid_reuse", False), (62, "t_em_pad_void", False), (63, "t_no_user_paths", False),
+                            (64, "t_em_grid_reuse_openems", True)):
+    _em_case(_item, _name, _slow)
 
 
 # =================================================================================================

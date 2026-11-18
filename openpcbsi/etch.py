@@ -211,50 +211,50 @@ def measure(b, li, cands, rp_mm, res, tile_mm):
 
 
 def measure_spacing(b, li, pts, limit_of, res, tile_mm, max_tiles, coarse_res, reach_mm=0.2):
-    """Stage 2 for spacing. `pts` are stage-1 points (x, y, estimated gap); `limit_of(x, y, pad_a,
-    pad_b)` gives (limit mm, kind, limit key) or None when the pair is not judged here. The tiles
-    with the smallest estimates are measured first; beyond `max_tiles` the estimate is kept.
+    """Stage 2 for spacing, exactly. `pts` are stage-1 points (x, y, estimated gap) from the board raster;
+    `limit_of(x, y, pad_a, pad_b)` gives (limit mm, kind, limit key) or None when the pair is not judged
+    here. In each tile holding a point, every pair of copper elements of different nets is measured on
+    the vector data (exact.gaps: tracks, arcs, vias, pads, fills, graphics and text as KiCad describes
+    them); the tiles with the smallest estimates first, and beyond `max_tiles` the estimate is kept.
 
-    Returns ({(net a, net b, kind): {gap_mm, x, y, n, limit, key, res}}, tiles measured, tiles left)."""
+    Returns ({(net a, net b, kind): {lo, hi, x, y, n, limit, key, res}}, tiles measured, tiles left):
+    lo == hi where both items are exact (res 0), else the bounds of the true gap."""
+    from . import exact
     halo = reach_mm + 0.15
     by = {}
-    for x, y, s in pts:
+    for x, y, s_ in pts:
         k = (int(math.floor(x / tile_mm)), int(math.floor(y / tile_mm)))
-        by[k] = min(by.get(k, 1e9), s)
+        by[k] = min(by.get(k, 1e9), s_)
     order = sorted(by, key=by.get)
     fine, rest = order[:max_tiles], set(order[max_tiles:])
     found = {}
 
-    def add(na, nb, kind, gap, x, y, limit, key, r):
+    def add(na, nb, kind, lo, hi, x, y, limit, key, r):
         k = (min(na, nb), max(na, nb), kind)
-        e = found.setdefault(k, {"gap_mm": 1e9, "n": 0})
+        e = found.setdefault(k, {"lo": 1e9, "hi": 1e9, "n": 0})
         e["n"] += 1
-        if gap < e["gap_mm"]:
-            e.update(gap_mm=gap, x=float(x), y=float(y), limit=limit, key=key, res=r)
+        if lo < e["lo"] or (lo == e["lo"] and hi < e["hi"]):
+            e.update(lo=lo, hi=hi, gap_mm=hi, x=float(x), y=float(y), limit=limit, key=key, res=r)
 
+    cu = exact.Copper(b, li) if fine else None
     for tx, ty in fine:
         x0, y0 = tx * tile_mm, ty * tile_mm
-        g, lab, pm = b.raster_window(li, x0 - halo, y0 - halo, x0 + tile_mm + halo, y0 + tile_mm + halo, res, pads=True)
-        ii, jj, s, la, lb, ia, ib = close_pairs(lab, fields(lab), reach_mm / res)
-        if not len(ii):
+        G = exact.gaps(cu, x0, y0, x0 + tile_mm, y0 + tile_mm, reach_mm, core=(x0, y0, x0 + tile_mm, y0 + tile_mm))
+        if G is None:
             continue
-        x, y = g.xy(ii, jj)
-        core = (x >= x0) & (x < x0 + tile_mm) & (y >= y0) & (y < y0 + tile_mm)
-        pa, pb = pm[ia[0], ia[1]], pm[ib[0], ib[1]]
-        for k in np.flatnonzero(core):
+        na, nb, pa, pb, lo, hi, x, y = G
+        for k in np.flatnonzero(lo < reach_mm):
             lim = limit_of(x[k], y[k], bool(pa[k]), bool(pb[k]))
-            if lim is None:
+            if lim is None or lo[k] >= lim[0] - exact.TOL:
                 continue
-            gap = s[k] * res
-            if gap < lim[0] + res:                  # one fine pixel either side of the limit is the reading's slack
-                add(int(la[k]), int(lb[k]), lim[1], gap, x[k], y[k], lim[0], lim[2], res)
+            add(int(na[k]), int(nb[k]), lim[1], float(lo[k]), float(hi[k]), x[k], y[k], lim[0], lim[2], float(hi[k] - lo[k]))
     if rest:                                            # not refined: only what is clear at the coarse resolution
-        for x, y, s in pts:
+        for x, y, s_ in pts:
             if (int(math.floor(x / tile_mm)), int(math.floor(y / tile_mm))) not in rest:
                 continue
             lim = limit_of(x, y, False, False)
-            if lim is not None and s < lim[0] - 1.5 * coarse_res:
-                add(0, 0, lim[1] + " (coarse)", s, x, y, lim[0], lim[2], coarse_res)
+            if lim is not None and s_ < lim[0] - 1.5 * coarse_res:
+                add(0, 0, lim[1] + " (coarse)", s_, s_, x, y, lim[0], lim[2], coarse_res)
     return found, len(fine), len(rest)
 
 
@@ -339,7 +339,9 @@ def run(ctx, fabr, in_bga, want=("gap", "acid", "space"), log=print):
 
     widest = max([v for v in (space, padtrk) if v is not None] +
                  [e["value"] for k, e in fabr.limits.items() if k.startswith("track_space_mm@")])  if do_space else None
-    space_px = (widest + 1.5 * g.res) / g.res if do_space else None
+    # stage 1 keeps every place the 25 um raster puts within three pixels of the limit (each copper edge
+    # is drawn to within a pixel, so a gap at the limit reads at most two pixels wide of it)
+    space_px = (widest + 3 * g.res) / g.res if do_space else None
     def layer(li):
         lname = b.layers[li]
         cur["key"] = fabr.layer_key("track_space_mm", lname)
@@ -370,13 +372,23 @@ def run(ctx, fabr, in_bga, want=("gap", "acid", "space"), log=print):
                 what = "enclosed opening" if f["enclosed"] else "gap"
                 msg = (f"{what} of {f['width_mm'] * 1000:.0f} um in copper of one net, {'at least ' if f['cut'] else ''}"
                        f"{f['length_mm']:.2f} mm long")
-                if tw is not None:
+                field = in_bga(f["x"], f["y"])
+                sev = "info"
+                if tw is not None and field and bga_sp is not None:
+                    # in a BGA fan-out the fabricator accepts its BGA spacing (JLCPCB: "3 mil is acceptable in BGA
+                    # fan-outs"): a same-net gap is judged against that there
+                    n_track += f["width_mm"] < bga_sp - res
+                    sev = "warning" if f["width_mm"] < bga_sp - res else "info"
+                    msg += (f", beside a {tw:g} mm track in a BGA fan-out, where the fabricator accepts {bga_sp * 1000:.0f} um "
+                            f"({fabr.src('bga_track_mm')}); its {snet:g} mm same-net figure applies outside the fields")
+                elif tw is not None:
                     n_track += 1
+                    sev = "warning"
                     msg += f", beside a {tw:g} mm track (same-net track spacing {snet:g} mm, {fabr.src('same_net_spacing_mm')})"
                 else:
                     msg += (f", between pads or pour copper only: the fabricator's {snet:g} mm figure is for tracks, "
                             f"so this is listed, not judged")
-                f_gap.append(finding("same_net_gap", "warning" if tw is not None else "info", msg, b.net_names[f["net"]], lname,
+                f_gap.append(finding("same_net_gap", sev, msg, b.net_names[f["net"]], lname,
                                      f["x"], f["y"], value=round(f["width_mm"], 4), limit=snet, unit="mm",
                                      length_mm=round(f["length_mm"], 3), kind="track" if tw is not None else "copper",
                                      basis=fabr.src("same_net_spacing_mm"), field="BGA" if in_bga(f["x"], f["y"]) else ""))
@@ -387,16 +399,24 @@ def run(ctx, fabr, in_bga, want=("gap", "acid", "space"), log=print):
         if do_space:
             fs, n_fine, n_left = measure_spacing(b, li, pts, limit_of, res, p["tile_mm"], sp_cfg["max_tiles"], g.res,
                                                  max(v for v in (cur["space"], padtrk) if v is not None) + 0.02)
-            for (na, nb, kind), e in sorted(fs.items(), key=lambda kv: kv[1]["gap_mm"] - kv[1]["limit"]):
+            from . import exact
+            for (na, nb, kind), e in sorted(fs.items(), key=lambda kv: kv[1]["lo"] - kv[1]["limit"]):
                 names = f"{b.net_names[na]} / {b.net_names[nb]}" if na or nb else "nets not resolved"
-                below = e["gap_mm"] < e["limit"] - e["res"]
+                coarse = "(coarse)" in kind
+                below = e["hi"] < e["limit"] - exact.TOL if not coarse else True
                 n_below += below
-                how = (f"below the {e['limit'] * 1000:.0f} um minimum" if below else
-                       f"within the measuring slack ({e['res'] * 1000:g} um) of the {e['limit'] * 1000:.0f} um minimum, so neither a pass nor a fail can be shown")
-                f_sp.append(finding("fab_space", "error" if below else "warning", f"{names}: {e['gap_mm'] * 1000:.0f} um apart, {how} "
-                                    f"for {kind.replace(' (coarse)', '')} ({fabr.src(e['key'])}); "
-                                    f"{e['n'] * e['res']:.2f} mm of it, measured at {e['res'] * 1000:g} um",
-                                    b.net_names[na] if na else "", lname, e["x"], e["y"], value=round(e["gap_mm"], 4), limit=e["limit"],
+                if coarse:
+                    how = f"below the {e['limit'] * 1000:.0f} um minimum on the 25 um raster (this tile was not measured exactly: max_tiles)"
+                elif below:
+                    how = f"below the {e['limit'] * 1000:.1f} um minimum"
+                else:
+                    how = (f"between {e['lo'] * 1000:.1f} and {e['hi'] * 1000:.1f} um: one of the two is a custom pad or text polygon, "
+                           f"which lies up to {exact.POLY_ERR * 1000:g} um inside its true shape, and the {e['limit'] * 1000:.0f} um "
+                           f"minimum falls in between")
+                gap_txt = f"{e['hi'] * 1000:.1f} um" if e["lo"] == e["hi"] else f"{e['lo'] * 1000:.1f} to {e['hi'] * 1000:.1f} um"
+                f_sp.append(finding("fab_space", "error" if below else "warning", f"{names}: {gap_txt} apart, {how} "
+                                    f"for {kind.replace(' (coarse)', '')} ({fabr.src(e['key'])}); the closest place is shown",
+                                    b.net_names[na] if na else "", lname, e["x"], e["y"], value=round(e["hi"], 5), limit=e["limit"],
                                     unit="mm", aggressor=b.net_names[nb] if nb else "", kind=kind, basis=fabr.src(e["key"])))
             est = pts[:, 2].min() if len(pts) else None
             m_sp = {"min_gap_estimate_mm": None if est is None else round(float(est), 3), "tiles_measured": n_fine,
@@ -430,7 +450,8 @@ def run(ctx, fabr, in_bga, want=("gap", "acid", "space"), log=print):
     if "space" in want:
         out["fab_space"] = result("fab_space", "MF12", "Copper spacing between nets, measured", {
             "track_space_mm": space, "pad_to_track_mm": padtrk, "bga_track_mm": bga_sp, "bga_pad_to_track_mm": bga_pt,
-            "res_mm": res, "tolerance_mm": round(res, 5)}, m_sp, f_sp)
+            "measured": "exactly on the vector data (tracks, arcs, vias, pads, fills, graphics and text as KiCad describes them)",
+            "tolerance_mm": 1e-5}, m_sp, f_sp)
     if "acid" in want:
         out["acid_trap"] = {"rule": "acid_trap", "spec": "MF1", "title": "Acute corners in copper of one net",
                             "params": {"acute_deg": p["acute_deg"], "listed_below_deg": judge_at, "ball_mm": rp_mm, "res_mm": res},

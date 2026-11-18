@@ -69,8 +69,9 @@ def _progress(out_dir, report, t0, starting):
         with open(os.path.join(out_dir, "progress.json"), "w") as f:
             json.dump(st, f)
         if done:
+            from .paths import portable
             with open(os.path.join(out_dir, "report.partial.json.tmp"), "w") as f:
-                json.dump(report, f, default=str)
+                json.dump(portable(json.loads(json.dumps(report, default=str)), out_dir), f)
             os.replace(os.path.join(out_dir, "report.partial.json.tmp"), os.path.join(out_dir, "report.partial.json"))
     except OSError:
         pass
@@ -249,8 +250,9 @@ def run_loaded(b, cfg, ctx, checks=None, out_dir=None, label=None, log=print, ru
     _progress(out_dir, report, t0, None)
     report["seconds"] = round(time.time() - t0, 1)
     path = os.path.join(out_dir, "report.json")
+    from .paths import portable
     with open(path + ".tmp", "w") as f:
-        json.dump(report, f, indent=1, default=_jd)
+        json.dump(portable(json.loads(json.dumps(report, default=_jd)), out_dir), f, indent=1)
     os.replace(path + ".tmp", path)
     log(f"report: {path}  ({report['seconds']} s)")
     return report, (b, cfg, ctx), out_dir

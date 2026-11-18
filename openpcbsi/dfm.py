@@ -258,6 +258,11 @@ def order_checklist(ctx, fabr, rules):
     if fd and fd["params"].get("hole_spacing") == "centre to centre":
         out.append({"item": "hole-to-hole spacing", "state": "read centre to centre: confirm with the fabricator", "set_in_config": True,
                     "basis": "board config [dfm] hole_spacing"})
+    asm = rules.get("assembly")
+    nf = (asm or {}).get("metrics", {}).get("board", {}).get("no_fiducials_on") or []
+    if nf:
+        out.append({"item": "fiducials", "state": f"none on the {' and '.join(nf)} of the board: put them on the panel's edge rails",
+                    "set_in_config": False, "basis": fabr.src("fiducials_required")})
     if fabr.get("rails_required"):
         out.append({"item": "edge rails", "state": f"required for the {cfg['dfm'].get('assembly_service', 'standard')} assembly service: "
                     f"add them to the panel or order them", "set_in_config": False, "basis": fabr.src("rails_required")})
@@ -285,12 +290,20 @@ def rule_audit(ctx, fabr, measured=()):
     `dfm` itself (the check named in AUDIT): that is listed (info) when the check runs in this review,
     and a warning only when it does not."""
     b = ctx.b
+    fs0 = []
+    seen = max([d for d in (fabr.retrieved, getattr(fabr, "verified", None)) if d] or [""])
+    age = fab_mod.age_days(seen) if seen else None
+    if age is None or age > fab_mod.STALE_DAYS:
+        fs0.append(finding("rule_audit", "warning", f"the {fabr.name} profile was last read from the fabricator's pages "
+                           + (f"{age} days ago ({seen})" if age is not None else "on no recorded date")
+                           + f": its figures may have changed. Run `openpcbsi fab-check {os.path.splitext(os.path.basename(fabr.path))[0] if getattr(fabr, 'path', None) else ''}`"
+                           f" and update the profile", kind="profile_age", basis="profile"))
     sev_of = lambda by: "info" if by in measured else "warning"
     how = lambda by: (f"`dfm` measures it in {by} (this review)" if by in measured else
                       f"`dfm` measures it in {by}, which did not run in this review")
     stem = os.path.splitext(b.path)[0]
     pro = stem + ".kicad_pro"
-    fs, rows = [], []
+    fs, rows = list(fs0), []
     if not os.path.exists(pro):
         fs.append(finding("rule_audit", "warning", f"no KiCad project file beside the board: KiCad's DRC judges clearance, annular rings "
                           f"and holes against KiCad's default rules, not against {fabr.name}'s limits", kind="no_project"))
@@ -464,7 +477,7 @@ def rule_fab_drill(ctx, fabr):
                         f"of {rmin:g} mm ({fabr.src('pth_ring_min_mm')}: {fabr.limits['pth_ring_min_mm']['note']})", p["x"], p["y"],
                         part=p["ref"], net=p["net"], limit=rmin, unit="mm", basis=fabr.src("pth_ring_min_mm"), kind="pth_ring:" + p["ref"])
             elif rrec is not None and rg < rrec - TOL:
-                agg.add(("pth_ring_rec", p["ref"]), "warning", rg, f"{p['ref']}.{p['num']}: annular ring of {rg:.3f} mm, below the recommended "
+                agg.add(("pth_ring_rec", p["ref"]), "info", rg, f"{p['ref']}.{p['num']}: annular ring of {rg:.3f} mm, below the recommended "
                         f"{rrec:g} mm ({fabr.src('pth_ring_rec_mm')})", p["x"], p["y"], part=p["ref"], net=p["net"], limit=rrec, unit="mm",
                         basis=fabr.src("pth_ring_rec_mm"), kind="pth_ring_rec:" + p["ref"])
             if slot is not None and abs(dx - dy) > 1e-6 and small < slot - 1e-6:
@@ -931,6 +944,12 @@ def _area_perimeter(rings):
     return a, float(np.hypot(np.diff(q[:, 0]), np.diff(q[:, 1])).sum())
 
 
+def _few(refs, n=3):
+    """At most n references, then how many more (a message names a few parts, dfm.json lists them all)."""
+    refs = list(refs)
+    return ", ".join(refs[:n]) + (f" and {len(refs) - n} more" if len(refs) > n else "")
+
+
 def rule_paste(ctx, fabr):
     b, cfg = ctx.b, ctx.cfg
     ar_min, as_min = fabr.judge("stencil_area_ratio_min", "paste"), fabr.judge("stencil_aspect_ratio_min", "paste")
@@ -963,7 +982,7 @@ def rule_paste(ctx, fabr):
         opts = sorted({round(x, 3) for x in list(ts) + [0.13] if lo_ - 1e-9 <= x <= hi_ + 1e-9} | {t})
         if len(opts) > 1:
             tsrc += (f"; judged also at {', '.join(f'{x:g}' for x in opts if x != t)} mm, within the guide's {lo_:g} to {hi_:g} mm"
-                     + (f" (the ranges of {', '.join(pred['range_from'])}, which share the commonly used thickness)" if len(pred.get("range_from") or []) > 1 else ""))
+                     + (f" (the ranges of {_few(pred['range_from'])}, which share the commonly used thickness)" if len(pred.get("range_from") or []) > 1 else ""))
             assumption = (f"stencil {t:g} mm, as {fabr.name}'s guide gives for {pred['part']} ({pred['row']}); its recommended range is "
                           f"{lo_:g} to {hi_:g} mm, and the apertures were judged at {', '.join(f'{x:g}' for x in opts)} mm; state the "
                           f"thickness in the order or set [dfm] stencil_mm")
@@ -1010,7 +1029,7 @@ def rule_paste(ctx, fabr):
             agg.add(("ratio_range", p["ref"]), "warning", A / (P * thick), f"{pname}: paste aperture {w:.2f} x {h:.2f} mm prints with the "
                     f"predicted {t:g} mm stencil (area ratio {ar:.2f}) but not with a {thick:g} mm one (area ratio {A / (P * thick):.2f}, "
                     f"aspect {small / thick:.1f}; IPC-7525: {ar_min:g} and {as_min:g}), which {fabr.name}'s guide also recommends for "
-                    f"{', '.join(pred.get('range_from') or [pred['part']])}: order a stencil of {ok_to:.3f} mm or thinner", p["x"], p["y"], part=p["ref"], net=p["net"], layer=lay,
+                    f"{_few(pred.get('range_from') or [pred['part']])}: order a stencil of {ok_to:.3f} mm or thinner", p["x"], p["y"], part=p["ref"], net=p["net"], layer=lay,
                     limit=ar_min, unit="", basis="industry standard (IPC-7525)", kind="ratio_range:" + p["ref"])
     for ref, fp in b.fps.items():                              # a placed SMD part with pads but no paste at all
         pads = [p for p in b.pads_by_ref.get(ref, []) if p["kind"] == "smd"]
@@ -1100,9 +1119,11 @@ def rule_part_spacing(ctx, fabr):
             if d < limit - TOL:
                 big, small = (A, B) if cls_i[A["cls"]] >= cls_i[B["cls"]] else (B, A)
                 chips = cls_i[big["cls"]] < 5                      # two chips: one finding per pair; else one per larger part
-                agg.add((big["ref"], small["ref"]) if chips else (big["ref"],), "warning", d - limit,
+                # the assembler's table is a recommendation, not a limit: listed (info), not judged
+                agg.add((big["ref"], small["ref"]) if chips else (big["ref"],), "info", d - limit,
                         f"{A['ref']} ({A['cls']}) and {B['ref']} ({B['cls']}): {d:.2f} mm apart outline to outline (pads and body), "
-                        f"below the {limit:g} mm recommended between these packages ({fabr.src('part_spacing')})", (A["x"] + B["x"]) / 2,
+                        f"below the {limit:g} mm the assembler recommends between these packages ({fabr.src('part_spacing')}; a "
+                        f"recommendation, not a limit: listed, not judged)", (A["x"] + B["x"]) / 2,
                         (A["y"] + B["y"]) / 2, part=A["ref"], layer=b.layers[0 if A["side"] == "F" else -1], limit=limit, unit="mm",
                         basis=fabr.src("part_spacing") + ", recommended", kind=f"{big['ref']}/{small['ref']}" if chips else big["ref"])
     fs = agg.findings("parts closer than recommended")
@@ -1155,16 +1176,22 @@ def rule_assembly(ctx, fabr):
                     f"({fabr.src(key)})", fp["x"], fp["y"], part=ref, limit=limit, unit="mm", basis=fabr.src(key), kind="pitch:" + ref)
     fid = {s: [r for r, fp in b.fps.items() if _side(b, r) == s and ("FIDUCIAL" in (fp.get("fpid") or "").upper()
                                                                    or r.upper().startswith(("FID", "FD")))] for s in ("F", "B")}
+    no_fid = []
     if fabr.judge("fiducials_required", "assembly"):
+        rails = bool(fabr.get("rails_required"))
         for s in ("F", "B"):
             if sides[s] and not fid[s]:
-                agg.add(("fiducials", s), "warning", 0.0, f"{len(sides[s])} SMD parts on the {'front' if s == 'F' else 'back'} and no fiducial "
-                        f"there; the {svc} lists fiducials as necessary ({fabr.src('fiducials_required')}). They may instead be on the panel "
-                        f"rails, which this review does not see", layer=b.layers[0 if s == "F" else -1], basis=fabr.src("fiducials_required"),
-                        kind="fiducials:" + s)
+                no_fid.append("front" if s == "F" else "back")
+                # with edge rails (which the service requires anyway) the fiducials can be on the rails: an
+                # item of the order checklist, not a warning on the board
+                agg.add(("fiducials", s), "info" if rails else "warning", 0.0,
+                        f"{len(sides[s])} SMD parts on the {'front' if s == 'F' else 'back'} and no fiducial there; the {svc} lists "
+                        f"fiducials as necessary ({fabr.src('fiducials_required')})"
+                        + ("; the edge rails it requires can carry them (order checklist)" if rails else ""),
+                        layer=b.layers[0 if s == "F" else -1], basis=fabr.src("fiducials_required"), kind="fiducials:" + s)
     metrics = {"board": {"smd_parts_front": len(sides["F"]), "smd_parts_back": len(sides["B"]), "fiducials_front": len(fid["F"]),
                          "fiducials_back": len(fid["B"]), "tightest_pitch_mm": None if tight is None else round(tight, 3),
-                         "rails_required": fabr.get("rails_required")}}
+                         "rails_required": fabr.get("rails_required"), "no_fiducials_on": no_fid}}
     return dict(result("assembly", "MF18", "What the assembly service accepts", {"service": svc}, metrics, agg.findings("parts")),
                 checked=len(placed))
 
@@ -1172,11 +1199,28 @@ def rule_assembly(ctx, fabr):
 # ------------------------------------------------------------------------------------------------
 # MF20: the files that are sent
 
+EXIT_ASSUMED = 4    # exit code of "pass with assumptions" (0 pass, 1 warn, 2 fail, 3 could not check)
+PLOT_MARK = ".openpcbsi-plot"            # marks a folder of plots openpcbsi made (and may empty)
+
+
 def _plot(board_path, layers, od, log):
+    """Plot the board into `od`. The folder is emptied first only if openpcbsi made it (it holds the
+    PLOT_MARK file); a folder of that name that openpcbsi did not make, and that is not empty, is
+    refused rather than cleared. With OPENPCBSI_NO_REFILL the zones are plotted as stored (as the reader
+    reads them); otherwise kicad-cli refills them first, as the reader's copy was."""
+    stem = os.path.splitext(os.path.basename(board_path))[0]
+    if os.path.isdir(od) and os.listdir(od):
+        ours = os.path.exists(os.path.join(od, PLOT_MARK)) or all(f.startswith(stem) for f in os.listdir(od))
+        if not ours:
+            raise RuntimeError(f"{od} exists and was not made by openpcbsi: not emptied. Choose another -o folder, or remove it")
+        for f in os.listdir(od):
+            fp = os.path.join(od, f)
+            if os.path.isfile(fp) and f != PLOT_MARK:
+                os.remove(fp)
     os.makedirs(od, exist_ok=True)
-    for f in os.listdir(od):
-        os.remove(os.path.join(od, f))
-    cmds = [["kicad-cli", "pcb", "export", "gerbers", "-o", od + os.sep, "-l", ",".join(layers), "--no-protel-ext", "--check-zones", board_path],
+    open(os.path.join(od, PLOT_MARK), "w").write("plots made by openpcbsi dfm; this folder is emptied on the next run\n")
+    refill = [] if os.environ.get("OPENPCBSI_NO_REFILL") else ["--check-zones"]
+    cmds = [["kicad-cli", "pcb", "export", "gerbers", "-o", od + os.sep, "-l", ",".join(layers), "--no-protel-ext"] + refill + [board_path],
             ["kicad-cli", "pcb", "export", "drill", "-o", od + os.sep, "--format", "excellon", "--excellon-units", "mm",
              "--excellon-zeros-format", "decimal", "--drill-origin", "absolute", "--excellon-separate-th", board_path],
             ["kicad-cli", "pcb", "export", "pos", "--format", "csv", "--units", "mm", "--side", "both", "-o",
@@ -1223,7 +1267,9 @@ def rule_output(ctx, fabr, od, gerber_dir, log):
                     checked=0, unchecked="the files could not be plotted")
     own = _match_files(ctx, src, False, cmd, log)
     reader_bad = [f for f in own["fs"] if f["severity"] == "error"]
-    fs = [dict(f, severity="warning", kind="reader:" + (f.get("kind") or ""), msg="KiCad's plot of the board and the reader disagree: " + f["msg"])
+    fs = [dict(f, severity="warning", kind="reader:" + (f.get("kind") or ""),
+               msg="KiCad's plot of the board differs from the geometry the checks worked on: " + f["msg"]
+               + " (copper or an opening the reading lacks, misplaces or draws otherwise: the checks did not judge it as plotted)")
           if f["severity"] == "error" else f for f in own["fs"]]
     metrics = {"plotted": own["metrics"]}
     params = dict(own["params"], plotted=src)
@@ -1231,8 +1277,8 @@ def rule_output(ctx, fabr, od, gerber_dir, log):
     unchecked = ""
     assumption = None
     if reader_bad:
-        unchecked = (f"KiCad's plot of the board and the reader disagree in {len(reader_bad)} places: the checks may have worked on "
-                     f"wrong geometry")
+        unchecked = (f"KiCad's plot of the board differs from the geometry the checks worked on in {len(reader_bad)} places: what "
+                     f"is plotted there was not judged")
     elif not own["compared"]:
         unchecked = "no plotted file could be compared"
     if gerber_dir:
@@ -1249,8 +1295,10 @@ def rule_output(ctx, fabr, od, gerber_dir, log):
         params["source"] = "plotted now by kicad-cli (no --gerbers)"
         assumption = (f"the files sent are the ones plotted in {src}: no --gerbers DIR was given, so files plotted earlier "
                       f"were not checked")
-        fs.append(finding("output_match", "info", f"the files in {src} were plotted from the board just now and agree with what was "
-                          f"checked; files plotted earlier were not seen: send these, or check the ones you will send with --gerbers DIR",
+        fs.append(finding("output_match", "info", f"the files in {src} were plotted from the board just now"
+                          + (" and agree with what was checked" if not reader_bad else
+                             f"; they differ from what was checked in {len(reader_bad)} places (listed)")
+                          + "; files plotted earlier were not seen: send these, or check the ones you will send with --gerbers DIR",
                           kind="plotted"))
     out = dict(result("output_match", "MF20", "The files that are sent against the geometry that was checked", params, metrics, fs),
                checked=checked, unchecked=unchecked)
@@ -1971,7 +2019,7 @@ def run(board, cfg_path=None, fab=None, checks=None, out_dir=None, waivers=None,
     assumptions = [{"check": n, "assumption": r["assumption"]} for n, r in rules.items() if r.get("assumption") and n in ran]
     if status == "pass" and assumptions:
         status = "pass with assumptions"
-        code = max(code, 1)
+        code = EXIT_ASSUMED
     checklist = order_checklist(ctx, fabr, rules)
     # a rule that ran and could not check leaves the verdict open: no pass or warn stands on it
     blocked = [c for c in per if c["tier"] == "rule" and c["status"] == "could not check"]
@@ -2017,10 +2065,11 @@ def run(board, cfg_path=None, fab=None, checks=None, out_dir=None, waivers=None,
           "rules": list(rules.values()), "rankings": list(ranks.values()), "bga_fields": bga_refs, "not_checked": NOT_CHECKED,
           "observed": obs, "judge": judge or None, "images": images, "marker_board": marker, "seconds": round(time.time() - t0, 1)}
     path = os.path.join(od, "dfm.json")
+    from .paths import portable
     for pth in [path] + ([json_out] if json_out else []):
         with open(pth, "w") as fh:
-            json.dump(ev, fh, indent=1, default=runmod._jd)
-    write_html(ev, os.path.join(od, "dfm.html"))
+            json.dump(portable(json.loads(json.dumps(ev, default=runmod._jd)), os.path.dirname(os.path.abspath(pth))), fh, indent=1)
+    write_html(portable(json.loads(json.dumps(ev, default=runmod._jd)), od), os.path.join(od, "dfm.html"))
     log("")
     log(f"rules ({fabr.name} profile; these give the verdict):")
     for c in per:
@@ -2212,7 +2261,7 @@ def write_html(ev, path):
                  f"marched through the oven of the board run, against the lag difference plus that direction's belt term (the first "
                  f"{p['detail']} layouts). Parts with the same layout and result share a row. The window's edge follows the "
                  f"{e(p['edge'])}.</p><div class=wrap><table><tr><th>Parts</th><th>Package</th><th class=n>dt (s)</th>"
-                 "<th>range (s)</th><th class=n>belt, largest (s)</th><th>check: oven / lag + belt (s)</th><th>melts first</th><th>melts last</th><th>copper leaving the pads (mm)</th>"
+                 "<th>range (s)</th><th>rank range</th><th class=n>belt, largest (s)</th><th>check: oven / lag + belt (s)</th><th>melts first</th><th>melts last</th><th>copper leaving the pads (mm)</th>"
                  "<th class=n>toe (mm)</th><th class=n>pad areas</th></tr>")
         for x in r["rows"][:30]:
             refs = ", ".join(x["refs"][:5]) + (f" +{x['n'] - 5}" if x["n"] > 5 else "")
@@ -2220,13 +2269,18 @@ def write_html(ev, path):
                             + (" +via in pad" if q["vias_in_pad"] else "") + (f" +{q['plane_vias']} plane via" if q["plane_vias"] else "")
                             for q in x["pads"])
             rng = f"{x['dt_range_s'][0]:g} to {x['dt_range_s'][1]:g}" if x.get("dt_range_s") else ""
+            rr = x.get("rank_range") or [x.get("rank"), x.get("rank")]
             H.append(f"<tr><td>{e(refs)}</td><td>{e(x['package'])}</td><td class=n>{x['dt_s']:g}</td><td>{rng}</td>"
+                     f"<td>{rr[0] if rr[0] == rr[1] else f'{rr[0]} to {rr[1]}'}</td>"
                      f"<td class=n>{x.get('belt_max_s', 0):.2f}</td>"
-                     f"<td>{'' if not x.get('oven_check') else format(x['oven_check']['oven_s'], 'g') + ' / ' + format(x['oven_check']['lag_plus_belt_s'], 'g')}</td>"
+                     f"<td>{'' if not x.get('oven_check') else format(x['oven_check']['oven_s'], 'g') + ' / ' + format(x['oven_check']['lag_plus_belt_s'], 'g') + ('' if x['oven_check'].get('agrees', True) else ' (disagree: not resolved)')}</td>"
                      f"<td>{e(str(x['first_pad']))} {e(x['first_net'])}</td><td>{e(str(x['last_pad']))} {e(x['last_net'])}</td>"
                      f"<td class=mut>{e(ent)}</td><td class=n>{x['land']['toe_mm']:.2f}</td><td class=n>{x['land']['area_ratio']:g}</td></tr>")
-        H.append(f"</table></div><p class=mut>The {min(30, len(r['rows']))} layouts with the largest difference of {r['summary']['layouts']} "
-                 f"({r['summary']['chips']} chips); all are in dfm.json.</p>")
+        sm = r["summary"]
+        H.append(f"</table></div><p class=mut>The {min(30, len(r['rows']))} layouts with the largest difference of {sm['layouts']} "
+                 f"({sm['chips']} chips); all are in dfm.json. {e(sm.get('top_resolved', ''))}. What explains the order "
+                 f"({e(sm.get('explained_note', ''))}): "
+                 + e(", ".join(f"{k} {v}" for k, v in (sm.get("explained_by") or {}).items() if v is not None)) + ".</p>")
     if ev.get("observed"):
         o = ev["observed"]
         H.append(f"<h2>Observed defects</h2><p class=mut>{o['defects']} defective parts on {o.get('boards_built')} boards built, from "

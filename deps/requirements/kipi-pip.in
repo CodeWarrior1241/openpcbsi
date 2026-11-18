@@ -1,0 +1,3 @@
+# pip for deps/kipi-venv, installed (by hash) over the venv's bundled pip before kipi.txt.
+# pythons: 3.12 3.13
+pip==26.3

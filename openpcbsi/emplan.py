@@ -9,13 +9,27 @@ the standard fix as a variant, so the 3D result says whether the fix is worth it
 
 Fast class: Nyquist at or above `[em] fast_ghz` (default 3 GHz). A job is a region spec for region3d
 (nets + box) plus `variant`; `evaluate --em plan` lists them, `--em run` runs them (minutes each).
+
+Each planned box is then fitted to region3d's own pre-flight (fit_box): on a real board another net's
+track, pad or via often ends near a box edge, which the pre-flight refuses. The fit moves each side that
+has a problem, a step at a time, outwards up to FIT_GROW or inwards down to the features the job is about
+(they stay FIT_CORE clear of the edge), keeping the same ports, and keeps the first box that passes. A job
+whose box cannot be fitted says so (`fit.ok` false, `fit.why` the remaining problems).
 """
 import math
 import re
 
+from .si import safe_name
+
 HALF = 3.0          # mm around a point discontinuity
 CLEAR = 2.5         # mm from the features to the box edge: the PML plus 8 cells (see region3d pre-flight)
 MAX_JOBS = 12
+FIT_STEP = 0.25     # mm: one move of a box side
+FIT_GROW = 3.0      # mm: a side moves out by at most this
+FIT_CORE = 0.5      # mm: the job's own features stay at least this far inside the box
+FIT_POINT = 1.0     # mm: half-size of the core of a point discontinuity (split, connector, breakout)
+FIT_TRIES = 48      # pre-flight builds per job
+PLANNER_KEYS = ("kind", "parts", "core", "fit", "planned_box", "result", "variant_result")
 
 
 def _fast_nets(ctx, fast_ghz):
@@ -31,6 +45,11 @@ def _box(x, y, h=HALF):
     return [round(x - h, 3), round(y - h, 3), round(x + h, 3), round(y + h, 3)]
 
 
+def _name(*parts):
+    """A job name from part and net names: also a file and folder name (hierarchical nets are '/sheet/NET')."""
+    return "_".join(safe_name(p) for p in parts)
+
+
 def _bbox(pts, clear=CLEAR):
     """The features' bounding box grown by `clear` (pads: their size counted)."""
     x0 = min(p[0] - p[2] / 2 for p in pts) - clear
@@ -40,7 +59,7 @@ def _bbox(pts, clear=CLEAR):
     return [round(v, 3) for v in (x0, y0, x1, y1)]
 
 
-def plan(ctx, report, fast_ghz=3.0):
+def plan(ctx, report, fast_ghz=3.0, fit=True, log=None):
     b = ctx.b
     fast = _fast_nets(ctx, fast_ghz)
     jobs = []
@@ -63,8 +82,8 @@ def plan(ctx, report, fast_ghz=3.0):
         others = [r for r, ps in b.pads_by_ref.items() if r != ref and len(ps) == 2 and {q["net"] for q in ps} <= set(key)]
         refs = [ref] + others[:1]
         pts = [(p["x"], p["y"], p["sx"], p["sy"]) for r in refs for p in b.pads_by_ref[r]]
-        jobs.append({"kind": "series_cap", "name": f"cap_{ref}", "nets": list(key), "parts": refs,
-                     "box": _bbox(pts),
+        jobs.append({"kind": "series_cap", "name": _name("cap", ref), "nets": list(key), "parts": refs,
+                     "box": _bbox(pts), "core": _bbox(pts, FIT_CORE),
                      "variant": {"name": "cut-out", "void_under": refs, "margin_mm": 0.15}})
     # layer changes on fast nets
     seen = set()
@@ -79,7 +98,8 @@ def plan(ctx, report, fast_ghz=3.0):
         x, y = float(b.vias["x"][k]), float(b.vias["y"][k])
         vs = [(float(b.vias["x"][q]), float(b.vias["y"][q]), float(b.vias["d"][q]), float(b.vias["d"][q]))
               for q in range(len(b.vias["x"])) if b.net_names[int(b.vias["net"][q])] in key]
-        jobs.append({"kind": "layer_change", "name": f"via_{net}", "nets": list(key), "box": _bbox(vs + [(x + 0.7, y, 0.3, 0.3), (x - 0.7, y, 0.3, 0.3)]),
+        feat = vs + [(x + 0.7, y, 0.3, 0.3), (x - 0.7, y, 0.3, 0.3)]
+        jobs.append({"kind": "layer_change", "name": _name("via", net), "nets": list(key), "box": _bbox(feat), "core": _bbox(feat, FIT_CORE),
                      "variant": {"name": "return vias", "add_vias": [[round(x + 0.7, 3), round(y, 3)], [round(x - 0.7, 3), round(y, 3)]]}})
     # split crossings
     for rule in report["checks"].get("drc", []):
@@ -90,7 +110,8 @@ def plan(ctx, report, fast_ghz=3.0):
             if f["severity"] != "error" or f["net"] in done:
                 continue
             done |= set(pair(f["net"]))
-            jobs.append({"kind": "split", "name": f"split_{f['net']}", "nets": pair(f["net"]), "box": _box(f["x"], f["y"]),
+            jobs.append({"kind": "split", "name": _name("split", f["net"]), "nets": pair(f["net"]), "box": _box(f["x"], f["y"]),
+                         "core": _box(f["x"], f["y"], FIT_POINT),
                          "variant": {"name": "solid reference", "fill_layer": f.get("ref_layer"), "fill_box": _box(f["x"], f["y"], 1.0)}})
             break
     # connector launches
@@ -100,15 +121,118 @@ def plan(ctx, report, fast_ghz=3.0):
         hits = [p for p in b.pads_by_ref[ref] if p["net"] in fast]
         if hits:
             p = hits[0]
-            jobs.append({"kind": "connector", "name": f"launch_{ref}_{p['net']}", "nets": pair(p["net"]), "box": _box(p["x"], p["y"])})
+            jobs.append({"kind": "connector", "name": _name("launch", ref, p["net"]), "nets": pair(p["net"]), "box": _box(p["x"], p["y"]),
+                         "core": _box(p["x"], p["y"], FIT_POINT)})
     # the longest breakout neck
     bo = [r for r in report["checks"].get("drc", []) if r["rule"] == "breakout"]
     if bo and bo[0]["findings"]:
         f = max(bo[0]["findings"], key=lambda q: q.get("neck_mm", 0))
-        jobs.append({"kind": "breakout", "name": f"breakout_{f['net']}", "nets": pair(f["net"]), "box": _box(f["x"], f["y"])})
+        jobs.append({"kind": "breakout", "name": _name("breakout", f["net"]), "nets": pair(f["net"]), "box": _box(f["x"], f["y"]),
+                     "core": _box(f["x"], f["y"], FIT_POINT)})
+    used = set()
     for j in jobs:
         j.setdefault("fmax_ghz", 20)
-    return jobs[:MAX_JOBS]
+        n, k = j["name"], 2
+        while j["name"] in used:              # two names that differ only in characters safe_name drops
+            j["name"], k = f"{n}_{k}", k + 1
+        used.add(j["name"])
+    jobs = jobs[:MAX_JOBS]
+    if fit:
+        for j in jobs:
+            fit_box(ctx, j, log=log)
+    return jobs
+
+
+def region_spec(job, variant=False):
+    """The region3d spec of a job: the planner's own keys left out, the fix variant only when asked."""
+    return {k: v for k, v in job.items() if k not in PLANNER_KEYS and (variant or k != "variant")}
+
+
+def _check(ctx, job, box):
+    """region3d's pre-flight of the job's base model in `box`: (pre-flight dict, its set of ports)."""
+    from . import region3d
+    spec = dict(region_spec(job), box=[round(v, 3) for v in box], preflight_only=True)
+    reg = region3d.Region(ctx, spec)
+    reg.build()
+    pf = reg.preflight()
+    return pf, sorted({(p["net"], p["side"]) for p in reg.model["ports"]})
+
+
+SIDE_AX = {"xmin": (0, -1), "ymin": (1, -1), "xmax": (2, +1), "ymax": (3, +1)}   # box index, outward sign
+
+
+def fit_box(ctx, job, log=None, tries=FIT_TRIES):
+    """Fit the job's box to region3d's pre-flight (see the module text); records `fit` in the job and
+    updates `box`. The search is per side: a side whose pre-flight problems name it moves out or in, a
+    step at a time, nearest first, until its problems are gone without adding any elsewhere; the ports
+    (net, side) must stay those of the planned box, so the job still measures what it was planned for."""
+    box0 = list(job["box"])
+    core = job.get("core") or box0
+    job["planned_box"] = box0
+    try:
+        pf, ports0 = _check(ctx, job, box0)
+    except Exception as ex:                       # a model that cannot be built is reported, not raised
+        job["fit"] = {"ok": False, "tries": 1, "why": f"model not built: {type(ex).__name__}: {ex}"}
+        return job
+    n, box = 1, list(box0)
+    lim = {"xmin": (box0[0] - FIT_GROW, core[0]), "ymin": (box0[1] - FIT_GROW, core[1]),
+           "xmax": (core[2], box0[2] + FIT_GROW), "ymax": (core[3], box0[3] + FIT_GROW)}
+    for _ in range(3):                            # rounds: fixing one side can move another's problems
+        if pf["ok"] or n >= tries:
+            break
+        bad = [s for s in SIDE_AX if pf.get("by_side", {}).get(s)]
+        if not bad or pf.get("by_side", {}).get("other"):
+            break                                 # nothing a side move can fix (no reference plane, no port)
+        progress = False
+        for side in bad:
+            if not pf.get("by_side", {}).get(side):
+                continue                          # fixed by an earlier side's move
+            i, sg = SIDE_AX[side]
+            lo, hi = lim[side]
+            steps = []
+            for k in range(1, int(FIT_GROW / FIT_STEP) + 1):
+                for d in (+k, -k):                # out, then in, nearest first
+                    v = round(box[i] + sg * d * FIT_STEP, 3)
+                    if lo - 1e-9 <= v <= hi + 1e-9:
+                        steps.append(v)
+            for v in steps:
+                if n >= tries:
+                    break
+                cand = list(box)
+                cand[i] = v
+                pf2, ports2 = _check(ctx, job, cand)
+                n += 1
+                if ports2 != ports0:
+                    continue
+                if not pf2.get("by_side", {}).get(side) and pf2["n_problems"] < pf["n_problems"]:
+                    box, pf, progress = cand, pf2, True
+                    break
+            if pf["ok"]:
+                break
+        if not progress:
+            break
+    fit = {"ok": bool(pf["ok"]), "tries": n, "moved_mm": [round(b - a, 3) for a, b in zip(box0, box)]}
+    if pf["ok"]:
+        job["box"] = [round(v, 3) for v in box]
+        if job.get("variant"):                   # the fix variant adds copper or vias: check it in the same box
+            from . import region3d
+            try:
+                reg = region3d.Region(ctx, dict(region_spec(job, variant=True), preflight_only=True))
+                reg.build()
+                pv = reg.preflight()
+                fit["variant_ok"] = pv["ok"]
+                if not pv["ok"]:
+                    fit["variant_why"] = "; ".join(pv["problems"][:3])
+            except Exception as ex:
+                fit["variant_ok"], fit["variant_why"] = False, f"model not built: {type(ex).__name__}: {ex}"
+    else:
+        fit["why"] = ("; ".join(pf["problems"][:3]) + (f" (and {pf['n_problems'] - 3} more)" if pf["n_problems"] > 3 else "")
+                      + f"; searched {n} boxes, each side moved up to {FIT_GROW:g} mm out or in to the features")
+    job["fit"] = fit
+    if log:
+        log(f"  3D region {job['name']}: " + (f"box {job['box']} passes pre-flight" + (f" (moved {fit['moved_mm']} mm)" if any(fit['moved_mm']) else "")
+                                            if fit["ok"] else f"no box passes pre-flight: {fit['why']}"))
+    return job
 
 
 def judge(job, res, base=None, cls_tol_pct=10.0):

@@ -17,6 +17,7 @@
 [fab]
 name = "JLCPCB"
 retrieved = "2026-11-16"
+verified = "2026-11-18"        # `openpcbsi fab-check`: every quote below found on its page that day
 
 [fab.pages]
 main = "https://jlcpcb.com/capabilities/pcb-capabilities"
@@ -117,7 +118,7 @@ oz = 1.0
 min_mm = 0.18
 recommended_mm = 0.25
 page = "main"
-quote = "PTH annular ring, 2-layer: 1 oz: Recommended 0.25 mm or above; absolute minimum 0.18 mm"
+quote = "2-layer: 1 oz: Recommended 0.25 mm or above; absolute minimum 0.18 mm"
 
 [[published.pth_ring]]
 layers = [3, 32]
@@ -235,7 +236,7 @@ aspect_ratio_min = 1.5              # IPC-7525: aperture width / stencil thickne
 # `kind` is ic (QFN, QFP, SOP, ...), bga or chip (EIA size); `pitch_mm` the part's pitch (ic, bga).
 [guidance.stencil]
 page = "stencil_guide"
-quote = "Reference table: IC/QFN/QFP 0.4 mm: 0.10-0.12 / 0.10 ... BGA 0.8 mm: 0.13-0.15 / 0.15 (Recommended range / Commonly used)"
+quote = "IC, QFN, QFP 0.3 mm 0.07 – 0.10 mm 0.08 mm; IC, QFN, QFP 0.4 mm 0.10 – 0.12 mm 0.10 mm; IC, QFN, QFP 0.5 mm 0.12 – 0.15 mm 0.12 mm; IC, QFN, QFP 0.65 mm 0.15 – 0.18 mm 0.15 mm; 0201 N/A 0.08 – 0.12 mm 0.10 mm; 0402 N/A 0.10 – 0.13 mm 0.12 mm; BGA 0.4 mm 0.08 – 0.10 mm 0.10 mm; BGA 0.5 mm 0.10 – 0.12 mm 0.10 mm; BGA 0.65 mm 0.12 – 0.13 mm 0.12 mm; BGA 0.8 mm 0.13 – 0.15 mm 0.15 mm; BGA 1.27 mm 0.15 – 0.20 mm 0.15 mm"       # the reference table, row by row: component, pitch, recommended range, commonly used
 finest_pitch_quote = "Give most of your attention to the board's smallest pitch component."
 finest_pitch_page = "stencil_design"
 conflict = "the same article's quick answer gives 0.10 mm for every pitch up to 0.5 mm; its table gives 0.12 mm for 0.5 mm-pitch ICs. The table is used."

@@ -57,8 +57,14 @@ def main(argv=None):
         if x.dest not in ("help",):
             so._add_action(x)
     so.add_argument("--reviewer")
+    so.add_argument("--sign-key", help="SSH private key: sign the record (ssh-keygen -Y sign), authenticating it and the reviewer")
     vs = sub.add_parser("verify-signoff", help="check that a sign-off record still matches its inputs")
     vs.add_argument("record")
+    vs.add_argument("--allowed-signers", help="ssh allowed_signers file: check the record's signature against the reviewer")
+    vs.add_argument("--rerun", action="store_true", help="also evaluate the board again and compare the verdict")
+    fc = sub.add_parser("fab-check", help="re-read a fabricator profile's pages and check that every quoted figure is still there")
+    fc.add_argument("profile", nargs="?", default="jlcpcb")
+    fc.add_argument("--json", dest="json_out")
     i = sub.add_parser("init", help="draft a board config from the board (EV5 detection)")
     i.add_argument("board")
     i.add_argument("-o", "--out")
@@ -129,13 +135,31 @@ def main(argv=None):
     elif getattr(a, "cmd", None) in ("evaluate", "signoff", "check") and not a.board:
         print("openpcbsi: give a board file or --live", file=sys.stderr)
         return 2
+    if a.cmd == "fab-check":
+        from . import fab
+        r = fab.check_pages(a.profile)
+        print(f"{r['name']} profile, read {r['retrieved']} ({fab.age_days(r['retrieved'])} days ago)")
+        for k, v in r["pages"].items():
+            print(f"  page {k}: {'could not be read: ' + v['error'] if v['error'] else 'read'}  {v['url']}")
+        n = len(r["quotes"])
+        print(f"  {n - len(r['missing'])} of {n} quoted figures found on their pages")
+        for m in r["missing"]:
+            print(f"  NOT FOUND [{m['page']}] {m['where']}: \"{m['quote'][:110]}\"" + (f" ({m['note']})" if m.get("note") else ""))
+        if a.json_out:
+            import json
+            json.dump(r, open(a.json_out, "w"), indent=1)
+        print("every quote is still on its page: the profile can be dated today" if not r["missing"] else
+              "the quotes not found above must be checked by hand and the profile updated (figures, quotes, retrieved date)")
+        return 0 if not r["missing"] else 1
     if a.cmd == "verify-signoff":
         from . import signoff
-        good, bad, rec = signoff.verify(a.record)
-        print(f"sign-off of {rec['board']} ({rec['date']}, verdict: {rec['verdict']})")
+        good, bad, rec = signoff.verify(a.record, a.allowed_signers, a.rerun)
+        print(f"sign-off of {rec.get('board')} ({rec.get('date')}, verdict: {rec.get('verdict')})")
         for x in bad:
             print("  " + x)
-        print("record matches its inputs" if good else "record does NOT match its inputs")
+        for x in rec.get("_notes", []):
+            print("  note: " + x)
+        print("record matches its inputs and its evaluation" if good else "record does NOT match its inputs or its evaluation")
         return 0 if good else 1
     if a.cmd in ("evaluate", "signoff"):
         from . import evaluate
@@ -146,7 +170,8 @@ def main(argv=None):
             if a.cmd == "signoff":
                 from . import signoff
                 od = os.path.dirname(_["report"])
-                p, rec = signoff.write(_, od, a.config, a.waivers, a.reviewer)
+                p, rec = signoff.write(_, od, a.config, a.waivers, a.reviewer, a.sign_key,
+                                       {"families": a.families, "checks": a.checks, "stage": a.stage, "no_drc": a.no_drc})
                 print(f"sign-off: {p}\nverdict:  {rec['verdict']}")
         except Exception as ex:  # G21: 3 = could not evaluate
             from .snapshot import InputError
@@ -271,7 +296,12 @@ def main(argv=None):
         spec = tomllib.load(open(a.spec, "rb"))["region"]
         if "nets" in spec:                       # 3D regions with line ports (region3d.py)
             from . import region3d
-            res = region3d.run(ctx, spec, runmod.CACHE, runmod.RUNS)
+            from .snapshot import InputError
+            try:
+                res = region3d.run(ctx, spec, runmod.CACHE, runmod.RUNS)
+            except InputError as ex:             # e.g. OPENPCBSI_OPENEMS_PYTHON not set
+                print(f"openpcbsi region: {ex}", file=sys.stderr)
+                return 3
             path = os.path.join(res["dir"], "result.json")
             pf = res["preflight"]
             if not pf["ok"]:

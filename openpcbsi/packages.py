@@ -70,9 +70,11 @@ def _num(v):
     return float(m.group(0)) if m else None
 
 
-def body_of(fp, cfg):
-    """Heat capacity (J/K) and height of any part: chip table, else the board config, else footprint
-    fields, else a block over the courtyard with the assumed height and moulded-epoxy properties."""
+def body_of(fp, cfg, model=None):
+    """Heat capacity (J/K) and height of a part, from the first of: the board config, a Mass or Height
+    field, the chip table, the part's 3D model (`model`: bodies.read's entry), an estimate for its
+    package class (marked assumed). A part none of these covers gets None: it is left out of a model
+    and listed, never given a guessed body."""
     r = cfg["reflow"]
     spec = r.get("parts", {}).get(fp["ref"], {})
     chip = chip_of(fp)
@@ -101,6 +103,12 @@ def body_of(fp, cfg):
     if chip and height is None:
         return {"C": chip["C"], "height": chip["H"], "area": chip["L"] * chip["W"], "source": chip["source"],
                 "assumed": False}
+    if height is None and model and model.get("volume_mm3", 0) > 0:
+        from .bodies import RHOC
+        return {"C": RHOC * model["volume_mm3"], "height": model["height_mm"], "area": model["area_mm2"],
+                "source": f"3D model: {model['volume_mm3']:.1f} mm3, {model['height_mm']:g} mm tall", "assumed": False, "model": True}
+    if height is None and part_class(fp) not in TYPICAL_HEIGHT_MM:
+        return None
     if height is None:
         # an estimate: the body drawn on the fabrication layer (else the courtyard, which includes its
         # clearance), with a typical height for the package class; the review varies estimated bodies

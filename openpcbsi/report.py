@@ -336,9 +336,11 @@ def write_all(report, ctx_tuple, out_dir, markers=True, log=print):
             log(f"marker board: {os.path.join(out_dir, name)} ({n} markers on User.9)")
         except Exception as e:
             log(f"marker board not written: {e}")
-    p = write_html(report, out_dir, images, zc)
+    from .run import _jd
+    from .paths import portable
+    plain = portable(json.loads(json.dumps(report, default=_jd)), out_dir)
+    p = write_html(plain, out_dir, images, zc)
     with open(os.path.join(out_dir, "report.json"), "w") as f:
-        from .run import _jd
-        json.dump(report, f, indent=1, default=_jd)
+        json.dump(plain, f, indent=1)
     log(f"html: {p}")
     return p

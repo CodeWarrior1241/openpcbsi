@@ -99,7 +99,33 @@ class Board:
         s.SetWidth(MM(0.05))
         self.b.Add(s)
 
+    def graphic_line(self, layer, x1, y1, x2, y2, w):
+        """A graphic line (not a track) on any layer, copper included."""
+        s = pcbnew.PCB_SHAPE(self.b)
+        s.SetShape(pcbnew.SHAPE_T_SEGMENT)
+        s.SetLayer(LAYER[layer])
+        s.SetStart(V(x1, y1))
+        s.SetEnd(V(x2, y2))
+        s.SetWidth(MM(w))
+        self.b.Add(s)
+        return s
+
+    def text(self, layer, txt, x, y, size=1.0, thickness=0.15, angle=0.0):
+        """Board text on any layer (stroke font, centred)."""
+        t = pcbnew.PCB_TEXT(self.b)
+        t.SetText(txt)
+        t.SetLayer(LAYER[layer])
+        t.SetPosition(V(x, y))
+        t.SetTextSize(pcbnew.VECTOR2I(MM(size), MM(size)))
+        t.SetTextThickness(MM(thickness))
+        t.SetTextAngleDegrees(angle)
+        self.b.Add(t)
+        return t
+
     def track(self, layer, pts, w, net):
+        """`net` "" or None draws a track with no net."""
+        if net in ("", None):
+            net = self.b.GetNetInfo().GetNetItem(0)
         ni = self.net(net) if isinstance(net, str) else net
         for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
             t = pcbnew.PCB_TRACK(self.b)
@@ -200,7 +226,7 @@ class Board:
                     side="F" if layer == "F.Cu" else "B")
         return name + "_P", name + "_N"
 
-    def footprint(self, ref, value, x, y, pads, fields=None, courtyard=None, side="F", fpid=None, fab=None):
+    def footprint(self, ref, value, x, y, pads, fields=None, courtyard=None, side="F", fpid=None, fab=None, model=None):
         """pads: list of dicts {num, net, dx, dy, sx, sy, kind: smd|pth, drill, drill_y (an oblong hole), shape: rect|circle|custom, pintype,
         func, mask, prims, only, paste_margin}. `mask` (mm) opens the solder mask and the paste over an SMD pad,
         grown by that margin. A custom pad has an anchor of sx x sy and `prims`, rectangles (x0, y0, x1, y1)
@@ -290,6 +316,10 @@ class Board:
             if d.get("pintype"):
                 p.SetPinType(d["pintype"])
             fp.Add(p)
+        if model:                                     # a 3D model file, as KiCad paths are written (${KICAD10_3DMODEL_DIR}/...)
+            m = pcbnew.FP_3DMODEL()
+            m.m_Filename = model
+            fp.Add3DModel(m)
         for k, v in (fields or {}).items():
             fp.SetField(k, str(v))
         if fab:                                       # the body outline on the fabrication layer

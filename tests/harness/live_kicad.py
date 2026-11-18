@@ -12,7 +12,7 @@ import subprocess
 import time
 
 PCBNEW = os.environ.get("OPENPCBSI_TEST_PCBNEW", "/usr/bin/pcbnew")
-KIPY_PY = os.environ.get("OPENPCBSI_KIPY_PYTHON", "/media/fpgadev/Dev_Tools/virtual_environments/kicad-python/bin/python")
+KIPY_PY = os.environ.get("OPENPCBSI_KIPY_PYTHON", "")       # no default: the kicad-python (kipy) venv's Python
 
 
 KICAD_GUIS = {"kicad", "pcbnew", "eeschema", "pl_editor", "gerbview", "bitmap2component", "pcb_calculator"}
@@ -42,6 +42,9 @@ class LiveKiCad:
         self.proc, self.socket = None, None
 
     def __enter__(self):
+        if not KIPY_PY or not os.path.isfile(KIPY_PY):
+            raise RuntimeError("the live-board test needs kicad-python (kipy): set OPENPCBSI_KIPY_PYTHON to the Python "
+                               f"of an environment that has it installed (now {KIPY_PY or 'unset'})")
         # a copy of the user's KiCad 10 settings (so no first-run wizard blocks the editor), with the API
         # server switched on in the copy only; the originals are only read
         import json

@@ -3,8 +3,8 @@
     python3 -m openpcbsi evaluate --live [--socket PATH] [evaluate options]
     from openpcbsi import api; snap = api.live_snapshot()
 
-The kipy client runs in its own Python (OPENPCBSI_KIPY_PYTHON, by default the kicad-python venv in
-Dev_Tools/virtual_environments) through deps/kipy_driver.py, so openpcbsi never imports kipy. The
+The kipy client runs in its own Python (OPENPCBSI_KIPY_PYTHON, which must be set: the Python of an
+environment with kicad-python installed) through deps/kipy_driver.py, so openpcbsi never imports kipy. The
 driver takes the open board as KiCad file text (unsaved edits included); openpcbsi writes it beside
 copies of the project's .kicad_pro / .kicad_dru (netclasses and custom rules still apply) and reads it
 like any board file, so a live board and the same board saved give the same findings.
@@ -19,18 +19,28 @@ import subprocess
 from .snapshot import InputError
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-KIPY_PY = os.environ.get("OPENPCBSI_KIPY_PYTHON",
-                         "/media/fpgadev/Dev_Tools/virtual_environments/kicad-python/bin/python")
+KIPY_ENV = "OPENPCBSI_KIPY_PYTHON"
 DRIVER = os.path.join(os.environ.get("OPENPCBSI_DEPS") or os.path.join(HERE, "deps"), "kipy_driver.py")
+
+
+def kipy_python():
+    """The Python that runs kipy, from OPENPCBSI_KIPY_PYTHON. There is no default: openpcbsi never runs an
+    interpreter it was not pointed at."""
+    py = os.environ.get(KIPY_ENV, "").strip()
+    if not py:
+        raise InputError(f"--live needs kicad-python (kipy): set {KIPY_ENV} to the Python of an environment "
+                         "that has it installed (e.g. <venv>/bin/python)")
+    if not os.path.isfile(py) or not os.access(py, os.X_OK):
+        raise InputError(f"{KIPY_ENV}={py} is not an executable Python")
+    return py
 
 
 def fetch_board(cache_dir, socket=None, timeout=120):
     """Write the live board into the cache and return the path of the board file to read."""
-    if not os.path.exists(KIPY_PY):
-        raise InputError(f"no kicad-python (kipy) Python at {KIPY_PY}; set OPENPCBSI_KIPY_PYTHON")
+    py = kipy_python()
     tmp = os.path.join(cache_dir, "live", "incoming")
     os.makedirs(tmp, exist_ok=True)
-    cmd = [KIPY_PY, "-I", DRIVER, tmp] + (["--socket", socket] if socket else [])
+    cmd = [py, "-I", DRIVER, tmp] + (["--socket", socket] if socket else [])
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if p.returncode != 0:
         msg = (p.stderr or p.stdout).strip().splitlines()[-1:] or ["no output"]
@@ -39,7 +49,7 @@ def fetch_board(cache_dir, socket=None, timeout=120):
     meta = json.load(open(os.path.join(tmp, "live.json")))
     import hashlib
     h = hashlib.sha256(open(os.path.join(tmp, "live.kicad_pcb"), "rb").read()).hexdigest()[:16]
-    name = os.path.splitext(meta.get("name") or "live")[0] or "live"
+    name = os.path.splitext(os.path.basename(meta.get("name") or "live"))[0].lstrip(".") or "live"
     d = os.path.join(cache_dir, "live", h)
     os.makedirs(d, exist_ok=True)
     dst = os.path.join(d, name + ".kicad_pcb")

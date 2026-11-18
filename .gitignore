@@ -27,3 +27,5 @@ build/
 deps/kicad_monkey
 deps/KiCadFiles
 deps/parsers-site
+deps/parsers-site.new
+deps/parsers-site.old

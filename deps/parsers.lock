@@ -3,17 +3,23 @@
 #
 # kicad-monkey: primary parser. Its repository is a monorepo; release 2026.9.7 is the commit
 # "release: prepare KiCad toolchain 2026.9.7" (tag kicad-cruncher-v2026.9.7). Its Python source
-# (src/py) is identical to the PyPI sdist kicad_monkey-2026.9.7.tar.gz, whose SHA-256 is recorded.
+# (src/py) is identical to src/py in the PyPI sdist kicad_monkey-2026.9.7.tar.gz, whose SHA-256 is
+# recorded. setup_parsers.sh checks both: the sdist against sdist_sha256, and the clone's tracked files
+# under clone_tree against the sdist's files under sdist_tree (same file set, same bytes).
 [kicad_monkey]
 repo = "https://github.com/wavenumber-eng/kicad_monkey"
 version = "2026.9.7"
 commit = "4c029a39f38304ca4d39beddabb93c117bbb6653"
 dir = "kicad_monkey"
 python_path = "kicad_monkey/src/py"
+sdist_url = "https://files.pythonhosted.org/packages/0b/af/3e69c9f9445938302e734699918adadf6cb56fda65a19a6cb604ae5baf5f/kicad_monkey-2026.9.7.tar.gz"
 sdist_sha256 = "deaee71ac27d4bb423f7f81ac7d320fcb631ba59d7b63623132bfa20b7c7d3e4"
+sdist_tree = "src/py"
+clone_tree = "src/py"
 license = "MIT"
 
-# KiCadFiles: independent cross-check parser (no dependencies).
+# KiCadFiles: independent cross-check parser (no dependencies). The package (kicadfiles/) is
+# identical to kicadfiles/ in the PyPI sdist kicadfiles-1.0.5.tar.gz, checked the same way.
 [kicadfiles]
 repo = "https://github.com/Steffen-W/KiCadFiles"
 version = "1.0.5"
@@ -21,10 +27,16 @@ tag = "v1.0.5"
 commit = "41554b5e61a7660ec566801c61dab0f6ba18eb60"
 dir = "KiCadFiles"
 python_path = "KiCadFiles"
+sdist_url = "https://files.pythonhosted.org/packages/5d/c4/ec875a8b771a3da60350392629e91df5ab51e8afb9c4aa74aa508bd33eca/kicadfiles-1.0.5.tar.gz"
 sdist_sha256 = "3417c7d94248e63bb464025cd04bda89619ad75a4fae2c079388059ea57838a7"
+sdist_tree = "kicadfiles"
+clone_tree = "kicadfiles"
 license = "MIT"
 
-# kicad-monkey's dependencies, installed with --no-deps into parsers-site (the system numpy is used).
+# kicad-monkey's dependencies, installed with --no-deps into parsers-site (the host's numpy is used).
+# The pins are in requirements/parsers.in (colorama 0.4.6, freetype-py 2.5.1, msgspec 0.22.0,
+# shapely 2.2.0, trimesh 5.2.1, uharfbuzz 0.57.0, zstandard 0.25.0); requirements/parsers.txt adds
+# the wheels' SHA-256s and is what setup_parsers.sh installs, with --require-hashes.
 [site]
 dir = "parsers-site"
-requirements = ["colorama==0.4.6", "freetype-py==2.5.1", "msgspec==0.22.0", "shapely==2.2.0", "trimesh==5.2.1", "uharfbuzz==0.57.0", "zstandard==0.25.0"]
+requirements = "requirements/parsers.txt"

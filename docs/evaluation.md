@@ -128,13 +128,25 @@ defaults above.
 
 ## Sign-off record
 
-`python3 -m openpcbsi signoff BOARD [-c CFG] [--waivers FILE] [--reviewer NAME]` runs the evaluation
-and writes `signoff.json` (schema `openpcbsi-signoff/1`) beside it: the SHA-256 of the board, of each
-KiCad project file next to it (`.kicad_pro`, `.kicad_dru`, `.kicad_sch`), of the config, the waivers
-and `evaluation.json`; the KiCad file version and openpcbsi version; every check's status; the
-verdict (`release`, `release with warnings`, `blocked: failures`, `blocked: could not evaluate`, or
-`blocked: layout stage ...` before the final stage); the blocking findings; and the checks that were
-not judged (not built, not run, nothing to check, not judged, unvalidated, assumed inputs).
+`python3 -m openpcbsi signoff BOARD [-c CFG] [--waivers FILE] [--reviewer NAME] [--sign-key KEY]` runs
+the evaluation and writes `signoff.json` (schema `openpcbsi-signoff/2`) beside it: the SHA-256 of the
+board, of each KiCad project file next to it (`.kicad_pro`, `.kicad_dru`, `.kicad_sch`), of the
+config, the waivers and `evaluation.json`; the KiCad file version and openpcbsi version; every
+check's status; the verdict (`release`, `release with warnings`, `blocked: failures`, `blocked: could
+not evaluate`, or `blocked: layout stage ...` before the final stage); the blocking findings; and the
+checks that were not judged (not built, not run, nothing to check, not judged, unvalidated, assumed
+inputs). Paths in it are relative to its folder. With `--sign-key` (an SSH private key) the record is
+signed: `ssh-keygen -Y sign`, namespace `openpcbsi-signoff`, into `signoff.json.sig`.
 
-`python3 -m openpcbsi verify-signoff signoff.json` recomputes every hash and exits 1 if any input
-changed, so a record never vouches for a board it did not judge.
+`python3 -m openpcbsi verify-signoff signoff.json [--allowed-signers FILE] [--rerun]` exits 1 when:
+
+- any input's hash changed (a record never vouches for a board it did not judge);
+- any field that follows from the hashed evaluation differs from it: the exit code, the counts, the
+  checks, the families, the blockers or the verdict are recomputed from `evaluation.json`, never
+  read from the record (an edited verdict or emptied blocker list does not verify);
+- with `--allowed-signers` (an ssh allowed_signers file), the signature does not verify for the
+  record's reviewer.
+
+Only the signature authenticates the record as a whole and the reviewer's name: a record and its
+evaluation edited together, consistently, verify by their hashes alone. `--rerun` evaluates the board
+again with the recorded config and waivers and compares the verdict, which needs neither.

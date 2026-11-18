@@ -1,5 +1,5 @@
 # openpcbsi configuration for the AU7P FMC pilot board
-# (Work/Sandbox/Minimalist_AU7P_Board, REQUIREMENTS.md sections 3, 4 and 7).
+# (the Minimalist_AU7P_Board project; its REQUIREMENTS.md sections 3, 4 and 7).
 # Limits are the proposals of the pilot's section 7; they are to be fixed at review.
 
 [board]

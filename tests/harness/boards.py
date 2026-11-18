@@ -332,7 +332,8 @@ def chip_board(out, name="chips"):
 
 def reflow_board(out, name="reflow"):
     """A 3 g part (U1, 5 mm tall) on the left, 0402 resistors next to it (R1) and far from it (R2), and a
-    QFN with no body data (U2): its body is estimated from its fabrication outline."""
+    QFN with no body data (U2): its body is estimated from its fabrication outline; a QFN with KiCad's 3D model
+    (U3): its body comes from the model; a connector with nothing (J9): left out and listed."""
     b = Board(_p(out, name), layers=4, size=(80, 40))
     b.plane("In1.Cu", "GND")
     b.plane("In2.Cu", "GND")
@@ -343,6 +344,13 @@ def reflow_board(out, name="reflow"):
     b.footprint("U2", "QFN", 45, 20, [{"num": i + 1, "net": "GND", "dx": -2 + 4 * (i % 2), "dy": -2 + 4 * (i // 2), "sx": 0.8, "mask": 0.0}
                                        for i in range(4)], fpid="Package_DFN_QFN:QFN-4_5x5mm_test", fab=(-2.5, -2.5, 2.5, 2.5),
                 courtyard=(-3, -3, 3, 3))
+    # U3: no body fields, but KiCad's 3D model of a 3 x 3 mm QFN-16: its body comes from the model
+    b.footprint("U3", "QFN", 55, 10, [{"num": i + 1, "net": "GND", "dx": -1 + 2 * (i % 2), "dy": -1 + 2 * (i // 2), "sx": 0.5, "mask": 0.0}
+                                       for i in range(4)], fpid="Package_DFN_QFN:QFN-16_3x3mm_test", courtyard=(-2, -2, 2, 2),
+                model="${KICAD10_3DMODEL_DIR}/Package_DFN_QFN.3dshapes/QFN-16-1EP_3x3mm_P0.5mm_EP1.7x1.7mm.step")
+    # J9: a connector with no body data, no model and no package class: left out and listed, not given a body
+    b.footprint("J9", "CONN", 65, 30, [{"num": i + 1, "net": "GND", "dx": 1.27 * i, "dy": 0, "sx": 0.6, "sy": 1.5, "mask": 0.0}
+                                       for i in range(4)], fpid="Connector:CONN_test", courtyard=(-1, -1.5, 5, 1.5))
     return b.save()
 
 
@@ -470,6 +478,10 @@ def reader_board(out, name="reader"):
     b.via(32, 14, "L", plug=(True, False))
     b.via(34, 14, "K", fill=False)
     b.via(36, 14, "L")
+    # graphics and text on copper (no net): a line, text turned 30 degrees, text on the back
+    b.graphic_line("F.Cu", 30, 3, 36, 4, 0.2)
+    b.text("F.Cu", "OPENPCBSI 1.0", 20, 17.5, size=1.0, thickness=0.15, angle=30)
+    b.text("B.Cu", "REV C", 30, 9, size=1.2, thickness=0.2)
     return b.save()
 
 
@@ -508,4 +520,31 @@ def limit_board(out, name="limit"):
                                                   "drill": 0.6, "drill_y": 1.6}])
         yt = row + 0.8 + 0.3 + (gap - 0.2) + 0.1
         b.track("In2.Cu", [(34, yt), (36, yt)], 0.2, f"T4{tag}")
+    return b.save()
+
+
+def spacing_board(out, name="spacing"):
+    """Spacing against the 0.09 mm multilayer limit: pairs of 0.1 mm parallel tracks at 0.090 (legal),
+    0.088, 0.085 and 0.080 mm on F.Cu (nets A0/B0 ... A3/B3, x = 5, 10, 15, 20); a graphic line on F.Cu,
+    not a track, 0.04 mm from track C (x = 25); a track with no net 0.04 mm from track D (x = 30); board
+    text on B.Cu whose stroke edge is 0.04 mm from track E (y = 15); and the same three at 0.2 mm (legal)
+    on the right half (x = 35, 40; y = 17)."""
+    b = Board(_p(out, name), layers=4, size=(50, 20))
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    w = 0.1
+    for k, gap in enumerate((0.090, 0.088, 0.085, 0.080)):
+        x = 5 + 5 * k
+        b.track("F.Cu", [(x, 3), (x, 9)], w, f"A{k}")
+        b.track("F.Cu", [(x + w + gap, 3), (x + w + gap, 9)], w, f"B{k}")
+    for x, gap, tag in ((25, 0.04, ""), (35, 0.2, "_ok")):
+        b.track("F.Cu", [(x, 3), (x, 9)], w, f"C{tag}")
+        b.graphic_line("F.Cu", x + w + gap, 3, x + w + gap, 9, w)            # 0.1 mm wide: its edge `gap` from C's
+    for x, gap, tag in ((30, 0.04, ""), (40, 0.2, "_ok")):
+        b.track("F.Cu", [(x, 3), (x, 9)], w, f"D{tag}")
+        b.track("F.Cu", [(x + w + gap, 3), (x + w + gap, 9)], w, "")            # no net
+    # text "I" (a vertical stroke 0.15 mm wide, centred on x) beside track E
+    for x, gap, tag in ((10, 0.04, ""), (20, 0.2, "_ok")):
+        b.text("B.Cu", "I", x, 15, size=1.0, thickness=0.15)
+        b.track("B.Cu", [(x + 0.075 + gap + w / 2, 13), (x + 0.075 + gap + w / 2, 17)], w, f"E{tag}")
     return b.save()
