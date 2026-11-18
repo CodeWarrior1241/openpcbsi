@@ -40,8 +40,9 @@ def V(x, y):
 
 
 class Board:
-    def __init__(self, path, layers=4, size=(40.0, 20.0), stackup=None, copper=None):
-        """`copper` overrides the finished copper thickness (mm) of named layers, e.g. {"In1.Cu": 0.07}."""
+    def __init__(self, path, layers=4, size=(40.0, 20.0), stackup=None, copper=None, corner_r=0.0):
+        """`copper` overrides the finished copper thickness (mm) of named layers, e.g. {"In1.Cu": 0.07};
+        `corner_r` rounds the outline's corners with arcs of that radius."""
         self.path, self.n_layers, self.size = os.path.abspath(path), layers, size
         self.copper = copper or {}
         self.stackup = stackup or STACKUPS[layers]
@@ -52,7 +53,10 @@ class Board:
         self.netclasses = {}               # name -> settings dict for the .kicad_pro
         self.dru = []                      # custom rule texts for the .kicad_dru
         w, h = size
-        self.outline([(0, 0), (w, 0), (w, h), (0, h)])
+        if corner_r:
+            self.rounded_outline(w, h, corner_r)
+        else:
+            self.outline([(0, 0), (w, 0), (w, h), (0, h)])
 
     # ---- primitives ---------------------------------------------------------------------------
     def net(self, name):
@@ -72,6 +76,29 @@ class Board:
             s.SetWidth(MM(0.05))
             self.b.Add(s)
 
+    def rounded_outline(self, w, h, r):
+        import math
+        k = r * (1 - math.sqrt(0.5))
+        for (x1, y1), (x2, y2) in (((r, 0), (w - r, 0)), ((w, r), (w, h - r)), ((w - r, h), (r, h)), ((0, h - r), (0, r))):
+            self.outline_segment(x1, y1, x2, y2)
+        for (sx, sy), (mx, my), (ex, ey) in ((((w - r, 0), (w - k, k), (w, r))), (((w, h - r), (w - k, h - k), (w - r, h))),
+                                             (((r, h), (k, h - k), (0, h - r))), (((0, r), (k, k), (r, 0)))):
+            a = pcbnew.PCB_SHAPE(self.b)
+            a.SetShape(pcbnew.SHAPE_T_ARC)
+            a.SetLayer(pcbnew.Edge_Cuts)
+            a.SetArcGeometry(V(sx, sy), V(mx, my), V(ex, ey))
+            a.SetWidth(MM(0.05))
+            self.b.Add(a)
+
+    def outline_segment(self, x1, y1, x2, y2):
+        s = pcbnew.PCB_SHAPE(self.b)
+        s.SetShape(pcbnew.SHAPE_T_SEGMENT)
+        s.SetLayer(pcbnew.Edge_Cuts)
+        s.SetStart(V(x1, y1))
+        s.SetEnd(V(x2, y2))
+        s.SetWidth(MM(0.05))
+        self.b.Add(s)
+
     def track(self, layer, pts, w, net):
         ni = self.net(net) if isinstance(net, str) else net
         for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
@@ -83,7 +110,20 @@ class Board:
             t.SetEnd(V(x2, y2))
             self.b.Add(t)
 
-    def via(self, x, y, net, drill=0.3, size=0.6, kind="through", top="F.Cu", bottom="B.Cu", backdrill_bottom=None):
+    def arc(self, layer, start, mid, end, w, net):
+        """An arc track through three points."""
+        a = pcbnew.PCB_ARC(self.b)
+        a.SetLayer(LAYER[layer])
+        a.SetWidth(MM(w))
+        a.SetNet(self.net(net) if isinstance(net, str) else net)
+        a.SetStart(V(*start))
+        a.SetMid(V(*mid))
+        a.SetEnd(V(*end))
+        self.b.Add(a)
+        return a
+
+    def via(self, x, y, net, drill=0.3, size=0.6, kind="through", top="F.Cu", bottom="B.Cu", backdrill_bottom=None,
+            fill=None, cap=None, plug=(None, None)):
         v = pcbnew.PCB_VIA(self.b)
         v.SetPosition(V(x, y))
         v.SetDrill(MM(drill))
@@ -96,6 +136,14 @@ class Board:
             v.SetBackdrillMode(pcbnew.BACKDRILL_MODE_BACKDRILL_BOTTOM)
             v.SetBottomBackdrillLayer(LAYER[backdrill_bottom])
             v.SetBottomBackdrillSize(MM(drill + 0.2))
+        # via protection (KiCad 10): None leaves the board's default
+        if fill is not None:
+            v.SetFillingMode(pcbnew.FILLING_MODE_FILLED if fill else pcbnew.FILLING_MODE_NOT_FILLED)
+        if cap is not None:
+            v.SetCappingMode(pcbnew.CAPPING_MODE_CAPPED if cap else pcbnew.CAPPING_MODE_NOT_CAPPED)
+        for val, setter in zip(plug, (v.SetFrontPluggingMode, v.SetBackPluggingMode)):
+            if val is not None:
+                setter(pcbnew.PLUGGING_MODE_PLUGGED if val else pcbnew.PLUGGING_MODE_NOT_PLUGGED)
         self.b.Add(v)
         return v
 
@@ -175,8 +223,24 @@ class Board:
             kind = d.get("kind", "smd")
             p.SetAttribute(pcbnew.PAD_ATTRIB_SMD if kind == "smd" else pcbnew.PAD_ATTRIB_PTH)
             shape = d.get("shape")
-            p.SetShape(pcbnew.PAD_SHAPE_CIRCLE if shape == "circle" else pcbnew.PAD_SHAPE_RECTANGLE)
-            p.SetSize(pcbnew.VECTOR2I(MM(d["sx"]), MM(d.get("sy", d["sx"]))))
+            SH = {"circle": pcbnew.PAD_SHAPE_CIRCLE, "oval": pcbnew.PAD_SHAPE_OVAL, "roundrect": pcbnew.PAD_SHAPE_ROUNDRECT,
+                  "trapezoid": pcbnew.PAD_SHAPE_TRAPEZOID, "chamfered_rect": pcbnew.PAD_SHAPE_CHAMFERED_RECT}
+
+            def set_shape(lay, sh, sx, sy, q):
+                p.SetShape(lay, SH.get(sh, pcbnew.PAD_SHAPE_RECTANGLE))
+                p.SetSize(lay, pcbnew.VECTOR2I(MM(sx), MM(sy)))
+                if q.get("rratio") is not None:
+                    p.SetRoundRectRadiusRatio(lay, q["rratio"])
+                if q.get("delta"):
+                    p.SetDelta(lay, pcbnew.VECTOR2I(MM(q["delta"][0]), MM(q["delta"][1])))
+                if q.get("chamfer"):
+                    p.SetChamferRectRatio(lay, q["chamfer"][0])
+                    p.SetChamferPositions(lay, q["chamfer"][1])
+            if shape != "custom":
+                set_shape(pcbnew.F_Cu, shape, d["sx"], d.get("sy", d["sx"]), d)
+            else:
+                p.SetShape(pcbnew.PAD_SHAPE_RECTANGLE)
+                p.SetSize(pcbnew.VECTOR2I(MM(d["sx"]), MM(d.get("sy", d["sx"]))))
             only = d.get("only")
             if kind == "smd":
                 ls = pcbnew.LSET()
@@ -210,7 +274,15 @@ class Board:
                     for px_, py_ in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
                         pts.append(pcbnew.VECTOR2I(MM(px_), MM(py_)))
                     p.AddPrimitivePoly(lay, pts, 0, True)
+            if d.get("stack"):                         # a padstack: {"mode": "front_inner_back" | "custom", "layers": {name: {...}}}
+                st = d["stack"]
+                p.Padstack().SetMode(pcbnew.PADSTACK.MODE_FRONT_INNER_BACK if st["mode"] == "front_inner_back" else pcbnew.PADSTACK.MODE_CUSTOM)
+                for lname, q in st["layers"].items():
+                    lay = pcbnew.PADSTACK.INNER_LAYERS if lname == "Inner" else LAYER[lname]
+                    set_shape(lay, q.get("shape", "rect"), q["sx"], q.get("sy", q["sx"]), q)
             p.SetPosition(V(x + d["dx"], y + d["dy"]))
+            if d.get("rot"):
+                p.SetOrientation(pcbnew.EDA_ANGLE(float(d["rot"]), pcbnew.DEGREES_T))
             if d.get("net"):
                 p.SetNet(self.net(d["net"]))
             if d.get("func"):

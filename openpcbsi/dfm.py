@@ -52,7 +52,7 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from . import padgeom, fab as fab_mod
+from . import padgeom, fab as fab_mod, model
 from . import geom, packages
 from .drc import finding, result
 
@@ -77,7 +77,6 @@ NOT_CHECKED = [
     "clearance, annular rings and holes as KiCad's DRC sees them: MF19 says whether its rules match the fabricator",
 ]
 TOL = 0.003          # mm: polygons approximate arcs to 2 um
-FINE_EDGE = 0.0025   # mm: the fine raster of the hole-to-copper and copper-to-edge measurements
 
 
 class Agg:
@@ -176,11 +175,15 @@ AUDIT = [   # board-setup rule, DRC test, every profile limit of the same measur
     ("solder_mask_min_width", "solder_mask_bridge", ["mask_web_mm"], "solder-mask web", "mask_web"),
 ]
 # .kicad_dru constraint type -> the profile limits of the same measurand
-DRU = {"clearance": ["track_space_mm", "pad_to_track_mm", "smd_pad_to_pad_mm"], "track_width": ["track_width_mm"],
+# (clearance as in AUDIT: SMD pad to pad is measured by fab_space and mask_web, not held by one KiCad number)
+DRU = {"clearance": ["track_space_mm", "pad_to_track_mm"], "track_width": ["track_width_mm"],
        "hole_clearance": ["via_hole_to_copper_mm", "pth_hole_to_copper_mm", "inner_pth_hole_to_copper_mm", "npth_hole_to_copper_mm"],
        "hole_to_hole": ["via_hole_spacing_mm", "pad_hole_spacing_mm"], "edge_clearance": ["copper_to_edge_mm"],
        "annular_width": ["via_ring_min_mm", "pth_ring_min_mm"], "hole_size": ["via_hole_min_mm"], "via_diameter": ["via_diameter_min_mm"]}
-KEY_WHAT = {"track_space_mm": "track to track", "pad_to_track_mm": "pad to track", "smd_pad_to_pad_mm": "SMD pad to pad",
+# inside a BGA field the fabricator's BGA figures apply (a custom rule limited to BGA courtyards)
+BGA_KEYS = {"track_space_mm": "bga_track_mm", "track_width_mm": "bga_track_mm", "pad_to_track_mm": "bga_pad_to_track_mm"}
+COURTYARD_RE = re.compile(r"(?:[AB]\.)?(?:inside|intersects)(?:Front|Back)?Courtyard\('([^']*)'\)")
+KEY_WHAT = {"bga_track_mm": "tracks in a BGA fan-out", "bga_pad_to_track_mm": "BGA pad to track", "track_space_mm": "track to track", "pad_to_track_mm": "pad to track", "smd_pad_to_pad_mm": "SMD pad to pad",
             "via_hole_to_copper_mm": "via holes", "pth_hole_to_copper_mm": "plated holes (outer layers)",
             "inner_pth_hole_to_copper_mm": "plated holes (inner layers)", "npth_hole_to_copper_mm": "non-plated holes",
             "via_hole_min_mm": "via holes", "npth_min_mm": "non-plated holes", "via_hole_spacing_mm": "via holes",
@@ -245,6 +248,16 @@ def order_checklist(ctx, fabr, rules):
         out.append({"item": "stencil thickness", "state": f"{pa['params']['stencil_mm']:g} mm"
                     + ("" if cfg["dfm"]["stencil_mm"] else f" (predicted; {fabr.name} chooses unless the order states it)"),
                     "set_in_config": bool(cfg["dfm"]["stencil_mm"]), "basis": pa["params"]["stencil_source"]})
+    om = rules.get("output_match")
+    if om:
+        sent = "sent" in om["metrics"]
+        out.append({"item": "fabrication files", "state": (f"the files checked in {om['params']['files']}" if sent else
+                                                            f"send the files plotted in {om['params'].get('plotted')} (no --gerbers: files plotted "
+                                                            f"earlier were not checked)"), "set_in_config": sent, "basis": "MF20"})
+    fd = rules.get("fab_drill")
+    if fd and fd["params"].get("hole_spacing") == "centre to centre":
+        out.append({"item": "hole-to-hole spacing", "state": "read centre to centre: confirm with the fabricator", "set_in_config": True,
+                    "basis": "board config [dfm] hole_spacing"})
     if fabr.get("rails_required"):
         out.append({"item": "edge rails", "state": f"required for the {cfg['dfm'].get('assembly_service', 'standard')} assembly service: "
                     f"add them to the panel or order them", "set_in_config": False, "basis": fabr.src("rails_required")})
@@ -253,8 +266,28 @@ def order_checklist(ctx, fabr, rules):
     return out
 
 
-def rule_audit(ctx, fabr):
+def _dru_scope(ctx, cond, bga_refs):
+    """The parts a custom rule's condition limits it to, when it is limited to courtyards: (refs, all
+    of them BGA fields). Anything else in the condition than courtyard tests and item types is not read."""
+    if not cond:
+        return [], False
+    refs = list(dict.fromkeys(COURTYARD_RE.findall(cond)))
+    rest = COURTYARD_RE.sub("", cond)
+    rest = re.sub(r"[AB]\.Type\s*[!=]=\s*'[^']*'|\|\||&&|[()\s]", "", rest)
+    if not refs or rest or any(ch in r for r in refs for ch in "*?"):
+        return refs, False
+    return refs, all(r in bga_refs for r in refs)
+
+
+def rule_audit(ctx, fabr, measured=()):
+    """KiCad's rules (board setup and .kicad_dru) against the profile's limits: whether a clean KiCad DRC
+    means the fabricator's limits are met. Where KiCad's rule is looser, the limit is still measured by
+    `dfm` itself (the check named in AUDIT): that is listed (info) when the check runs in this review,
+    and a warning only when it does not."""
     b = ctx.b
+    sev_of = lambda by: "info" if by in measured else "warning"
+    how = lambda by: (f"`dfm` measures it in {by} (this review)" if by in measured else
+                      f"`dfm` measures it in {by}, which did not run in this review")
     stem = os.path.splitext(b.path)[0]
     pro = stem + ".kicad_pro"
     fs, rows = [], []
@@ -278,7 +311,7 @@ def rule_audit(ctx, fabr):
         row = {"rule": key, "kicad_mm": val, "fab": {k: fabr.get(k) for k in keys}, "drc_test": test, "severity": s, "measured_by": by}
         if val is None:
             row["verdict"] = "not set in the project"
-            unset.append(what)
+            unset.append((what, by))
         else:
             strict, looser, notes = _compare(fabr, val, keys)
             parts = []
@@ -286,36 +319,50 @@ def rule_audit(ctx, fabr):
                 parts.append("as strict as " + fabr.name + " for " + ", ".join(f"{w} ({l:g})" for w, l, _ in strict))
             if looser:
                 parts.append("looser for " + ", ".join(f"{w} ({val:g} < {l:g})" for w, l, _ in looser))
-                fs.append(finding("rule_audit", "warning", f"KiCad's DRC accepts {what} down to {val:g} mm; {fabr.name} needs "
+                fs.append(finding("rule_audit", sev_of(by), f"KiCad's DRC accepts {what} down to {val:g} mm; {fabr.name} needs "
                                   + "; ".join(f"{l:g} mm for {w} ({fabr.src(k)})" for w, l, k in looser)
-                                  + f". A clean DRC does not show these limits are met; `dfm` measures them in {by}",
+                                  + f". A clean DRC alone does not show these limits are met; {how(by)}",
                                   value=val, limit=max(l for _, l, _ in looser), unit="mm", kind=key, basis=fabr.src(looser[0][2])))
             row["verdict"] = "; ".join(parts + notes)
         if s == "ignore":
             row["verdict"] += "; test switched off"
-            fs.append(finding("rule_audit", "warning", f"KiCad's DRC test '{test}' ({what}) is set to ignore in the project: "
-                              f"DRC does not check it at all; `dfm` measures it in {by}", kind=key + ":ignore", basis="KiCad project"))
+            fs.append(finding("rule_audit", sev_of(by), f"KiCad's DRC test '{test}' ({what}) is set to ignore in the project: "
+                              f"DRC does not check it at all; {how(by)}", kind=key + ":ignore", basis="KiCad project"))
         rows.append(row)
     if unset:
-        fs.append(finding("rule_audit", "warning", f"the KiCad project sets no rule for {', '.join(unset)}: KiCad's DRC uses its defaults "
-                          f"there, not {fabr.name}'s limits; `dfm` measures them itself", kind="unset"))
+        fs.append(finding("rule_audit", "info" if all(by in measured for _, by in unset) else "warning",
+                          f"the KiCad project sets no rule for {', '.join(w for w, _ in unset)}: KiCad's DRC uses its defaults there, not "
+                          f"{fabr.name}'s limits; " + ("`dfm` measures them in this review" if all(by in measured for _, by in unset) else
+                                                      "some of them are measured by checks that did not run in this review"), kind="unset"))
     dru = stem + ".kicad_dru"
     if os.path.exists(dru):
         n = 0
+        _, bga_refs = bga_field(ctx)
+        by_type = {a[1]: a[4] for a in AUDIT if a[1]}
+        by_type.update({"edge_clearance": "fab_drill", "hole_size": "fab_drill", "via_diameter": "fab_drill"})
         for c in _dru_items(dru):
             keys = [k for k in DRU.get(c["type"], []) if fabr.judged(k)]
             if c["min"] is None or not keys:
                 continue
             n += 1
+            scope, in_bga = _dru_scope(ctx, c["condition"], set(bga_refs))
+            if in_bga:
+                keys = list(dict.fromkeys(BGA_KEYS.get(k, k) for k in keys if fabr.judged(BGA_KEYS.get(k, k))))
             _, looser, _ = _compare(fabr, c["min"], keys)
+            by = by_type.get(c["type"], "fab_space")
             row = {"rule": f"{c['rule']} ({c['type']})", "kicad_mm": c["min"], "fab": {k: fabr.get(k) for k in keys}, "drc_test": c["type"],
-                   "severity": None, "measured_by": "custom rule", "condition": c["condition"],
+                   "severity": None, "measured_by": by, "condition": c["condition"],
+                   "scope": (f"courtyards of {', '.join(scope)} (BGA fields: the fabricator's BGA figures apply)" if in_bga else
+                             f"courtyards of {', '.join(scope)}" if scope else "not read (the rule is compared as if it applied everywhere)"),
                    "verdict": ("looser for " + ", ".join(f"{w} ({c['min']:g} < {l:g})" for w, l, _ in looser)) if looser else "as strict"}
             rows.append(row)
             if looser:
-                fs.append(finding("rule_audit", "warning", f"custom rule '{c['rule']}' (.kicad_dru{', where ' + c['condition'] if c['condition'] else ''}) "
+                fs.append(finding("rule_audit", sev_of(by), f"custom rule '{c['rule']}' (.kicad_dru{', where ' + c['condition'] if c['condition'] else ''}) "
                                   f"lets KiCad's DRC accept {c['type'].replace('_', ' ')} down to {c['min']:g} mm; {fabr.name} needs "
-                                  + "; ".join(f"{l:g} mm for {w}" for w, l, _ in looser), value=c["min"],
+                                  + "; ".join(f"{l:g} mm for {w}" for w, l, _ in looser)
+                                  + ("" if in_bga else " (the rule is compared as if it applied everywhere: its condition "
+                                     + ("limits it to parts that are not BGA fields" if scope else "is not read") + ")")
+                                  + f"; {how(by)}", value=c["min"],
                                   limit=max(l for _, l, _ in looser), unit="mm", kind="dru:" + c["rule"], basis=fabr.src(looser[0][2])))
         if not n:
             fs.append(finding("rule_audit", "info", "the project has custom rules (.kicad_dru) with no minimum of a measurand the profile "
@@ -410,7 +457,8 @@ def rule_fab_drill(ctx, fabr):
                 agg.add(("npth", round(small, 3)), "error", small, f"non-plated hole of {small:g} mm, below the {nmin:g} mm minimum "
                         f"({fabr.src('npth_min_mm')})", p["x"], p["y"], part=p["ref"], limit=nmin, unit="mm", basis=fabr.src("npth_min_mm"), kind="npth")
         else:
-            rg = min(p["sx"] - dx, p["sy"] - dy) / 2
+            # the narrowest ring of any copper layer (a padstack may have a smaller pad on inner layers)
+            rg = min(min(sx_ - dx, sy_ - dy) / 2 for sx_, sy_ in ((p.get("layer_size") or {}).values() or [(p["sx"], p["sy"])]))
             if rmin is not None and rg < rmin - TOL:
                 agg.add(("pth_ring", p["ref"]), "error", rg, f"{p['ref']}.{p['num']}: annular ring of {rg:.3f} mm, below the absolute minimum "
                         f"of {rmin:g} mm ({fabr.src('pth_ring_min_mm')}: {fabr.limits['pth_ring_min_mm']['note']})", p["x"], p["y"],
@@ -476,9 +524,17 @@ def rule_fab_drill(ctx, fabr):
     metrics["castellated"] = {"holes": len(cast)}
 
     # ---- hole to hole: holes that cut into each other fail as such (geometry); the fabricator's figure
-    # is judged in the measurand the profile records (centre to centre, the owner's choice), and a pair
-    # that meets it only in that reading is noted
+    # is judged in the measurand the profile records (wall to wall), or centre to centre when the board
+    # config says so ([dfm] hole_spacing = "centre": an assumption of the review), and a pair that meets
+    # it only in that reading is noted
     hv, hp = lim("via_hole_spacing_mm"), lim("pad_hole_spacing_mm")
+    hs_cfg = str(ctx.cfg["dfm"].get("hole_spacing") or "").lower()
+    if hs_cfg and hs_cfg not in ("centre", "center", "wall"):
+        raise ValueError(f"[dfm] hole_spacing = {hs_cfg!r}: give \"centre\" or \"wall\"")
+    assumption = None
+    if hs_cfg in ("centre", "center"):
+        assumption = (f"hole-to-hole spacing read centre to centre (board config [dfm] hole_spacing): {fabr.name}'s pages do not say "
+                      f"which; wall to wall, the stricter reading, is the profile's")
     is_via = np.array([h[5] == "via" for h in H], bool)
     if len(H) > 1:
         cxy = np.c_[(hseg[:, 0] + hseg[:, 2]) / 2, (hseg[:, 1] + hseg[:, 3]) / 2]
@@ -496,25 +552,27 @@ def rule_fab_drill(ctx, fabr):
             limit, key = (hv, "via_hole_spacing_mm") if (is_via[i_] or is_via[j_]) else (hp, "pad_hole_spacing_mm")
             if limit is None:
                 continue
-            centre = fabr.limits[key].get("measurand", "hole_wall_to_wall") == "hole_centre_to_centre"
+            centre = (hs_cfg in ("centre", "center")) if hs_cfg else fabr.limits[key].get("measurand", "hole_wall_to_wall") == "hole_centre_to_centre"
             val = cc if centre else wall
             how = "centre to centre" if centre else "wall to wall"
             if val < limit - 1e-3:
-                agg.add(("hole_hole", key), "error", val, f"two holes {val:.3f} mm apart {how} ({wall:.3f} mm wall to wall), below "
+                agg.add(("hole_hole", key), "error", val, f"two holes {val:.3f} mm apart {how}" + (f" ({wall:.3f} mm wall to wall)" if centre else "") + ", below "
                         f"{limit:g} mm ({fabr.src(key)})", mx, my, limit=limit, unit="mm", basis=fabr.src(key), kind="hole_hole:" + key)
             elif centre and wall < limit - 1e-3:
                 agg.add(("hole_hole_wall", key), "info", wall, f"two holes {cc:.3f} mm apart centre to centre and {wall:.3f} mm wall to wall: "
                         f"they meet {fabr.name}'s {limit:g} mm only if it is measured centre to centre ({fabr.src(key)})", mx, my,
                         limit=limit, unit="mm", basis=fabr.src(key), kind="hole_hole_wall:" + key)
     # ---- hole to copper of another net, on every layer the hole passes through. Candidates come from
-    # the board raster; each is measured again on a fine local raster against the exact hole shape
-    # (stadium), so the measuring slack is FINE / 2 plus the 2 um arc approximation.
+    # the board raster (a screen wider than its pixel); each is measured exactly on the vector data
+    # (exact.Copper): the hole as its stadium, the copper as KiCad describes it. A comparison is exact
+    # to KiCad's unit (1 nm) unless the nearest copper is a custom pad's polygon, whose error is bounded.
+    from . import exact
     lim_c = {"via": (lim("via_hole_to_copper_mm"), lim("inner_via_hole_to_copper_mm"), "via_hole_to_copper_mm", "inner_via_hole_to_copper_mm"),
              "pth": (lim("pth_hole_to_copper_mm"), lim("inner_pth_hole_to_copper_mm"), "pth_hole_to_copper_mm", "inner_pth_hole_to_copper_mm"),
              "npth": (lim("npth_hole_to_copper_mm"), lim("npth_hole_to_copper_mm"), "npth_hole_to_copper_mm", "npth_hole_to_copper_mm")}
     rast = [b.raster(l) for l in range(L)]
-    slack = FINE_EDGE / 2 + 0.002
-    cand = 0
+    cu = {}
+    cand = marginal_n = 0
     for (x1_, y1_, x2_, y2_, r, kind, nid, top, bot, _p) in H:
         outer, inner, ko, ki = lim_c[kind]
         big = max(v for v in (outer, inner, 0.0) if v is not None)
@@ -536,97 +594,51 @@ def rule_fab_drill(ctx, fabr):
                 continue
             sub = rast[l][i0:i1, j0:j1]
             other = (sub != 0) & (sub != nid) if nid else (sub != 0)
-            if not (other & (dist < limit + slack + 1.5 * g.res)).any():
+            if not (other & (dist < limit + 2 * g.res)).any():
                 continue
             cand += 1
-            # fine measurement around the hole
-            W = r + limit + 0.05
-            fg, fr = b.raster_window(l, min(x1_, x2_) - W, min(y1_, y2_) - W, max(x1_, x2_) + W, max(y1_, y2_) + W, FINE_EDGE)
-            fx = fg.x0 + (np.arange(fg.nx) + 0.5) * fg.res
-            fy = fg.y0 + (np.arange(fg.ny) + 0.5) * fg.res
-            FX, FY = np.meshgrid(fx, fy)
-            fd = geom.point_seg_dist(FX, FY, x1_, y1_, x2_, y2_) - r - fg.res / 2
-            fo = (fr != 0) & (fr != nid) if nid else (fr != 0)
-            if not fo.any():
+            if l not in cu:
+                cu[l] = exact.Copper(b, l)
+            m = cu[l].clearance(x1_, y1_, x2_, y2_, r, nid, limit + 0.01)
+            if m is None:
                 continue
-            d = float(fd[fo].min())
-            if d >= limit + slack:
+            lo, hi, n_, mx_, my_ = m
+            if lo >= limit - exact.TOL:
                 continue
-            k = int(np.argmin(np.where(fo, fd, 1e9)))
-            net = b.net_names[int(fr.ravel()[k])]
+            net = b.net_names[n_]
             what = "via" if kind == "via" else kind.upper() + " hole"
             x, y = (x1_ + x2_) / 2, (y1_ + y2_) / 2
             who = _p["ref"] if _p else None
-            if d < limit - slack:
-                agg.add(("hole_copper", kind, b.layers[l], who), "error", d, f"{what} wall {max(d, 0):.3f} mm from copper of {net}, below "
-                        f"{limit:g} mm ({fabr.src(key)})", x, y, net=net, layer=b.layers[l], limit=limit, unit="mm", basis=fabr.src(key),
-                        kind=f"hole_copper:{kind}")
+            if hi < limit - exact.TOL:
+                agg.add(("hole_copper", kind, b.layers[l], who), "error", hi, f"{what} wall {max(hi, 0):.4f} mm from copper of {net}, below "
+                        f"{limit:g} mm ({fabr.src(key)})" + ("; the copper cuts into the hole" if hi < 0 else ""), x, y, net=net, layer=b.layers[l],
+                        limit=limit, unit="mm", basis=fabr.src(key), kind=f"hole_copper:{kind}")
             else:
-                agg.add(("hole_copper_marginal", kind, l in (0, L - 1)), "warning", d, f"{what} wall {max(d, 0):.3f} mm from copper of {net}: "
-                        f"within the measuring slack ({slack * 1000:.1f} um) of the {limit:g} mm limit ({fabr.src(key)}), so neither a "
-                        f"pass nor a fail can be shown here; KiCad's DRC with the hole clearance set to {limit:g} mm settles it exactly",
-                        x, y, net=net, layer=b.layers[l], limit=limit, unit="mm", basis=fabr.src(key),
-                        kind=f"hole_copper_marginal:{kind}")
-    metrics["hole_copper"] = {"candidates_measured_fine": cand, "slack_mm": round(slack, 4)}
-    # ---- copper to the board edge: candidates from the raster, then the fine raster against the
-    # outline polygon itself
+                marginal_n += 1
+                agg.add(("hole_copper_marginal", kind, l in (0, L - 1)), "warning", hi, f"{what} wall between {max(lo, 0):.4f} and {hi:.4f} mm "
+                        f"from copper of {net}: the nearest copper is a custom pad, whose polygon lies up to {exact.POLY_ERR * 1000:g} um inside its "
+                        f"true shape, and the {limit:g} mm limit ({fabr.src(key)}) falls in between", x, y, net=net, layer=b.layers[l],
+                        limit=limit, unit="mm", basis=fabr.src(key), kind=f"hole_copper_marginal:{kind}")
+    metrics["hole_copper"] = {"candidates_measured_exactly": cand, "tolerance_mm": exact.TOL, "bounded_not_exact": marginal_n}
+    # ---- copper to the board edge, exactly on the vector data (the outline's arcs are chords: a bound)
     edge = lim("copper_to_edge_mm")
     if edge is not None and outline:
-        inside = thermal._inside(ctx)
-        d_out = ndimage.distance_transform_edt(inside) * g.res
-        s_ = geom.ring_segments(outline)
+        O, tree, O_err = exact.outline_index(b)
         # castellated pads reach the edge by design: their copper is not judged against the edge
-        cast_rings = [ring for k in cast for poly in H[k][9]["poly"] for ring in poly]
-        cast_mask = ndimage.binary_dilation(geom.raster_rings(g, cast_rings), iterations=2) if cast_rings else np.zeros(g.shape, bool)
+        skip = [(H[k][9]["x"], H[k][9]["y"], max(H[k][9]["sx"], H[k][9]["sy"]) / 2 + 2 * H[k][4]) for k in cast]
         for l in range(L):
-            bad = (rast[l] != 0) & ~cast_mask & (d_out < edge + slack + 2 * g.res)
-            if not bad.any():
+            if l not in cu:
+                cu[l] = exact.Copper(b, l)
+            m = cu[l].edge(O, tree, edge, O_err, skip) if tree is not None else None
+            if m is None or m[0] >= edge - exact.TOL:
                 continue
-            lbl, n = ndimage.label(bad)
-            # 1 mm tiles of candidate pixels, nearest the edge first; a tile whose coarse distance cannot
-            # beat the best fine reading so far is not refined
-            ii, jj = np.nonzero(bad)
-            tpx = max(int(1.0 / g.res), 1)
-            tiles = {}
-            for a_, c_ in zip(ii // tpx, jj // tpx):
-                tiles.setdefault((int(a_), int(c_)), None)
-            coarse = sorted(((float(d_out[a_ * tpx:(a_ + 1) * tpx, c_ * tpx:(c_ + 1) * tpx][bad[a_ * tpx:(a_ + 1) * tpx, c_ * tpx:(c_ + 1) * tpx]].min()),
-                              a_, c_) for a_, c_ in tiles))
-            worst = None
-            for cd, a_, c_ in coarse:
-                if worst is not None and cd - 2 * g.res > worst[0]:
-                    break
-                x0_, y0_ = g.xy(a_ * tpx, c_ * tpx)
-                x1w, y1w = g.xy((a_ + 1) * tpx, (c_ + 1) * tpx)
-                fg, fr = b.raster_window(l, min(x0_, x1w) - g.res, min(y0_, y1w) - g.res, max(x0_, x1w) + g.res, max(y0_, y1w) + g.res,
-                                         FINE_EDGE)
-                if not (fr != 0).any():
-                    continue
-                fx = fg.x0 + (np.arange(fg.nx) + 0.5) * fg.res
-                fy = fg.y0 + (np.arange(fg.ny) + 0.5) * fg.res
-                FX, FY = np.meshgrid(fx, fy)
-                pts = np.c_[FX[fr != 0], FY[fr != 0]]
-                ids = fr[fr != 0]
-                near = np.full(len(pts), 1e9)
-                for a0, b0, a1, b1 in s_:
-                    near = np.minimum(near, geom.point_seg_dist(pts[:, 0], pts[:, 1], a0, b0, a1, b1))
-                # copper outside the outline (a fill drawn past the edge) is at distance 0
-                outside = ~geom.points_in_rings(pts[:, 0], pts[:, 1], outline)
-                near[outside] = 0.0
-                if cast_rings:
-                    near[geom.points_in_rings(pts[:, 0], pts[:, 1], cast_rings)] = 1e9
-                k = int(np.argmin(near))
-                d = float(near[k]) - fg.res / 2
-                if worst is None or d < worst[0]:
-                    worst = (d, pts[k][0], pts[k][1], int(ids[k]))
-            if worst is None or worst[0] >= edge + slack:
-                continue
-            d, x, y, nid_ = worst
-            sev, how = ("error", "below") if d < edge - slack else ("warning", "within the measuring slack of")
-            agg.add(("edge" if sev == "error" else "edge_marginal", b.layers[l]), sev, d, f"copper of {b.net_names[nid_]} {max(d, 0):.3f} mm "
-                    f"from the board edge, {how} {edge:g} mm ({fabr.src('copper_to_edge_mm')})", float(x), float(y), n=n,
-                    net=b.net_names[nid_], layer=b.layers[l], limit=edge, unit="mm", basis=fabr.src("copper_to_edge_mm"),
-                    kind="edge" if sev == "error" else "edge_marginal")
+            lo, hi, nid_, x, y = m
+            sev, how = ("error", f"{max(hi, 0):.4f} mm from the board edge, below") if hi < edge - exact.TOL else \
+                ("warning", f"between {max(lo, 0):.4f} and {hi:.4f} mm from the board edge (an arc of the outline or of a track is "
+                            f"read as chords, which lie up to {(hi - lo) * 1000:.2g} um inside the curve), and so maybe below")
+            agg.add(("edge" if sev == "error" else "edge_marginal", b.layers[l]), sev, hi, f"copper of {b.net_names[nid_]} {how} {edge:g} mm "
+                    f"({fabr.src('copper_to_edge_mm')})", float(x), float(y), net=b.net_names[nid_], layer=b.layers[l], limit=edge, unit="mm",
+                    basis=fabr.src("copper_to_edge_mm"), kind="edge" if sev == "error" else "edge_marginal")
     # ---- board thickness
     t = b.stack.thickness
     tmin, tmax = lim("thickness_min_mm"), lim("thickness_max_mm")
@@ -637,7 +649,8 @@ def rule_fab_drill(ctx, fabr):
     metrics["board"] = {"thickness_mm": round(t, 3), "holes": int(len(H)),
                         "aspect_ratio": round(t / float(plated.min()), 1) if len(plated) else None}
     return dict(result("fab_drill", "MF13", "Holes, annular rings and the clearances around them", {
-        "measuring_slack_mm": round(slack, 4)}, metrics, agg.findings()), checked=int(len(H)))
+        "tolerance_mm": exact.TOL, "hole_spacing": "centre to centre" if hs_cfg in ("centre", "center") else "wall to wall"},
+        metrics, agg.findings()), checked=int(len(H)), **({"assumption": assumption} if assumption else {}))
 
 
 # ------------------------------------------------------------------------------------------------
@@ -805,15 +818,38 @@ def rule_via_pad(ctx, fabr):
     b, cfg = ctx.b, ctx.cfg
     V = b.vias
     L = len(b.layers)
-    cover = cfg["dfm"]["via_cover"] or fabr.get("via_cover") or "tented"
-    csrc = "board config" if cfg["dfm"]["via_cover"] else (fabr.src("via_cover") + ": " + fabr.limits["via_cover"]["note"]
-                                                           if "via_cover" in fabr.limits else "assumed")
+    # each via's covering: as the design states it (KiCad 10 stores filling, capping and plugging per via
+    # and as board defaults), else as the board config states it for every via, else the profile's
+    # default -- which the fabricator applies to the vias the order names: the vias in SMD pads (the ones
+    # the order checklist says to name); every other via is judged as KiCad tents it
+    cfg_cover = cfg["dfm"]["via_cover"]
+    dflt = fabr.get("via_cover") or "tented"
+    dsrc = (fabr.src("via_cover") + ": " + fabr.limits["via_cover"]["note"]) if "via_cover" in fabr.limits else "assumed"
+    assumed_in_pad = set()
+
+    def cover_of(k, in_pad):
+        pr = b.snap["vias"][k].get("protect") or {}
+        if pr.get("filled"):
+            return "filled", "the design (KiCad's via filling)"
+        if any(pr.get("plugged") or []):
+            return "plugged", "the design (KiCad's via plugging)"
+        if pr.get("filled") is False and not cfg_cover:
+            return "as drawn", "the design (via not filled)"
+        if cfg_cover:
+            return cfg_cover, "board config"
+        if in_pad:
+            assumed_in_pad.add(k)
+            return dflt, dsrc
+        return "as drawn", "KiCad's tenting of the via (not named for filling)"
+    cover = cfg_cover or dflt
+    csrc = "board config" if cfg_cover else dsrc
     web = fabr.judge("mask_web_mm", "via_pad")
     fmin, fmax = fabr.judge("filled_via_min_mm", "via_pad"), fabr.judge("filled_via_max_mm", "via_pad")
     plug = fabr.judge("plugged_to_opening_mm", "via_pad")
     pmax = fabr.judge("plugged_via_max_mm", "via_pad")
     agg = Agg("via_pad")
-    n_in = n_pads = 0
+    n_pads = 0
+    in_pad_vias = set()             # a via in two pads (or on both sides) counts once
     for mname, li, side in (("F.Mask", 0, 0), ("B.Mask", L - 1, 1)):
         sel = np.flatnonzero((V["top"] <= li) & (V["bot"] >= li)) if len(V["x"]) else np.zeros(0, int)
         P = [q for q in _mask_pads(b, mname) if q["pad"]["kind"] == "smd"]
@@ -832,8 +868,9 @@ def rule_via_pad(ctx, fabr):
                 same = int(V["net"][k]) == p["net_id"] and p["net_id"] != 0
                 dcu = _pt_rings(vx, vy, q["cu"])
                 if same and dcu < vdr / 2:
-                    n_in += 1
-                    if cover == "filled":
+                    in_pad_vias.add(k)
+                    cv, cs = cover_of(k, True)
+                    if cv == "filled":
                         # the range is of drill sizes (the profile's measurand; the via-covering article
                         # gives its upper bound as a hole size)
                         if fmin is not None and not (fmin - 1e-6 <= vdr <= fmax + 1e-6):
@@ -842,19 +879,23 @@ def rule_via_pad(ctx, fabr):
                                     part=p["ref"], net=p["net"], layer=b.layers[li], limit=fmax if vdr > fmax else fmin, unit="mm",
                                     basis=fabr.src("filled_via_max_mm"), kind="fill_range:" + p["ref"])
                     else:
-                        agg.add(("in_pad", p["ref"]), "error", vdr, f"{p['ref']}.{p['num']}: via in an SMD pad, and the vias are {cover} "
-                                f"({csrc}): solder drains into the hole. Order filled and capped vias or move the via off the pad",
-                                vx, vy, part=p["ref"], net=p["net"], layer=b.layers[li], unit="mm", basis=csrc, kind="in_pad:" + p["ref"])
+                        agg.add(("in_pad", p["ref"]), "error", vdr, f"{p['ref']}.{p['num']}: via in an SMD pad, and the via is "
+                                f"{'tented or open as KiCad draws it' if cv == 'as drawn' else cv} ({cs}): solder drains into the hole. Order "
+                                f"it filled and capped or move the via off the pad",
+                                vx, vy, part=p["ref"], net=p["net"], layer=b.layers[li], unit="mm", basis=cs, kind="in_pad:" + p["ref"])
                     continue
-                if cover == "filled" or dcu < vdr / 2:
+                if dcu < vdr / 2:
                     continue
-                if cover == "plugged" and pmax is not None and vdia > pmax + 1e-6:
+                cv, cs = cover_of(k, False)
+                if cv == "filled":
+                    continue
+                if cv == "plugged" and pmax is not None and vdia > pmax + 1e-6:
                     agg.add(("plug_max", round(float(vdia), 3)), "error", -vdia, f"plugged via of {vdia:g} mm; a via filled with solder mask "
                             f"may be at most {pmax:g} mm ({fabr.src('plugged_via_max_mm')})", vx, vy, net=b.net_names[int(V['net'][k])],
                             layer=b.layers[li], limit=pmax, unit="mm", basis=fabr.src("plugged_via_max_mm"), kind="plug_max")
                 tented = (b.snap["vias"][k].get("tented") or [None, None])[side]
                 dm = _pt_rings(vx, vy, q["mask"])
-                if cover == "plugged" and plug is not None and dm - vdia / 2 < plug - TOL:
+                if cv == "plugged" and plug is not None and dm - vdia / 2 < plug - TOL:
                     agg.add(("plug", p["ref"]), "warning", dm - vdia / 2, f"{p['ref']}.{p['num']}: plugged via {max(dm - vdia / 2, 0):.2f} mm "
                             f"from the pad's mask opening, below {plug:g} mm ({fabr.src('plugged_to_opening_mm')})", vx, vy, part=p["ref"],
                             net=p["net"], layer=b.layers[li], limit=plug, unit="mm", basis=fabr.src("plugged_to_opening_mm"),
@@ -867,13 +908,17 @@ def rule_via_pad(ctx, fabr):
                                 f"{'no' if w <= TOL else f'a {w:.3f} mm'} solder-mask web to the pad opening (minimum {web:g} mm, "
                                 f"{fabr.src('mask_web_mm')}): solder can run from the pad into the via", vx, vy, part=p["ref"], net=p["net"],
                                 layer=b.layers[li], limit=web, unit="mm", basis=fabr.src("mask_web_mm"), kind="open_via:" + p["ref"])
+    n_in = len(in_pad_vias)
     assumption = None
-    if not cfg["dfm"]["via_cover"] and len(V["x"]):
-        assumption = (f"vias {cover} ({csrc}); {n_in} vias are in SMD pads" if n_in else f"vias {cover} ({csrc})") + \
-            "; state the via covering in the order or set [dfm] via_cover"
-    return dict(result("via_pad", "MF14", "Vias in and beside SMD pads", {"via_cover": cover, "via_cover_source": csrc},
-                       {"vias": {"in_pads": n_in, "cover": cover}}, agg.findings("vias")), checked=n_pads if len(V["x"]) else 0,
-                assumption=assumption)
+    if assumed_in_pad:
+        assumption = (f"the {len(assumed_in_pad)} vias in SMD pads {dflt} ({dsrc}), as the design does not mark them; name them "
+                      f"in the order (or mark them filled in KiCad, or set [dfm] via_cover); the other vias are judged as KiCad tents them")
+    stated = sum(1 for v in b.snap["vias"] if (v.get("protect") or {}).get("filled") or any((v.get("protect") or {}).get("plugged") or []))
+    return dict(result("via_pad", "MF14", "Vias in and beside SMD pads", {"via_cover": cover, "via_cover_source": csrc,
+                       "per_via": "the design's filling and plugging per via, else " + ("the board config" if cfg_cover else
+                                  f"{dflt} for vias in pads (assumed) and KiCad's tenting for the others")},
+                       {"vias": {"in_pads": n_in, "cover": cover, "stated_in_design": stated, "assumed_in_pads": len(assumed_in_pad)}},
+                       agg.findings("vias")), checked=n_pads if len(V["x"]) else 0, assumption=assumption)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -892,7 +937,7 @@ def rule_paste(ctx, fabr):
     ap_min = fabr.judge("stencil_aperture_min_mm", "paste")
     ts = sorted(fabr.get("stencil_thickness_mm") or [])
     agg = Agg("paste")
-    assumption, pred = None, None
+    assumption, pred, opts = None, None, []
     if cfg["dfm"]["stencil_mm"]:
         t, tsrc = cfg["dfm"]["stencil_mm"], "board config"
     else:
@@ -907,11 +952,22 @@ def rule_paste(ctx, fabr):
             agg.add(("stencil_unknown",), "warning", 0.0, f"the stencil thickness is not known: {why}. Set [dfm] stencil_mm in the board "
                     f"config to the thickness that will be ordered", basis="board config needed", kind="stencil_unknown")
             return dict(result("paste", "MF15", "Stencil apertures", {"stencil_mm": None, "stencil_source": why}, {"prediction": pred},
-                               agg.findings("pads")), checked=0, unchecked=True)
+                               agg.findings("pads")), checked=0, unchecked=f"the stencil thickness is not known ({why}): set [dfm] stencil_mm")
         t = pred["thickness_mm"]
         tsrc = (f"predicted: {fabr.name}'s guide gives {t:g} mm for {pred['row']}, the board's finest ({pred['part']}); "
                 f"the fabricator chooses unless the order states it")
         assumption = f"stencil {t:g} mm, as {fabr.name}'s guide gives for {pred['part']} ({pred['row']}); state it in the order or set [dfm] stencil_mm"
+        # the fabricator may choose any thickness of the guide's recommended range for that part: the
+        # apertures are judged at every standard thickness within it
+        lo_, hi_ = pred.get("range_mm") or (t, t)
+        opts = sorted({round(x, 3) for x in list(ts) + [0.13] if lo_ - 1e-9 <= x <= hi_ + 1e-9} | {t})
+        if len(opts) > 1:
+            tsrc += (f"; judged also at {', '.join(f'{x:g}' for x in opts if x != t)} mm, within the guide's {lo_:g} to {hi_:g} mm"
+                     + (f" (the ranges of {', '.join(pred['range_from'])}, which share the commonly used thickness)" if len(pred.get("range_from") or []) > 1 else ""))
+            assumption = (f"stencil {t:g} mm, as {fabr.name}'s guide gives for {pred['part']} ({pred['row']}); its recommended range is "
+                          f"{lo_:g} to {hi_:g} mm, and the apertures were judged at {', '.join(f'{x:g}' for x in opts)} mm; state the "
+                          f"thickness in the order or set [dfm] stencil_mm")
+    thick = max(opts) if (assumption and opts) else t
     n, worst_ar, need = 0, None, None
     with_paste = set()
     for p in b.pads:
@@ -924,7 +980,8 @@ def rule_paste(ctx, fabr):
         # its width for the aspect ratio is the largest disc that fits in it
         pl = next(iter(p["paste"]))
         ap = (p.get("paste_poly") or {}).get(pl)
-        dm = padgeom.measure(ap, p["x"], p["y"], p.get("rot", 0.0)) if ap else None
+        dm = padgeom.measure(ap, p["x"], p["y"], p.get("rot", 0.0), symmetric=p.get("shape") in ("rect", "roundrect", "oval", "circle")
+                             and p.get("core") is not None and p["core"].get("pts") is not None) if ap else None
         if dm is None or dm["area"] <= 0:
             continue
         w, h = dm["w"], dm["h"]
@@ -948,13 +1005,20 @@ def rule_paste(ctx, fabr):
                     f"{ar:.2f} and an aspect ratio of {asp:.1f} with a {t:g} mm stencil ({tsrc}); IPC-7525 asks for at least {ar_min:g} and "
                     f"{as_min:g}: the paste may not release", p["x"], p["y"], part=p["ref"], net=p["net"], layer=lay,
                     limit=ar_min, unit="", basis="industry standard (IPC-7525)", kind="ratio:" + p["ref"])
+        elif thick > t + 1e-9 and ((ar_min and A / (P * thick) < ar_min - 1e-3) or (as_min and small / thick < as_min - 1e-3)):
+            ok_to = min(A / (P * ar_min) if ar_min else 9, small / as_min if as_min else 9)
+            agg.add(("ratio_range", p["ref"]), "warning", A / (P * thick), f"{pname}: paste aperture {w:.2f} x {h:.2f} mm prints with the "
+                    f"predicted {t:g} mm stencil (area ratio {ar:.2f}) but not with a {thick:g} mm one (area ratio {A / (P * thick):.2f}, "
+                    f"aspect {small / thick:.1f}; IPC-7525: {ar_min:g} and {as_min:g}), which {fabr.name}'s guide also recommends for "
+                    f"{', '.join(pred.get('range_from') or [pred['part']])}: order a stencil of {ok_to:.3f} mm or thinner", p["x"], p["y"], part=p["ref"], net=p["net"], layer=lay,
+                    limit=ar_min, unit="", basis="industry standard (IPC-7525)", kind="ratio_range:" + p["ref"])
     for ref, fp in b.fps.items():                              # a placed SMD part with pads but no paste at all
         pads = [p for p in b.pads_by_ref.get(ref, []) if p["kind"] == "smd"]
         if len(pads) >= 2 and ref not in with_paste and not fp.get("dnp") and fp.get("placed", True):
             agg.add(("no_paste", ref), "warning", 0.0, f"{ref}: {len(pads)} SMD pads and no paste aperture: the part cannot be reflowed",
                     fp["x"], fp["y"], part=ref, layer=pads[0]["layers"][0] if pads[0]["layers"] else "", basis="geometry", kind="no_paste:" + ref)
     fit = [x for x in ts if need is None or x <= need + 1e-9]
-    metrics = {"stencil": {"apertures": n, "judged_at_mm": t, "min_area_ratio": None if worst_ar is None else round(worst_ar, 2),
+    metrics = {"stencil": {"apertures": n, "judged_at_mm": opts or [t], "min_area_ratio": None if worst_ar is None else round(worst_ar, 2),
                            "thickest_stencil_that_prints_all_mm": None if need is None else round(need, 3),
                            "standard_thicknesses_that_fit_mm": fit}}
     if pred:
@@ -1141,27 +1205,69 @@ def _blobs(diff, g, cap=4):
 
 
 def rule_output(ctx, fabr, od, gerber_dir, log):
-    """The Gerber and drill files against the geometry that was checked. With `gerber_dir` the files
-    there are read (the ones that will be sent); without it they are plotted now with kicad-cli and
-    kept in <run>/dfm/fab_files, and the check then only shows that the reader and the plot agree."""
+    """The Gerber and drill files against the geometry that was checked, in two parts:
+
+    - the board plotted now by kicad-cli (kept in <run>/dfm/fab_files) against the reader's geometry:
+      KiCad's own rendering of every pad (custom primitives, padstacks), mask and paste opening and
+      the outline, so this is the run-time check of the reader on what the KiCadFiles cross-check does
+      not read. A difference means the review cannot rely on its input: "could not check".
+    - with `gerber_dir`, the files that will be sent against the same geometry: a difference fails.
+      Without it the verdict assumes the plotted files are the ones sent."""
+    src = os.path.join(od, "fab_files")
+    try:
+        cmd = _plot(ctx.b.path, list(ctx.b.layers) + ["F.Mask", "B.Mask", "F.Paste", "B.Paste", "Edge.Cuts"], src, log)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        fs = [finding("output_match", "warning", f"the fabrication files could not be plotted ({e}): the reader was not checked against "
+                      f"KiCad's plot", kind="plot")]
+        return dict(result("output_match", "MF20", "The files that are sent against the geometry that was checked", {}, {}, fs),
+                    checked=0, unchecked="the files could not be plotted")
+    own = _match_files(ctx, src, False, cmd, log)
+    reader_bad = [f for f in own["fs"] if f["severity"] == "error"]
+    fs = [dict(f, severity="warning", kind="reader:" + (f.get("kind") or ""), msg="KiCad's plot of the board and the reader disagree: " + f["msg"])
+          if f["severity"] == "error" else f for f in own["fs"]]
+    metrics = {"plotted": own["metrics"]}
+    params = dict(own["params"], plotted=src)
+    checked = own["compared"]
+    unchecked = ""
+    assumption = None
+    if reader_bad:
+        unchecked = (f"KiCad's plot of the board and the reader disagree in {len(reader_bad)} places: the checks may have worked on "
+                     f"wrong geometry")
+    elif not own["compared"]:
+        unchecked = "no plotted file could be compared"
+    if gerber_dir:
+        if not os.path.isdir(gerber_dir):
+            raise FileNotFoundError(f"--gerbers {gerber_dir}: no such folder")
+        sent = _match_files(ctx, os.path.abspath(gerber_dir), True, None, log)
+        fs += sent["fs"]
+        metrics["sent"] = sent["metrics"]
+        params.update(files=sent["params"]["files"], source="supplied with --gerbers", offset_mm=sent["params"]["offset_mm"])
+        checked += sent["compared"]
+        if not sent["compared"] and not unchecked:
+            unchecked = "no file given with --gerbers could be compared"
+    else:
+        params["source"] = "plotted now by kicad-cli (no --gerbers)"
+        assumption = (f"the files sent are the ones plotted in {src}: no --gerbers DIR was given, so files plotted earlier "
+                      f"were not checked")
+        fs.append(finding("output_match", "info", f"the files in {src} were plotted from the board just now and agree with what was "
+                          f"checked; files plotted earlier were not seen: send these, or check the ones you will send with --gerbers DIR",
+                          kind="plotted"))
+    out = dict(result("output_match", "MF20", "The files that are sent against the geometry that was checked", params, metrics, fs),
+               checked=checked, unchecked=unchecked)
+    if assumption:
+        out["assumption"] = assumption
+    return out
+
+
+def _match_files(ctx, src, supplied, cmd=None, log=print):
+    """One folder of fabrication files against the board's geometry: {fs, metrics, params, compared}."""
     from . import gerber
     b = ctx.b
     g = b.grid()
     L = len(b.layers)
     fs = []
-    supplied = bool(gerber_dir)
-    src = os.path.abspath(gerber_dir) if supplied else os.path.join(od, "fab_files")
-    cmd = None
-    if not supplied:
-        try:
-            cmd = _plot(b.path, list(b.layers) + ["F.Mask", "B.Mask", "F.Paste", "B.Paste", "Edge.Cuts"], src, log)
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-            fs.append(finding("output_match", "warning", f"the fabrication files could not be plotted ({e}); the checks ran on the board "
-                              f"file only", kind="plot"))
-            return dict(result("output_match", "MF20", "The files that are sent against the geometry that was checked", {}, {}, fs),
-                        checked=0, unchecked="the files could not be plotted")
     if not os.path.isdir(src):
-        raise FileNotFoundError(f"--gerbers {gerber_dir}: no such folder")
+        raise FileNotFoundError(f"{src}: no such folder")
     files, drills, unread = {}, [], []
     for name in sorted(os.listdir(src)):
         path = os.path.join(src, name)
@@ -1289,19 +1395,9 @@ def rule_output(ctx, fabr, od, gerber_dir, log):
     _outline_match(b, files.get("Edge.Cuts"), dx, dy, fs, metrics, supplied)
     # placement and BOM files, when they are among the files
     _placement_match(b, src, dx, dy, fs, metrics, supplied)
-    if not supplied and compared:
-        fs.append(finding("output_match", "info", f"the files in {src} were plotted from the board just now. They agree with what was checked"
-                          f"{'' if not any(f['severity'] == 'error' for f in fs) else ' except as listed'}, but that says nothing about files "
-                          f"plotted earlier: send these files, or check the ones you will send with --gerbers DIR", kind="plotted"))
-    params = {"files": src, "source": "supplied with --gerbers" if supplied else "plotted now by kicad-cli", "command": cmd,
-              "offset_mm": [dx, dy], "resolution_mm": g.res,
+    params = {"files": src, "command": cmd, "offset_mm": [dx, dy], "resolution_mm": g.res,
               "detects": "tracks, pads and vias to 1 um in position and size; other copper, mask and paste differences wider than two pixels"}
-    unchecked = "" if compared else "no file could be compared"
-    if not supplied:
-        unchecked = ("the files that will be sent were not given (--gerbers DIR): only the plotter and the reader were compared, "
-                     "a self-test of this check")
-    return dict(result("output_match", "MF20", "The files that are sent against the geometry that was checked", params, metrics, fs),
-                checked=compared, unchecked=unchecked)
+    return {"fs": fs, "metrics": metrics, "params": params, "compared": compared}
 
 
 VEC_TOL = 0.001      # mm: position and size of a feature in the files against the board
@@ -1312,6 +1408,8 @@ def _expected_wh(p, poly_w, poly_h, margin=(0.0, 0.0)):
     """The extent a standard pad shape plots with, in board axes: exact from its size when the pad is at
     a multiple of 90 degrees, else its polygon's extent (then with the polygon's arc error allowed).
     Returns (w, h, tolerance)."""
+    if p.get("layer_poly"):                       # a padstack: the layer's own shape, from its polygon
+        return poly_w, poly_h, 3 * VEC_TOL + 2 * POLY_ERR
     rot = (p.get("rot") or 0.0) % 180
     if p.get("shape") in ("circle", "rect", "oval", "roundrect", "trapezoid", "chamfered_rect") and min(rot, 180 - rot) < 1e-6 or abs(rot - 90) < 1e-6:
         w, h = p["sx"] + 2 * margin[0], p["sy"] + 2 * margin[1]
@@ -1365,7 +1463,7 @@ def _vector_match(b, files, dx, dy, fs):
             if lname not in p["layers"] or p.get("shape") == "custom" or not p["poly"]:
                 continue
             st["pads"] += 1
-            rings = _rings(p["poly"])
+            rings = _rings(model.pad_poly(p, lname))
             P = np.vstack([np.asarray(r) for r in rings])
             w, h = P[:, 0].max() - P[:, 0].min(), P[:, 1].max() - P[:, 1].min()
             cands = ft.query_ball_point((p["x"], p["y"]), VEC_TOL * 2) if len(F) else []
@@ -1455,6 +1553,25 @@ def _outline_match(b, G, dx, dy, fs, metrics, supplied):
                           basis="the fabrication files"))
 
 
+def _norm_value(v):
+    """A part value in one spelling: case, spaces, ohm signs, micro signs and a farad or henry unit after a
+    prefix do not matter ("10k", "10 kΩ" and "10K ohm" are one value, as are "100n" and "100 nF"); a
+    decimal comma is a point."""
+    v = str(v or "").strip().lower().replace("µ", "u").replace("μ", "u").replace(",", ".")
+    v = re.sub(r"\s+", "", v)
+    v = re.sub(r"(ω|ohms?)$", "", v)
+    v = re.sub(r"(ω|ohms?)(?=[^a-z])", "", v)
+    v = re.sub(r"(?<=\d[pnumk])[fh]$", "", v)          # the unit after a prefix: 100nF = 100n, 10uH = 10u
+    return v
+
+
+def _same_fp(bom_fp, fpid):
+    """A BOM's footprint against the board's library id: the same when equal, or when one lacks the
+    library part (\"Lib:Name\" against \"Name\")."""
+    a, b_ = str(bom_fp).strip(), str(fpid).strip()
+    return a == b_ or a.split(":")[-1] == b_.split(":")[-1]
+
+
 def _placement_match(b, src, dx, dy, fs, metrics, supplied):
     """A placement (pos) file and a BOM among the files: references, sides and positions of the fitted parts."""
     import csv
@@ -1491,34 +1608,58 @@ def _placement_match(b, src, dx, dy, fs, metrics, supplied):
             oy = np.median([got[r][1] + b.fps[r]["y"] for r in common])
             moved = [r for r in common if math.hypot(got[r][0] - ox - b.fps[r]["x"], -(got[r][1] - oy) - b.fps[r]["y"]) > 0.002]
             side = [r for r in common if (got[r][3].startswith("b")) != (b.fps[r]["side"] == "B")]
+            # KiCad's placement file gives each part its footprint's own angle, front and back alike
+            # (checked on the reference corpus); 0.01 degree is the file's precision
+            turned = [r for r in common if abs((got[r][2] - b.fps[r]["rot"] + 180) % 360 - 180) > 0.01]
         else:
-            moved, side = [], []
+            moved, side, turned = [], [], []
         missing = sorted(fitted - set(got))
         extra = sorted(set(got) - set(b.fps))
         metrics["placement"] = {"file": os.path.basename(pos), "parts": len(got), "missing": missing[:20], "not_on_board": extra[:20],
-                                "moved": moved[:20], "other_side": side[:20]}
-        if missing or extra or moved or side:
+                                "moved": moved[:20], "other_side": side[:20], "other_rotation": turned[:20]}
+        if missing or extra or moved or side or turned:
+            eg = (missing + extra + moved + side + turned)[0]
             fs.append(finding("output_match", "error", f"the placement file {os.path.basename(pos)} differs from the board: "
                               f"{len(missing)} fitted parts missing, {len(extra)} not on the board, {len(moved)} at another position, "
-                              f"{len(side)} on the other side" + (f" (e.g. {(missing + extra + moved + side)[0]})"),
-                              kind="placement", value=len(missing) + len(extra) + len(moved) + len(side), basis="the fabrication files"))
+                              f"{len(side)} on the other side, {len(turned)} at another rotation (e.g. {eg}"
+                              + (f": {got[eg][2]:g} degrees in the file, {b.fps[eg]['rot']:g} on the board" if eg in turned else "") + ")",
+                              kind="placement", value=len(missing) + len(extra) + len(moved) + len(side) + len(turned), basis="the fabrication files"))
     elif supplied:
         fs.append(finding("output_match", "info", "no placement (pos) file among the files: placement was not compared", kind="no_pos"))
     if bom:
         rows = list(csv.reader(open(bom, encoding="utf-8", errors="replace")))
         head = [h.lower() for h in rows[0]] if rows else []
-        col = next((i for i, h in enumerate(head) if h in ("reference", "references", "designator", "ref", "refs")), None)
-        refs = set()
+        col = next((i for i, h in enumerate(head) if h in ("reference", "references", "designator", "designators", "ref", "refs")), None)
+        vcol = next((i for i, h in enumerate(head) if h in ("value", "val", "comment")), None)
+        fcol = next((i for i, h in enumerate(head) if h in ("footprint", "package", "fp")), None)
+        refs, val_of, fp_of = set(), {}, {}
         for r in rows[1:]:
             if col is not None and col < len(r):
-                refs |= {x.strip() for x in re.split(r"[,\s]+", r[col]) if x.strip()}
+                these = {x.strip() for x in re.split(r"[,\s]+", r[col]) if x.strip()}
+                refs |= these
+                for x in these:
+                    if vcol is not None and vcol < len(r):
+                        val_of[x] = r[vcol]
+                    if fcol is not None and fcol < len(r):
+                        fp_of[x] = r[fcol]
         want = {r for r, fp in b.fps.items() if not fp.get("dnp") and fp.get("in_bom", True) and b.pads_by_ref.get(r)}
+        # the part each line orders: its value and footprint against the board's (a different value or
+        # footprint places another part)
+        wrong_v = sorted(r for r in want & refs if r in val_of and _norm_value(val_of[r]) != _norm_value(b.fps[r].get("value", "")))
+        wrong_f = sorted(r for r in want & refs if r in fp_of and fp_of[r].strip() and not _same_fp(fp_of[r], b.fps[r].get("fpid", "")))
         metrics["bom"] = {"file": os.path.basename(bom), "refs": len(refs), "missing": sorted(want - refs)[:20],
-                          "not_fitted_or_absent": sorted(refs - want)[:20]}
-        if want - refs or refs - want:
+                          "not_fitted_or_absent": sorted(refs - want)[:20], "other_value": wrong_v[:20], "other_footprint": wrong_f[:20],
+                          "compared": [k for k, c in (("value", vcol), ("footprint", fcol)) if c is not None]}
+        if want - refs or refs - want or wrong_v or wrong_f:
+            eg = next(iter(wrong_v), None)
             fs.append(finding("output_match", "error", f"the BOM {os.path.basename(bom)} differs from the board's fitted parts: "
-                              f"{len(want - refs)} missing, {len(refs - want)} not fitted or not on the board", kind="bom",
-                              value=len(want - refs) + len(refs - want), basis="the fabrication files"))
+                              f"{len(want - refs)} missing, {len(refs - want)} not fitted or not on the board, {len(wrong_v)} with another "
+                              f"value, {len(wrong_f)} with another footprint"
+                              + (f" (e.g. {eg}: '{val_of[eg]}' in the BOM, '{b.fps[eg].get('value', '')}' on the board)" if eg else ""),
+                              kind="bom", value=len(want - refs) + len(refs - want) + len(wrong_v) + len(wrong_f), basis="the fabrication files"))
+        if vcol is None:
+            fs.append(finding("output_match", "warning", f"the BOM {os.path.basename(bom)} has no value column: only references were compared",
+                              kind="bom_no_value"))
     elif supplied:
         fs.append(finding("output_match", "info", "no BOM among the files: the BOM was not compared", kind="no_bom"))
 
@@ -1589,10 +1730,12 @@ MIN_DEFECTIVE = 5          # fewer defective parts than this: no order score is 
 
 
 def score_observed(path, rankings, boot=1000):
-    """How well each ranking orders the parts that showed a defect: the share of (defective, sound) pairs
-    it puts in the right order (0.5 = chance, 1 = every defective part above every sound one), with a
-    bootstrap 95 % interval and the counts it rests on. The file must say how many boards were built;
-    below MIN_DEFECTIVE defective parts a ranking gets no score ("insufficient data")."""
+    """How well each ranking orders the parts by their observed defect rate (defects / boards built):
+    the share of (defective, sound) pairs it puts in the right order, each defective part weighted by
+    its rate (0.5 = chance, 1 = every defective part above every sound one; a part that failed on 9
+    of 10 boards counts nine times one that failed once), with a bootstrap 95 % interval over the
+    parts and the counts it rests on. Each part's rate is listed. The file must say how many boards
+    were built; below MIN_DEFECTIVE defective parts a ranking gets no score ("insufficient data")."""
     data = tomllib.loads(open(path, "rb").read().decode())
     obs = data.get("defect", [])
     built = data.get("boards_built")
@@ -1620,21 +1763,33 @@ def score_observed(path, rankings, boot=1000):
         cols.append(("reflow: below the median peak", {x["ref"]: -x["d_peak_c"] for x in rankings["reflow"]["rows"]}))
     rng = np.random.default_rng(0)
 
-    def auc(pos, neg):
-        return float(((pos[:, None] > neg[None, :]).sum() + 0.5 * (pos[:, None] == neg[None, :]).sum()) / (len(pos) * len(neg)))
+    def auc(pos, w, neg):
+        """Rate-weighted share of (defective, sound) pairs in the right order."""
+        right = (pos[:, None] > neg[None, :]).sum(axis=1) + 0.5 * (pos[:, None] == neg[None, :]).sum(axis=1)
+        return float((w * right).sum() / (w.sum() * len(neg)))
+    over = [r for refs in kinds.values() for r, c in refs.items() if c > built]
+    if over:
+        out["error"] = f"more defects than boards built for {', '.join(sorted(set(over))[:5])}: count is defects of that part over all boards"
+        return out
+    out["rates"] = {kind: {r: round(c / built, 4) for r, c in sorted(refs.items(), key=lambda kv: -kv[1])} for kind, refs in kinds.items()}
     for kind, refs in kinds.items():
         for name, score in cols:
-            pos = np.array([score[r] for r in refs if r in score])
+            have = [r for r in refs if r in score]
+            pos = np.array([score[r] for r in have])
+            w = np.array([refs[r] / built for r in have])
             neg = np.array([v for r, v in score.items() if r not in refs])
             if not len(pos) or not len(neg):
                 continue
             row = {"kind": kind, "ranking": name, "defective_ranked": len(pos), "sound": len(neg), "boards_built": built,
-                   "defects": sum(refs[r] for r in refs if r in score)}
+                   "defects": sum(refs[r] for r in have), "weighting": "each defective part by its defect rate (count / boards built)"}
             if len(pos) < MIN_DEFECTIVE:
                 row.update(order=None, note=f"insufficient data: {len(pos)} defective parts, at least {MIN_DEFECTIVE} needed")
             else:
-                bs = [auc(rng.choice(pos, len(pos)), rng.choice(neg, len(neg))) for _ in range(boot)]
-                row.update(order=round(auc(pos, neg), 2), ci95=[round(float(np.percentile(bs, 2.5)), 2), round(float(np.percentile(bs, 97.5)), 2)])
+                bs = []
+                for _ in range(boot):
+                    i = rng.integers(0, len(pos), len(pos))
+                    bs.append(auc(pos[i], w[i], rng.choice(neg, len(neg))))
+                row.update(order=round(auc(pos, w, neg), 2), ci95=[round(float(np.percentile(bs, 2.5)), 2), round(float(np.percentile(bs, 97.5)), 2)])
             out["scores"].append(row)
     return out
 
@@ -1690,7 +1845,7 @@ def run(board, cfg_path=None, fab=None, checks=None, out_dir=None, waivers=None,
 
     if "audit" in want:
         log("MF19 KiCad's rules against the fabricator's:")
-        rules["rule_audit"] = timed("audit", lambda: rule_audit(ctx, fabr))
+        rules["rule_audit"] = timed("audit", lambda: rule_audit(ctx, fabr, measured={n for g_ in want for n in GROUPS[g_]}))
         for r in rules["rule_audit"]["rows"]:
             log(f"  {r['rule']:28s} KiCad {r['kicad_mm']}  {fabr.name} {' / '.join(f'{v:g}' for v in r['fab'].values())}  {r['verdict']}")
     if "copper" in want:
@@ -1734,10 +1889,10 @@ def run(board, cfg_path=None, fab=None, checks=None, out_dir=None, waivers=None,
     if "output" in want:
         log(f"MF20 the files that are sent ({'supplied: ' + gerbers if gerbers else 'plotted now'}):")
         rules["output_match"] = timed("output", lambda: rule_output(ctx, fabr, od, gerbers, log))
-        m = rules["output_match"]["metrics"]
-        log(f"  {rules['output_match']['checked']} files compared; differences: "
-            + (", ".join(f"{k} {v['differences']}" for k, v in m.items() if "differences" in v and v["differences"]) or "none")
-            + (f"; holes {m['holes']}" if "holes" in m else ""))
+        for part, m in rules["output_match"]["metrics"].items():
+            log(f"  {'KiCad plot against the reader' if part == 'plotted' else 'files to send'}: differences: "
+                + (", ".join(f"{k} {v['differences']}" for k, v in m.items() if isinstance(v, dict) and v.get("differences")) or "none")
+                + (f"; holes {m['holes']}" if "holes" in m else ""))
     internal = None
     if "reflow" in want or "chips" in want:
         log("MF7 reflow ranking (model):")
@@ -1801,7 +1956,7 @@ def run(board, cfg_path=None, fab=None, checks=None, out_dir=None, waivers=None,
                 c["note"] += "; SOLVER CASES FAIL"
         else:
             c["status"] = ("fail" if c["fail"] else "could not check" if r.get("unchecked") else "warn" if c["warn"] else
-                           "pass" if r.get("checked") else "nothing to check")
+                           ("pass with assumptions" if r.get("assumption") else "pass") if r.get("checked") else "nothing to check")
             c["note"] = r.get("unchecked") or r.get("note") or (f"{r.get('checked')} items" if r.get("checked") else "")
             if name in ("fab_space", "same_net_gap") and not verified["etch"]:
                 c["status"], c["note"] = "could not check", "the measurement cases fail"
@@ -1818,6 +1973,11 @@ def run(board, cfg_path=None, fab=None, checks=None, out_dir=None, waivers=None,
         status = "pass with assumptions"
         code = max(code, 1)
     checklist = order_checklist(ctx, fabr, rules)
+    # a rule that ran and could not check leaves the verdict open: no pass or warn stands on it
+    blocked = [c for c in per if c["tier"] == "rule" and c["status"] == "could not check"]
+    if blocked and status != "fail":
+        status, code = "could not check", 3
+        log(f"could not check: {', '.join(c['check'] + ' (' + str(c['note']) + ')' for c in blocked)}")
     if xchk and xchk["n_problems"]:
         status, code = "could not check", 3
         log(f"the two readings of the board differ ({xchk['n_problems']}): the review cannot rely on its input; e.g. {xchk['problems'][0]}")
@@ -1955,23 +2115,29 @@ def write_html(ev, path):
     if r:
         p = r["params"]
         H.append(f"<h2>The files that are sent (MF20)</h2><p class=mut>Files: {e(str(p.get('files')))} ({e(str(p.get('source')))}). "
-                 f"Compared at {p.get('resolution_mm')} mm; detects {e(str(p.get('detects')))}. What the fabricator's CAM does with the files "
-                 f"is not visible here.</p><div class=wrap><table><tr><th>Layer</th><th>File</th><th class=n>in the file (mm2)</th>"
-                 f"<th class=n>checked (mm2)</th><th class=n>differences</th></tr>")
-        for k, m in r["metrics"].items():
-            if "file_mm2" in m:
-                H.append(f"<tr><td>{e(k)}</td><td>{e(m['file'])}</td><td class=n>{m['file_mm2']}</td><td class=n>{m['checked_mm2']}</td>"
-                         f"<td class=n>{m['differences']}</td></tr>")
-        H.append("</table></div>")
-        if "holes" in r["metrics"]:
-            H.append(f"<p class=mut>Holes: {e(json.dumps(r['metrics']['holes']))}</p>")
-        feat = r["metrics"].get("features") or {}
-        if feat:
-            H.append("<p>Feature by feature (1 um):</p><div class=wrap><table><tr><th>Layer</th><th>Compared</th></tr>"
-                     + "".join(f"<tr><td>{e(k)}</td><td class=mut>{e(json.dumps(v))}</td></tr>" for k, v in feat.items()) + "</table></div>")
-        for k in ("outline", "placement", "bom"):
-            if k in r["metrics"]:
-                H.append(f"<p class=mut>{k.title()}: {e(json.dumps(r['metrics'][k]))}</p>")
+                 f"The board is also plotted by KiCad now and compared with what the reader read (the run-time check of the reader on "
+                 f"pads, mask, paste and outline). Compared at {p.get('resolution_mm')} mm; detects {e(str(p.get('detects')))}. What the "
+                 f"fabricator's CAM does with the files is not visible here.</p>")
+        for part, title in (("plotted", "KiCad's plot against the reader"), ("sent", "The files to send against the board")):
+            M = r["metrics"].get(part)
+            if not M:
+                continue
+            H.append(f"<h3>{e(title)}</h3><div class=wrap><table><tr><th>Layer</th><th>File</th><th class=n>in the file (mm2)</th>"
+                     f"<th class=n>checked (mm2)</th><th class=n>differences</th></tr>")
+            for k, m in M.items():
+                if isinstance(m, dict) and "file_mm2" in m:
+                    H.append(f"<tr><td>{e(k)}</td><td>{e(m['file'])}</td><td class=n>{m['file_mm2']}</td><td class=n>{m['checked_mm2']}</td>"
+                             f"<td class=n>{m['differences']}</td></tr>")
+            H.append("</table></div>")
+            if "holes" in M:
+                H.append(f"<p class=mut>Holes: {e(json.dumps(M['holes']))}</p>")
+            feat = M.get("features") or {}
+            if feat:
+                H.append("<p>Feature by feature (1 um):</p><div class=wrap><table><tr><th>Layer</th><th>Compared</th></tr>"
+                         + "".join(f"<tr><td>{e(k)}</td><td class=mut>{e(json.dumps(v))}</td></tr>" for k, v in feat.items()) + "</table></div>")
+            for k in ("outline", "placement", "bom"):
+                if k in M:
+                    H.append(f"<p class=mut>{k.title()}: {e(json.dumps(M[k]))}</p>")
     H.append("<h2>Limits used</h2><div class=wrap><table><tr><th>Limit</th><th>Value</th><th>Origin</th><th>Measures</th><th>Certainty</th>"
              "<th>Judged by</th><th>The page's words</th><th>Note</th></tr>")
     for l in fabd["limits"]:
@@ -2039,13 +2205,14 @@ def write_html(ev, path):
         H.append("<h2>Ranking: chips, time between the two joints melting (MF8, model)</h2>"
                  "<p class=mut>Timing is one input to tombstoning; the wetting forces (pad geometry, paste volume and offset, placement, "
                  "alloy) are not modelled, so the land geometry is listed beside it. <i>dt</i> is the difference of the two joints' lag "
-                 "times; <i>range</i> is over the assumed paste conductance (x 0.5, x 2), the film coefficient (x 0.6, x 1.6) and a window "
-                 "twice as large; <i>in this oven</i> is the same window marched through the oven profile of the board run, which also "
-                 "carries one pad into each zone before the other (<i>belt</i>: the first pad's lead). Each figure's sensitivity to the "
-                 "model's parameters (paste, window, film coefficient; not an error bar) and the oven "
-                 f"figure are given for the first {p['detail']} layouts. Parts with the same layout and result share a row. The window's "
-                 f"edge follows the {e(p['edge'])}.</p><div class=wrap><table><tr><th>Parts</th><th>Package</th><th class=n>dt (s)</th>"
-                 "<th>dt sensitivity (s)</th><th class=n>in this oven (s)</th><th>oven sensitivity (s)</th><th class=n>belt (s)</th><th>melts first</th><th>melts last</th><th>copper leaving the pads (mm)</th>"
+                 "times plus the belt term (the belt carries one pad into each zone first) for the direction the board travels; when "
+                 f"that is not stated ([reflow] travel: {e(str(p.get('travel', '')))}), dt excludes the belt term and the range covers the "
+                 "four directions. <i>range</i> is over the assumed paste conductance (x 0.5, x 2), the film coefficient (x 0.6, x 1.6) and "
+                 "a window twice as large, and the belt term: its sensitivity to these, not an error bar. <i>check</i>: the same window "
+                 f"marched through the oven of the board run, against the lag difference plus that direction's belt term (the first "
+                 f"{p['detail']} layouts). Parts with the same layout and result share a row. The window's edge follows the "
+                 f"{e(p['edge'])}.</p><div class=wrap><table><tr><th>Parts</th><th>Package</th><th class=n>dt (s)</th>"
+                 "<th>range (s)</th><th class=n>belt, largest (s)</th><th>check: oven / lag + belt (s)</th><th>melts first</th><th>melts last</th><th>copper leaving the pads (mm)</th>"
                  "<th class=n>toe (mm)</th><th class=n>pad areas</th></tr>")
         for x in r["rows"][:30]:
             refs = ", ".join(x["refs"][:5]) + (f" +{x['n'] - 5}" if x["n"] > 5 else "")
@@ -2054,9 +2221,8 @@ def write_html(ev, path):
                             for q in x["pads"])
             rng = f"{x['dt_range_s'][0]:g} to {x['dt_range_s'][1]:g}" if x.get("dt_range_s") else ""
             H.append(f"<tr><td>{e(refs)}</td><td>{e(x['package'])}</td><td class=n>{x['dt_s']:g}</td><td>{rng}</td>"
-                     f"<td class=n>{'' if x.get('dt_oven_s') is None else format(x['dt_oven_s'], 'g')}</td>"
-                     f"<td>{'' if not x.get('dt_oven_range_s') else format(x['dt_oven_range_s'][0], 'g') + ' to ' + format(x['dt_oven_range_s'][1], 'g')}</td>"
-                     f"<td class=n>{x.get('belt_s', 0):+.2f}</td>"
+                     f"<td class=n>{x.get('belt_max_s', 0):.2f}</td>"
+                     f"<td>{'' if not x.get('oven_check') else format(x['oven_check']['oven_s'], 'g') + ' / ' + format(x['oven_check']['lag_plus_belt_s'], 'g')}</td>"
                      f"<td>{e(str(x['first_pad']))} {e(x['first_net'])}</td><td>{e(str(x['last_pad']))} {e(x['last_net'])}</td>"
                      f"<td class=mut>{e(ent)}</td><td class=n>{x['land']['toe_mm']:.2f}</td><td class=n>{x['land']['area_ratio']:g}</td></tr>")
         H.append(f"</table></div><p class=mut>The {min(30, len(r['rows']))} layouts with the largest difference of {r['summary']['layouts']} "

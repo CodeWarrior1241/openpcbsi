@@ -12,6 +12,7 @@ Status: pass, fail, blocked (needs an input this machine does not have), error (
 """
 import argparse
 import glob
+import gzip
 import json
 import math
 import os
@@ -21,6 +22,8 @@ import subprocess
 import sys
 import time
 import traceback
+
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -985,8 +988,8 @@ def t38_mask():
     need(not ev_findings(r2["ev"], "via_pad"), "a via in a pad is reported although the vias are ordered filled and capped")
     clean = dfm(boards.mask_board(d, "clean", planted=False), "--checks", "mask")
     # without [dfm] via_cover the verdict rests on the fabricator's default covering: "pass with assumptions"
-    need(clean["ev"]["status"] == "pass with assumptions" and clean["rc"] == 1 and not clean["ev"]["findings"]
-         and any("via" in a["assumption"] for a in clean["ev"]["assumptions"]),
+    # no via in a pad: nothing about the covering is assumed (the other vias are judged as KiCad tents them)
+    need(clean["ev"]["status"] == "pass" and clean["rc"] == 0 and not clean["ev"]["findings"] and not clean["ev"]["assumptions"],
          f"clean board: {clean['ev']['status']}, exit {clean['rc']}, {len(clean['ev']['findings'])} findings")
     return ok("6 planted defects found with their values; filled vias accepted in pads; clean board has none")
 
@@ -1044,9 +1047,15 @@ def t40_chips():
     need(t["C3"]["dt_s"] >= 0.05 and t["C3"]["first_net"] == "SIGC", f"C3: {t['C3']['dt_s']} s, first {t['C3']['first_net']}")
     for ref in ("C1", "C3"):
         x = t[ref]
-        need(x.get("dt_oven_s") is not None and abs(x["dt_oven_s"] - x["dt_s"]) <= max(0.3 * x["dt_s"], 0.03),
-             f"{ref}: lag difference {x['dt_s']} s against {x.get('dt_oven_s')} s through the oven")
-        need(x["dt_range_s"][0] <= x["dt_s"] <= x["dt_range_s"][1] and x["dt_range_s"][1] > x["dt_range_s"][0], f"{ref}: range {x['dt_range_s']}")
+        # one number per chip; the belt direction is not stated, so it excludes the belt term and its
+        # range covers the four directions; the oven transient checks it
+        oc_ = x.get("oven_check")
+        need(oc_ is not None and abs(oc_["differ_s"]) <= max(oc_["sensitivity_s"], 0.05),
+             f"{ref}: the oven transient against the lag difference plus belt term: {oc_}")
+        need(x["dt_range_s"][0] <= x["dt_s"] - x["belt_max_s"] + 1e-3 and x["dt_range_s"][1] >= x["dt_s"] + x["belt_max_s"] - 1e-3,
+             f"{ref}: the range {x['dt_range_s']} does not cover the belt term of +/-{x['belt_max_s']} s around {x['dt_s']} s")
+        need("dt_oven_s" not in x, f"{ref}: a second timing figure is reported")
+    need(not _rule(r["ev"], "chips")["problems"], f"chip model problems: {_rule(r['ev'], 'chips')['problems'][:3]}")
     need(t["C1"]["pads"][1]["plane_vias"] == 1 and t["C3"]["pads"][0]["share"] > 0.6 and "toe_mm" in t["C1"]["land"], "the geometry columns are missing")
     need(not ev_findings(r["ev"], "chips") and _chk(r["ev"], "chips")["status"] == "ranked" and r["rc"] == 0,
          f"the chip ranking is judged or changes the exit code (exit {r['rc']})")
@@ -1072,15 +1081,24 @@ def t40_chips():
     so = dfm_mod.score_observed(syn, {"chips": {"rows": rows}})
     st_ = next(x for x in so["scores"] if x["ranking"] == "chips: time between the joints")
     need(st_["order"] == 1.0 and st_["ci95"][0] >= 0.9 and st_["defects"] == 12, f"scored: {st_}")
+    # the score uses the defect rates: C0, ranked last, failed on 30 of 50 boards and five parts ranked
+    # first once each; by parts the order would look good (0.83), by rate it is poor
+    syn2 = toml(os.path.join(d, "syn2.toml"), "boards_built = 50\n" + "".join(f'[[defect]]\nref = "C{k}"\nkind = "tombstone"\ncount = 1\n'
+                                                                         for k in range(15, 20)) + '[[defect]]\nref = "C0"\nkind = "tombstone"\ncount = 30\n')
+    so2 = dfm_mod.score_observed(syn2, {"chips": {"rows": rows}})
+    st2 = next(x for x in so2["scores"] if x["ranking"] == "chips: time between the joints")
+    need(st2["order"] is not None and st2["order"] < 0.3 and so2["rates"]["tombstone"]["C0"] == 0.6, f"rate-weighted score: {st2}, {so2.get('rates')}")
+    over = toml(os.path.join(d, "over.toml"), 'boards_built = 2\n[[defect]]\nref = "C1"\ncount = 3\n')
+    need("more defects than boards" in (dfm_mod.score_observed(over, {"chips": {"rows": rows}}).get("error") or ""), "3 defects on 2 boards accepted")
     # a limit needs a source that can be checked: free text is refused
     bad = toml(os.path.join(d, "badjudge.toml"), '[dfm.judge]\nsource = "lot 7 tombstone count"\njoint_dt_s = 0.1\n')
     r5 = dfm(b, "--checks", "chips", "-c", bad)
     need(r5["rc"] == 3 and "free-text source" in (r5["out"] + r5["err"]), f"free-text judge source: exit {r5['rc']}")
-    return ok(f"C1 {t['C1']['dt_s']:g} s (oven {t['C1']['dt_oven_s']:g}), C3 {t['C3']['dt_s']:g} s (oven {t['C3']['dt_oven_s']:g}), C2 {t['C2']['dt_s']:g} s; "
+    return ok(f"C1 {t['C1']['dt_s']:g} s (oven check {t['C1']['oven_check']['oven_s']:g}), C3 {t['C3']['dt_s']:g} s (oven check {t['C3']['oven_check']['oven_s']:g}), C2 {t['C2']['dt_s']:g} s; "
               f"ranked only; judged with a config limit (checked source); one defect gives no score; 6 of 20 scored with an interval")
 
 
-@case(41, "Reflow: closed-form cases pass; a heavy part ranks coldest; fiducials and parts without body data are left out and listed; nothing is judged without a limit")
+@case(41, "Reflow: closed-form cases pass; a heavy part ranks coldest; a part without body data is ranked with an estimated body, marked and varied; fiducials are left out and listed; nothing is judged without a limit")
 def t41_reflow():
     sys.path.insert(0, ROOT)
     from openpcbsi import etch, reflow
@@ -1096,7 +1114,13 @@ def t41_reflow():
     need(rule["rows"][0]["ref"] == "U1", "the 3 g part is not the coldest")
     need(p["U1"]["lag_s"] > p["R1"]["lag_s"] > p["R2"]["lag_s"] and p["U1"]["lag_s"] - p["R2"]["lag_s"] >= 10, "lag order U1 > R1 > R2 not found")
     need(p["U1"]["d_range_c"][0] < p["U1"]["d_peak_c"] < p["U1"]["d_range_c"][1], f"no range around U1: {p['U1']['d_range_c']}")
-    need(len(rule["params"]["variants"]) == 3 and rule["params"]["belt_mm_s"] > 0, "model variants or belt speed missing")
+    need(len(rule["params"]["variants"]) == 5 and rule["params"]["belt_mm_s"] > 0, f"model variants or belt speed missing: {rule['params']['variants']}")
+    # a part without body data is ranked with an estimated body (its fabrication outline, a typical QFN
+    # height), marked so, and its range covers the estimate varied x0.5 and x2
+    need("U2" in p and p["U2"]["estimated"] and "fabrication-layer outline" in p["U2"]["body"] and "QFN" in p["U2"]["body"],
+         f"the QFN without body data: {p.get('U2', 'left out')}")
+    need(not p["U1"]["estimated"] and not p["R1"]["estimated"], "parts with body data are marked estimated")
+    need(p["U2"]["d_range_c"][1] - p["U2"]["d_range_c"][0] > 0, f"no sensitivity range around the estimated body: {p['U2']['d_range_c']}")
     # a fiducial is not a soldered part: it is left out of the ranking and listed
     rf = dfm(boards.order_board(d, "fid", via_in_pad=False), "--checks", "reflow")
     rr = _rule(rf["ev"], "reflow")
@@ -1104,42 +1128,54 @@ def t41_reflow():
          f"fiducial in the reflow ranking: {[x['ref'] for x in rr['rows']]}, left out {rr['summary']['left_out']}")
     need(not ev_findings(r["ev"], "reflow") and r["rc"] == 0 and _chk(r["ev"], "reflow")["status"] == "ranked",
          f"the reflow ranking is judged (exit {r['rc']})")
-    cfg = toml(os.path.join(d, "cfg.toml"), '[dfm]\nassembly_service = "economic"\n[dfm.judge]\nsource = { kind = \"assembler\", document = \"test data\", date = \"2026-11-16\" }\nreflow_cold_c = 5.0\n')
+    cfg = toml(os.path.join(d, "cfg.toml"), '[dfm]\nassembly_service = "economic"\n[dfm.judge]\nsource = { kind = \"assembler\", document = \"test data\", date = \"2026-11-16\" }\nreflow_cold_c = 10.0\n')
     r2 = dfm(b, "--checks", "reflow", "-c", cfg)
     m2 = _rule(r2["ev"], "reflow")["summary"]["median_peak_c"]
     need(abs(m2 - 255.0) <= 0.6, f"economic service: median peak {m2} C, want 255")
     hit = {f["refs"][0] for f in ev_findings(r2["ev"], "reflow", ("warn",))}
     need(hit == {"U1"} and r2["rc"] == 1, f"with a limit from the board config: warned {sorted(hit)}")
     return ok(f"U1 {p['U1']['d_peak_c']:+.0f} C from the median (sensitivity {p['U1']['d_range_c'][0]:+.0f} to {p['U1']['d_range_c'][1]:+.0f}), "
-              f"coldest; a fiducial left out and listed; not judged without a limit; median 240 and 255 C by service")
+              f"coldest; U2 estimated ({p['U2']['d_range_c'][0]:+.1f} to {p['U2']['d_range_c'][1]:+.1f}); a fiducial left out and listed; "
+              f"not judged without a limit; median 240 and 255 C by service")
 
 
-@case(42, "Holes: via hole, via ring, hole to hole, hole to copper, through-hole ring and copper to the edge, against published limits")
+@case(42, "Holes: via hole, via ring, hole to hole (wall to wall; centre to centre only as a stated assumption), hole to copper, through-hole ring and copper to the edge (exact), against published limits")
 def t42_drill():
     d = out_dir("t42")
     r = dfm(boards.drill_board(d, "planted"), "--checks", "drill")
     need(r["ev"] and r["rc"] == 2, f"exit code {r['rc']}, want 2: {r['err'][-300:]}")
     fs = ev_findings(r["ev"], "fab_drill", ("fail",))
     want = [("via hole", 6, 6, 0.1, 0.15), ("via ring", 10, 6, 0.03, 0.05),
-            ("hole to copper", 20, 6, 0.12, 0.2), ("through-hole ring", 30, 10, 0.1, 0.15), ("copper to the edge", 25, 0.2, 0.1, 0.2),
-            ("hole to hole, centre to centre", 6.09, 12, 0.18, 0.2), ("holes that overlap", 10.125, 12, -0.05, 0.0),
+            ("hole to copper", 20, 6, 0.12, 0.2), ("through-hole ring", 30, 10, 0.1, 0.15), ("copper to the edge", 30, 0.2, 0.1, 0.2, 5.1),
+            ("holes that overlap", 10.125, 12, -0.05, 0.0),
             ("slot end to copper", 15, 14, 0.25, 0.28), ("castellated hole", 40, 8, 0.4, 0.5), ("castellated hole", 40, 8.88, 0.4, 0.5),
             ("castellated spacing", 40, 8, 0.48, 0.5)]
     matched = set()
-    for what, x, y, val, lim in want:
-        hit = [f for f in _at(fs, x, y, 1.0) if f["limit"] == lim and abs(f["value"] - val) <= 0.03]
+    for what, x, y, val, lim, *tol in want:
+        hit = [f for f in _at(fs, x, y, tol[0] if tol else 1.0) if f["limit"] == lim and abs(f["value"] - val) <= 0.03]
         need(len(hit) >= 1, f"{what}: no fail of about {val} mm against {lim} mm; have {[(f['value'], f['limit'], f['reason'][:40]) for f in fs]}")
         need("published" in hit[0]["basis"] or what == "holes that overlap", f"{what}: limit origin '{hit[0]['basis']}'")
         matched |= {f["id"] for f in hit}
     extra = [f for f in fs if f["id"] not in matched]
     need(not extra, f"fails where nothing was planted: {[(f['value'], f['limit'], f['reason'][:60]) for f in extra]}")
-    info = [f for f in ev_findings(r["ev"], "fab_drill", ("info",)) if "only if it is measured centre to centre" in f["reason"]]
-    need(len(info) == 1 and abs(info[0]["value"] - 0.12) < 0.01, f"the pair 0.12 mm apart wall to wall is not noted: {[f['reason'][:70] for f in info]}")
-    marg = [f for f in ev_findings(r["ev"], "fab_drill", ("warn",)) if "measuring slack" in f["reason"] and "board edge" in f["reason"]]
-    need(len(marg) == 1 and abs(marg[0]["value"] - 0.201) < 0.003, f"copper 1 um beyond the edge clearance is not marginal: {[(f['value'], f['reason'][:70]) for f in marg]}")
+    # hole to hole, wall to wall: the reading is interpreted (the pages do not say), so it warns; the
+    # 0.15 mm vias 0.03 mm apart and the 0.3 mm vias 0.12 mm apart, in one finding
+    hh = [f for f in ev_findings(r["ev"], "fab_drill", ("warn",)) if "apart wall to wall" in f["reason"]]
+    need(len(hh) == 1 and abs(hh[0]["value"] - 0.03) < 0.005 and "2 places" in hh[0]["reason"] and "interpreted" in hh[0]["basis"] + hh[0]["reason"],
+         f"hole to hole wall to wall: {[(f['value'], f['reason'][:100], f['basis']) for f in hh]}")
+    # copper 1 um beyond the edge clearance, against a straight edge: measured exactly, so it passes
+    need(not [f for f in ev_findings(r["ev"], "fab_drill", ("warn", "fail")) if "board edge" in f["reason"] and f["value"] > 0.15],
+         f"copper 1 um beyond the edge clearance is reported: {[f['reason'][:80] for f in fs if 'board edge' in f['reason']]}")
+    # a board config may read the spacing centre to centre: an assumption, and the pair 0.12 mm apart wall
+    # to wall (0.42 mm centre to centre) is then only noted
+    cc = toml(os.path.join(d, "cc.toml"), '[dfm]\nhole_spacing = "centre"\n')
+    rc_ = dfm(boards.drill_board(d, "planted"), "--checks", "drill", "-c", cc)
+    info = [f for f in ev_findings(rc_["ev"], "fab_drill", ("info",)) if "only if it is measured centre to centre" in f["reason"]]
+    need(len(info) == 1 and abs(info[0]["value"] - 0.12) < 0.01, f"centre to centre: the 0.12 mm wall-to-wall pair is not noted: {[f['reason'][:70] for f in info]}")
+    need(any("centre to centre" in a["assumption"] for a in rc_["ev"]["assumptions"]), f"the centre-to-centre reading is not an assumption: {rc_['ev']['assumptions']}")
     clean = dfm(boards.drill_board(d, "clean", planted=False), "--checks", "drill")
     need(clean["rc"] == 0 and not ev_findings(clean["ev"], None, ("warn", "fail")), f"clean board: exit {clean['rc']}")
-    return ok(f"{len(want)} planted hole defects found (slot end, centre-to-centre spacing, overlap, castellated); the 0.12 mm wall-to-wall pair noted; a marginal edge clearance warned; clean board clean")
+    return ok(f"{len(want)} planted hole defects found (slot end, wall-to-wall spacing, overlap, castellated, edge beside castellated pads); copper 1 um beyond the edge clearance passes (exact); centre to centre only as a stated assumption; clean board clean")
 
 
 @case(43, "Parts: stencil aperture ratios (IPC-7525), land pattern against the named chip, part spacing, pin pitch, package, sides, fiducials")
@@ -1200,15 +1236,17 @@ def t44_audit():
     return ok("unset, looser and ignored KiCad rules reported; one hole clearance compared with every hole figure; a relaxing .kicad_dru rule reported; strict rules pass")
 
 
-@case(45, "Output files: tracks, pads, vias and paste apertures compared feature by feature to 1 um; outline, placement and BOM compared; plotted files are only a self-test")
+@case(45, "Output files: tracks, pads, vias and paste apertures compared feature by feature to 1 um; outline, placement (with rotation) and BOM (with values) compared; KiCad's plot always checks the reader; without the files sent the verdict is only 'pass with assumptions'")
 def t45_output():
     d = out_dir("t45")
     b = boards.chip_board(d)
     r = dfm(b, "--checks", "output")
-    # without --gerbers the check is a self-test of the plotter and the reader: it is not a pass
-    need(r["ev"] and r["rc"] == 0 and _chk(r["ev"], "output_match")["status"] == "could not check",
-         f"plotted files: exit {r['rc']}, {_chk(r['ev'], 'output_match')['status'] if r['ev'] else ''}: {r['err'][-200:]}")
-    m = _rule(r["ev"], "output_match")["metrics"]
+    # without --gerbers KiCad's plot checks the reader, and the verdict assumes those files are sent: not a pass
+    need(r["ev"] and r["rc"] == 1 and r["ev"]["status"] == "pass with assumptions"
+         and _chk(r["ev"], "output_match")["status"] == "pass with assumptions"
+         and any("files sent" in a["assumption"] for a in r["ev"]["assumptions"]),
+         f"plotted files: exit {r['rc']}, {r['ev']['status'] if r['ev'] else ''}, {_chk(r['ev'], 'output_match')['status'] if r['ev'] else ''}: {r['err'][-200:]}")
+    m = _rule(r["ev"], "output_match")["metrics"]["plotted"]
     need(all(m[l]["differences"] == 0 for l in ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu", "F.Mask")) and m["holes"]["in_files"] == 1,
          f"plotted files differ from the checked geometry: {m}")
     need(any("plotted from the board just now" in f["reason"] for f in ev_findings(r["ev"], "output_match", ("info",))),
@@ -1218,7 +1256,7 @@ def t45_output():
     r2 = dfm(b, "--checks", "output", "--gerbers", sent)
     need(r2["rc"] == 0 and not ev_findings(r2["ev"], "output_match", ("warn", "fail")) and _chk(r2["ev"], "output_match")["status"] == "pass",
          f"supplied, untouched files: exit {r2['rc']}, {[f['reason'][:80] for f in ev_findings(r2['ev'], 'output_match')]}")
-    feat = _rule(r2["ev"], "output_match")["metrics"]["features"]
+    feat = _rule(r2["ev"], "output_match")["metrics"]["sent"]["features"]
     need(feat["F.Cu"]["tracks"] > 0 and feat["F.Cu"]["pads"] > 0 and feat.get("F.Paste", {}).get("apertures", 0) > 0,
          f"features compared: {feat}")
     # planted file faults the images cannot see or that are not copper: tracks plotted 40 um narrow
@@ -1247,13 +1285,19 @@ def t45_output():
     cells = pr[1].split(",")
     cells[3] = f"{float(cells[3]) + 0.5:.4f}"
     pr[1] = ",".join(cells)
+    head = [h.strip().strip('"').lower() for h in pr[0].split(",")]
+    cells = pr[2].split(",")
+    ri = head.index("rot")
+    cells[ri] = f"{(float(cells[ri]) + 90) % 360:.4f}"                 # a part turned in the placement file
+    pr[2] = ",".join(cells)
     open(posf, "w").write("\n".join(pr) + "\n")
-    open(os.path.join(faults, "bom.csv"), "w").write("Reference,Value\nC1,100n\nC2,100n\nFID1,Fiducial\n")     # C3 left out
+    open(os.path.join(faults, "bom.csv"), "w").write("Reference,Value\nC1,100 nF\nC2,10n\nFID1,Fiducial\n")     # C3 left out, C2 another value
     r5 = dfm(b, "--checks", "output", "--gerbers", faults)
     ff = " | ".join(f["reason"] for f in ev_findings(r5["ev"], "output_match", ("fail",)))
     for what, pat in (("narrow tracks", r"F\.Cu: \d+ features.*tracks of another width"), ("10 um shift", r"B\.Cu: \d+ features"),
                       ("removed paste aperture", r"F\.Paste: 1 paste apertures missing"), ("cut outline", r"outline in the file differs"),
-                      ("moved part", r"placement file .* 1 at another position"), ("BOM missing a part", r"BOM bom\.csv differs .* 1 missing")):
+                      ("moved part", r"placement file .* 1 at another position"), ("turned part", r"placement file .* 1 at another rotation"),
+                      ("BOM missing a part", r"BOM bom\.csv differs .* 1 missing"), ("BOM value", r"BOM bom\.csv differs .* 1 with another value")):
         need(re.search(pat, ff), f"{what} not found: {ff[:600]}")
     cu = glob.glob(os.path.join(sent, "*F_Cu.gbr"))[0]
     txt = open(cu).read()
@@ -1271,7 +1315,7 @@ def t45_output():
     os.remove(glob.glob(os.path.join(sent, "*In1_Cu.gbr"))[0])
     r4 = dfm(b, "--checks", "output", "--gerbers", sent)
     need(any("no Gerber file for In1.Cu" in f["reason"] for f in ev_findings(r4["ev"], "output_match", ("fail",))), "a missing layer file is not reported")
-    return ok("plotted files are a self-test, not a pass; supplied files match feature by feature; tracks 40 um narrow, a 10 um shift, a missing paste aperture, a cut outline, a moved part, an added track, a removed hole and a missing layer are found")
+    return ok("plotted files check the reader, the verdict 'pass with assumptions'; supplied files match feature by feature; tracks 40 um narrow, a 10 um shift, a missing paste aperture, a cut outline, a moved part, a turned part, a BOM value, an added track, a removed hole and a missing layer are found")
 
 
 def _against_kicad(board, d, X):
@@ -1366,7 +1410,7 @@ def t47_custom_pads():
     return ok(f"custom pad judged by its copper; 0.2 mm copper pad failed; paste apertures from polygons ({met['apertures']} apertures)")
 
 
-@case(48, "Order options: a verdict that relies on the via covering or the stencil the fabricator chooses is 'pass with assumptions'; the stencil is predicted from the fabricator's guide")
+@case(48, "Order options: a verdict that relies on the via covering or the stencil the fabricator chooses is 'pass with assumptions'; the stencil is predicted from the fabricator's guide and judged over its recommended range")
 def t48_order():
     d = out_dir("t48")
     b = boards.order_board(d, "inpad", layers=6, ic_pitch=0.5)
@@ -1375,7 +1419,14 @@ def t48_order():
     ev = r["ev"]
     vp = _rule(ev, "via_pad")
     need(vp["metrics"]["vias"]["in_pads"] == 1, f"vias in pads: {vp['metrics']}")
-    need(ev["status"] == "pass with assumptions" and r["rc"] == 1, f"status {ev['status']}, exit {r['rc']}: {ev['assumptions']}")
+    # the 0.5 mm-pitch IC's 0.25 x 0.8 mm apertures print at the predicted 0.12 mm (area ratio 0.79) but not
+    # at 0.15 mm (0.63), which the guide's range for 0.5 mm pitch (0.12 to 0.15 mm) also allows: a warning
+    rng_ = [f for f in ev_findings(ev, "paste", ("warn",)) if "not with a 0.15 mm one" in f["reason"]]
+    need(ev["status"] == "warn" and r["rc"] == 1 and rng_ and rng_[0]["refs"] == ["U1"] and len(ev["assumptions"]) == 2,
+         f"status {ev['status']}, exit {r['rc']}, range warnings {[f['reason'][:90] for f in rng_]}: {ev['assumptions']}")
+    r0 = dfm(boards.order_board(d, "inpad0402", layers=6), "--checks", "mask,paste")
+    need(r0["ev"]["status"] == "pass with assumptions" and r0["rc"] == 1 and len(r0["ev"]["assumptions"]) == 2,
+         f"0402 chips and a via in a pad: {r0['ev']['status']}, exit {r0['rc']}: {r0['ev']['assumptions']}")
     chk = {c["item"]: c for c in ev["order_checklist"]}
     need("via covering" in chk and "1 vias are in SMD pads" in chk["via covering"]["state"] and "which vias should be filled" in chk["via covering"]["state"],
          f"checklist: {ev['order_checklist']}")
@@ -1395,7 +1446,8 @@ def t48_order():
     pc = _chk(r3["ev"], "paste")
     need(pc["status"] == "could not check" and any("stencil_mm" in f["reason"] and "01005" in f["reason"] for f in ev_findings(r3["ev"], "paste")),
          f"01005: paste {pc['status']}, {[f['reason'][:100] for f in ev_findings(r3['ev'], 'paste')]}")
-    return ok("vias in pads without a stated covering: pass with assumptions and a checklist entry; stated: pass; "
+    return ok("vias in pads without a stated covering: pass with assumptions and a checklist entry; 0.5 mm-pitch pads fail at the top of "
+              "the guide's range (warning); stated: pass; "
               "stencil predicted 0.12 / 0.10 / 0.12 mm (0.5 mm pitch, 0.4 mm pitch, 0402); 01005 needs stencil_mm")
 
 
@@ -1470,7 +1522,7 @@ def t50_corpus():
     return ok("; ".join(lines))
 
 
-@case(51, "Pilot known answers: the review's false findings stay gone (custom-pad anchor, paste anchor, via-fill range, pad-to-pad part spacing)", slow=True)
+@case(51, "Pilot known answers: the review's false findings stay gone (custom-pad anchor, paste anchor, via-fill range, pad-to-pad part spacing); apertures that print only at the predicted stencil are reported over the guide's range", slow=True)
 def t51_pilot():
     sys.path.insert(0, os.path.join(ROOT, "tests", "harness"))
     import corpus
@@ -1487,8 +1539,14 @@ def t51_pilot():
     need(ev, f"no dfm.json: {res['err'][-300:]}")
     small = [f for f in ev_findings(ev, "mask_web") if "smallest pad" in f["reason"] and f["refs"] and f["refs"][0] in ("U10", "U11", "U12", "U13", "U14")]
     need(not small, f"custom pads judged by their anchor: {[f['reason'][:80] for f in small]}")
-    paste = [f for f in ev_findings(ev, "paste", ("warn", "fail")) if f["refs"] and f["refs"][0] in ("U10", "U11", "U12", "U13", "U14")]
-    need(not paste, f"paste apertures of U10-U14: {[f['reason'][:80] for f in paste]}")
+    # U10-U14's apertures (0.45 x 0.25 mm) print at the predicted 0.12 mm stencil (area ratio 0.67): no finding
+    # at that thickness; at 0.15 mm, the top of the guide's range for the board's 0.5 mm-pitch part, they do
+    # not (0.54), which is reported (the reviewer's "passes by 0.01" case), with the thickest stencil that prints
+    u = ("U10", "U11", "U12", "U13", "U14")
+    paste = [f for f in ev_findings(ev, "paste", ("warn", "fail")) if f["refs"] and f["refs"][0] in u and "prints with the predicted" not in f["reason"]]
+    need(not paste, f"paste apertures of U10-U14 at the predicted stencil: {[f['reason'][:80] for f in paste]}")
+    rng_ = [f for f in ev_findings(ev, "paste", ("warn",)) if f["refs"] and f["refs"][0] in u and "but not with a 0.15 mm one" in f["reason"]]
+    need(len(rng_) == 5 and all("or thinner" in f["reason"] for f in rng_), f"U10-U14 at 0.15 mm: {[f['reason'][:100] for f in rng_]}")
     fill = [f for f in ev_findings(ev, "via_pad", ("fail",)) if "filled and capped" in f["reason"]]
     need(not fill, f"0.3 mm via holes against the fill range: {[f['reason'][:80] for f in fill]}")
     need(_rule(ev, "via_pad")["metrics"]["vias"]["in_pads"] > 100, "the vias in pads are not seen")
@@ -1522,6 +1580,74 @@ def t52_markers():
     n = open(mk[0]).read().count("(gr_circle")
     need(n >= 1, "no marker in the marker board")
     return ok(f"marker board opens in kicad-cli; {n} markers; its reading equals the board's")
+
+
+@case(53, "Both readers against KiCad on every pad shape: padstacks (front/inner/back and per layer), turned oval, rounded, trapezoid and chamfered pads, custom, paste-only and mask-only pads, arc tracks, via filling and plugging; exact pad shapes equal KiCad's polygons; KiCad's plot agrees with the reading")
+def t53_reader_shapes():
+    d = out_dir("t53")
+    b = boards.reader_board(d)
+    sys.path.insert(0, ROOT)
+    from openpcbsi import snapshot, geom
+    from openpcbsi.parse import compare
+    snap = snapshot.extract_file(b, os.path.join(d, "c"))
+    ref = glob.glob(os.path.join(d, "c", "refill", snap["sha256"][:16], os.path.basename(b)))
+    need(ref, "the refilled copy the file reader read is missing")
+    env = dict(os.environ, OPENPCBSI_NO_REFILL="1")
+    p = subprocess.run([sys.executable, "-c", "import sys, json, gzip; sys.path.insert(0, sys.argv[1]); from openpcbsi import snapshot; "
+                        "json.dump(snapshot.extract(sys.argv[2]), gzip.open(sys.argv[3], 'wt'))", ROOT, ref[0], os.path.join(d, "gold.json.gz")],
+                       capture_output=True, text=True, env=env)
+    need(p.returncode == 0, f"pcbnew reading failed: {p.stderr[-300:]}")
+    gold = json.load(gzip.open(os.path.join(d, "gold.json.gz"), "rt"))
+    diff = compare.differences(gold, snap)
+    need(not diff["problems"], f"the file reader differs from KiCad's pcbnew: {diff['problems'][:4]}")
+    stacks = sorted((q["ref"], q["num"], len(q["layer_poly"])) for q in snap["pads"] if q.get("layer_poly"))
+    need(len(stacks) == 2 and all(n == 4 for _, _, n in stacks), f"padstack pads not read per layer: {stacks}")
+    # the exact cores against KiCad's own polygons (pcbnew, independent of openpcbsi's shapes): every
+    # vertex KiCad draws lies on the core's boundary
+    worst, n = 0.0, 0
+    for q in gold["pads"]:
+        for ln, c in ((q.get("layer_core") or {}).items() if q.get("layer_core") else [(None, q.get("core"))]):
+            poly = (q.get("layer_poly") or {}).get(ln) if ln else q["poly"]
+            if not c or c.get("pts") is None or not poly:
+                continue
+            P = np.array([v for pl in poly for r in pl for v in r])
+            C = np.array(c["pts"])
+            if len(C) == 1:
+                dd = np.hypot(P[:, 0] - C[0, 0], P[:, 1] - C[0, 1])
+            elif len(C) == 2:
+                dd = geom.point_seg_dist(P[:, 0], P[:, 1], C[0, 0], C[0, 1], C[1, 0], C[1, 1])
+            else:
+                dd = np.min([geom.point_seg_dist(P[:, 0], P[:, 1], *C[k], *C[(k + 1) % len(C)]) for k in range(len(C))], axis=0)
+                dd[geom.points_in_rings(P[:, 0], P[:, 1], [C])] = 0.0
+            worst = max(worst, float(np.abs(dd - c["r"]).max()))
+            n += 1
+    need(n >= 9 and worst < 2e-6, f"exact pad shapes against KiCad's polygons: {n} shapes, worst vertex {worst * 1e6:.1f} nm off")
+    prot = [v["protect"] for v in snap["vias"]]
+    need(any(v["filled"] and v["capped"] for v in prot) and any(v["plugged"][0] for v in prot), f"via protection not read: {prot}")
+    r = dfm(b, "--checks", "output")
+    need(r["ev"], f"no dfm.json: {r['err'][-300:]}")
+    om = _chk(r["ev"], "output_match")
+    need(om["status"] != "could not check", f"KiCad's plot and the reader disagree: {om['note']} "
+         f"{[f['reason'][:100] for f in ev_findings(r['ev'], 'output_match', ('warn', 'fail'))][:3]}")
+    return ok(f"pcbnew and file reader agree ({sum(diff['compared'].values())} items); padstacks {stacks}; {n} exact shapes within "
+              f"{worst * 1e6:.1f} nm of KiCad's polygons; KiCad's plot agrees ({om['status']})")
+
+
+@case(54, "At the limit: copper exactly at the hole-to-copper limit passes and 0.5 um inside it fails, for a track, an arc, a turned rounded pad's corner and a slot, with no marginal band")
+def t54_at_limit():
+    d = out_dir("t54")
+    b = boards.limit_board(d)
+    r = dfm(b, "--checks", "drill")
+    need(r["ev"], f"no dfm.json: {r['err'][-300:]}")
+    fs = ev_findings(r["ev"], "fab_drill", ("fail", "warn"))
+    need(not [f for f in fs if f["severity"] == "warn"], f"a marginal band remains: {[f['reason'][:100] for f in fs if f['severity'] == 'warn']}")
+    bad_nets = {n for f in fs for n in f["nets"]}
+    need(not any(n.endswith("P") for n in bad_nets), f"copper exactly at the limit is reported: {[f['reason'][:100] for f in fs]}")
+    places = sum(int(m.group(1)) if (m := re.search(r"\((\d+) places", f["reason"])) else 1 for f in fs)
+    need(places == 4, f"of the four places 0.5 um inside the limit, {places} reported: {[f['reason'][:100] for f in fs]}")
+    m = _rule(r["ev"], "fab_drill")["metrics"]["hole_copper"]
+    need(m["bounded_not_exact"] == 0, f"measured with an error bound: {m}")
+    return ok(f"exact at the limit: 4 of 4 places 0.5 um inside fail, the 4 at the limit pass; {m['candidates_measured_exactly']} measured exactly")
 
 
 # =================================================================================================

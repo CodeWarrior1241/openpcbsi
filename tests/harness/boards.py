@@ -331,7 +331,8 @@ def chip_board(out, name="chips"):
 
 
 def reflow_board(out, name="reflow"):
-    """A 3 g part (U1, 5 mm tall) on the left and 0402 resistors next to it (R1) and far from it (R2)."""
+    """A 3 g part (U1, 5 mm tall) on the left, 0402 resistors next to it (R1) and far from it (R2), and a
+    QFN with no body data (U2): its body is estimated from its fabrication outline."""
     b = Board(_p(out, name), layers=4, size=(80, 40))
     b.plane("In1.Cu", "GND")
     b.plane("In2.Cu", "GND")
@@ -339,6 +340,9 @@ def reflow_board(out, name="reflow"):
                                        for i in range(4)], fields={"Mass": "3", "Height": "5"}, courtyard=(-6, -6, 6, 6))
     b.two_pin("R1", "10k", 23, 20, "N1", "N2", fpid=R0402, mask=0.0)
     b.two_pin("R2", "10k", 70, 20, "N3", "N4", fpid=R0402, mask=0.0)
+    b.footprint("U2", "QFN", 45, 20, [{"num": i + 1, "net": "GND", "dx": -2 + 4 * (i % 2), "dy": -2 + 4 * (i // 2), "sx": 0.8, "mask": 0.0}
+                                       for i in range(4)], fpid="Package_DFN_QFN:QFN-4_5x5mm_test", fab=(-2.5, -2.5, 2.5, 2.5),
+                courtyard=(-3, -3, 3, 3))
     return b.save()
 
 
@@ -430,4 +434,78 @@ def class_board(out, name="classes"):
     pads = [{"num": k + 1, "net": f"R{k}", "dx": -2 + (k % 5), "dy": -2 + 4 * (k // 5), "sx": 0.3, "sy": 0.6, "mask": 0.0} for k in range(10)]
     b.footprint("U3", "IC", 45, 15, pads, fpid="Package_DFN_QFN:QFN-10_6x6mm", fab=(-3, -3, 3, 3), courtyard=(-3.2, -3.2, 3.2, 3.2))
     b.two_pin("C3", "100n", 45 + 3 + 0.6 + 0.75, 15, "S1", "S2", pitch=1.0, pad=(0.5, 0.5), fpid=C0402, mask=0.0)
+    return b.save()
+
+
+def reader_board(out, name="reader"):
+    """Every shape the readers must agree on with KiCad: padstacks (front/inner/back and custom, rotated),
+    oval, rounded, trapezoid, chamfered and round pads at odd angles, a custom pad, paste-only and
+    mask-only pads, arc tracks, vias filled, capped and plugged, and a rounded board outline."""
+    b = Board(_p(out, name), layers=4, size=(40, 20), corner_r=2.0)
+    b.plane("In1.Cu", "GND")
+    b.plane("In2.Cu", "GND")
+    b.footprint("J1", "STACK", 8, 6, [
+        {"num": 1, "net": "A", "dx": 0, "dy": 0, "sx": 1.6, "sy": 1.6, "kind": "pth", "drill": 0.6, "rot": 30,
+         "stack": {"mode": "front_inner_back", "layers": {"Inner": {"shape": "circle", "sx": 0.9},
+                                                           "B.Cu": {"shape": "roundrect", "sx": 1.4, "sy": 1.2, "rratio": 0.25}}}},
+        {"num": 2, "net": "B", "dx": 3, "dy": 0, "sx": 1.5, "sy": 1.5, "kind": "pth", "drill": 0.6, "shape": "circle",
+         "stack": {"mode": "custom", "layers": {"In1.Cu": {"shape": "circle", "sx": 0.8}, "In2.Cu": {"shape": "oval", "sx": 1.3, "sy": 0.9},
+                                                "B.Cu": {"shape": "rect", "sx": 1.2, "sy": 1.0}}}}],
+        fpid="Connector:STACK_test")
+    b.footprint("U2", "SHAPES", 22, 6, [
+        {"num": 1, "net": "C", "dx": 0, "dy": 0, "sx": 1.2, "sy": 0.6, "shape": "oval", "rot": 30, "mask": 0.05},
+        {"num": 2, "net": "D", "dx": 2.5, "dy": 0, "sx": 1.1, "sy": 0.7, "shape": "roundrect", "rratio": 0.3, "rot": 45, "mask": 0.05},
+        {"num": 3, "net": "E", "dx": 5, "dy": 0, "sx": 1.0, "sy": 0.8, "shape": "trapezoid", "delta": (0.2, 0.0), "rot": 15, "mask": 0.05},
+        {"num": 4, "net": "F", "dx": 7.5, "dy": 0, "sx": 1.0, "sy": 1.0, "shape": "chamfered_rect", "rratio": 0.0, "chamfer": (0.2, 1 | 4),
+         "mask": 0.05},
+        {"num": 5, "net": "G", "dx": 10, "dy": 0, "sx": 0.9, "shape": "circle", "mask": 0.05},
+        {"num": 6, "net": "H", "dx": 12.5, "dy": 0, "sx": 0.2, "sy": 0.2, "shape": "custom", "prims": [(-0.5, -0.3, 0.5, 0.3), (-0.1, -0.7, 0.1, 0.7)],
+         "mask": 0.0},
+        {"num": "", "dx": 12.5, "dy": 2.0, "sx": 0.6, "sy": 0.4, "only": "paste"},
+        {"num": "", "dx": 15, "dy": 2.0, "sx": 0.8, "sy": 0.8, "only": "mask"}],
+        fpid="Package_SO:SHAPES_test", courtyard=(-1, -1, 16, 3))
+    b.arc("F.Cu", (5, 14), (8, 11.5), (11, 14), 0.2, "K")
+    b.arc("B.Cu", (20, 15), (22, 13), (24, 15), 0.25, "L")
+    b.via(30, 14, "K", fill=True, cap=True)
+    b.via(32, 14, "L", plug=(True, False))
+    b.via(34, 14, "K", fill=False)
+    b.via(36, 14, "L")
+    return b.save()
+
+
+def limit_board(out, name="limit"):
+    """Copper at exactly the hole-to-copper limit and 0.5 um inside it, for every kind of item: a straight
+    track, an arc track and a rounded-rectangle pad turned 30 degrees (its corner arc) against vias
+    (0.2 mm), and an inner-layer track against the end of a plated slot (0.3 mm). Vias of 0.3 mm holes on a 4-layer board; the passing places in row y = 5, the failing
+    ones in row y = 12. Returns the board path; boards.LIMIT_CASES names each place."""
+    b = Board(_p(out, name), layers=4, size=(50, 18))
+    r = 0.15                                   # via hole radius
+    for row, gap in ((5.0, 0.2), (12.0, 0.1995)):
+        tag = "P" if gap == 0.2 else "F"
+        # straight track, width 0.2: centreline at r + gap + 0.1 from the via centre
+        b.via(5, row, f"V1{tag}", drill=0.3, size=0.45)
+        x = 5 + r + gap + 0.1
+        b.track("F.Cu", [(x, row - 2), (x, row + 2)], 0.2, f"T1{tag}")
+        # arc track, width 0.2, centred on the via: radius r + gap + 0.1
+        b.via(15, row, f"V2{tag}", drill=0.3, size=0.45)
+        R = r + gap + 0.1
+        b.arc("In1.Cu", (15 - R, row), (15, row - R), (15 + R, row), 0.2, f"T2{tag}")
+        # rounded-rectangle pad (1.0 x 0.6, corner radius 0.15), turned 30 degrees, its corner arc
+        # toward the via: the via sits on the corner's diagonal, r + gap + 0.15 from the corner centre
+        import math
+        a = math.radians(30)
+        cxl, cyl = 0.5 - 0.15, 0.3 - 0.15          # corner centre in the pad frame
+        px, py = 25.0, row
+        ccx, ccy = px + cxl * math.cos(a) + cyl * math.sin(a), py - cxl * math.sin(a) + cyl * math.cos(a)
+        dirx, diry = math.cos(a) * 0.7071 + math.sin(a) * 0.7071, -math.sin(a) * 0.7071 + math.cos(a) * 0.7071
+        dd = r + gap + 0.15
+        b.via(ccx + dd * dirx, ccy + dd * diry, f"V3{tag}", drill=0.3, size=0.45)
+        b.footprint(f"U{tag}", "RR", px, py, [{"num": 1, "net": f"T3{tag}", "dx": 0, "dy": 0, "sx": 1.0, "sy": 0.6, "shape": "roundrect",
+                                               "rratio": 0.25, "rot": 30}], fpid="Package_SO:RR_test")
+        # plated slot 0.6 x 1.6 (along y) against an inner-layer track: a slot is a pad hole, whose inner
+        # limit is 0.3 mm; the track's edge 0.3 mm (or 0.2995 mm) beyond the end of the slot
+        b.footprint(f"J{tag}", "SLOT", 35, row, [{"num": 1, "net": f"S{tag}", "dx": 0, "dy": 0, "sx": 1.0, "sy": 2.0, "kind": "pth",
+                                                  "drill": 0.6, "drill_y": 1.6}])
+        yt = row + 0.8 + 0.3 + (gap - 0.2) + 0.1
+        b.track("In2.Cu", [(34, yt), (36, yt)], 0.2, f"T4{tag}")
     return b.save()

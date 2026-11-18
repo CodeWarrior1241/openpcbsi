@@ -31,9 +31,10 @@ def _ring_perim(r):
     return float(np.hypot(d[:, 0], d[:, 1]).sum())
 
 
-def measure(polys, cx=0.0, cy=0.0, rot_deg=0.0):
+def measure(polys, cx=0.0, cy=0.0, rot_deg=0.0, symmetric=False):
     """Measurements of one pad's polygons (the [outline, hole, ...] lists of a snapshot), or None
-    when there is no polygon."""
+    when there is no polygon. `symmetric`: the polygon is a rectangle, rounded rectangle, oval or
+    circle, whose largest inscribed disc is exactly min(w, h) (no raster needed)."""
     if not polys:
         return None
     a = math.radians(rot_deg or 0.0)
@@ -56,7 +57,7 @@ def measure(polys, cx=0.0, cy=0.0, rot_deg=0.0):
     v = dx * sa + dy * ca
     w, h = float(u.max() - u.min()), float(v.max() - v.min())
     return {"w": round(w, 5), "h": round(h, 5), "area": round(area, 6), "perim": round(perim, 5),
-            "inscribed_d": round(inscribed_diameter(polys, min(w, h)), 4)}
+            "inscribed_d": round(min(w, h) if symmetric else inscribed_diameter(polys, min(w, h)), 4)}
 
 
 def inscribed_diameter(polys, scale=None):
@@ -97,3 +98,38 @@ def inscribed_diameter(polys, scale=None):
     d = ndimage.distance_transform_edt(inside) * res
     # the transform measures to the centre of the first outside cell: half a cell beyond the edge
     return max(0.0, 2.0 * (float(d.max()) - 0.5 * res))
+
+
+def core(shape, sx, sy, cx, cy, rot_deg=0.0, corner_r=0.0, delta=(0.0, 0.0), chamfered=False):
+    """A standard pad's exact shape as a core and a radius: the copper is every point within `r` of the
+    core, which is one point (circle), a segment (oval), or a convex polygon (rectangle, rounded
+    rectangle's inner rectangle, trapezoid). Distances to it are then exact, with no arc approximation:
+    distance(core) - r. In board coordinates (KiCad's: y down, a positive angle turns counter-clockwise
+    on screen). None for shapes not exact this way (custom, chamfered with round corners); pts None for
+    a shape whose polygon has straight edges only (the polygon itself is exact)."""
+    shape = (shape or "rect").lower()
+    a = math.radians(rot_deg or 0.0)
+    c, s = math.cos(a), math.sin(a)
+    place = lambda pts: [[cx + c * x + s * y, cy - s * x + c * y] for x, y in pts]
+    if shape == "circle":
+        return {"r": sx / 2, "pts": place([(0.0, 0.0)])}
+    if shape == "oval":
+        if abs(sx - sy) < 1e-9:
+            return {"r": sx / 2, "pts": place([(0.0, 0.0)])}
+        half = (max(sx, sy) - min(sx, sy)) / 2
+        return {"r": min(sx, sy) / 2, "pts": place([(-half, 0.0), (half, 0.0)] if sx > sy else [(0.0, -half), (0.0, half)])}
+    if shape in ("roundrect", "chamfered_rect"):
+        r = max(0.0, min(corner_r, min(sx, sy) / 2))
+        if chamfered:
+            # with round corners: not exact this way; without: straight edges only, so the pad's own
+            # polygon is exact (pts None tells the caller to use it)
+            return None if r > 1e-9 else {"r": 0.0, "pts": None}
+        w, h = sx / 2 - r, sy / 2 - r
+        return {"r": r, "pts": place([(-w, -h), (w, -h), (w, h), (-w, h)])}
+    if shape == "trapezoid":
+        ddx, ddy = delta[0] / 2, delta[1] / 2
+        return {"r": 0.0, "pts": place([(-sx / 2 - ddy, sy / 2 + ddx), (sx / 2 + ddy, sy / 2 - ddx),
+                                         (sx / 2 - ddy, -sy / 2 + ddx), (-sx / 2 + ddy, -sy / 2 - ddx)])}
+    if shape == "rect":
+        return {"r": 0.0, "pts": place([(-sx / 2, -sy / 2), (sx / 2, -sy / 2), (sx / 2, sy / 2), (-sx / 2, sy / 2)])}
+    return None

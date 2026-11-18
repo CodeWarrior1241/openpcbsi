@@ -21,7 +21,9 @@ import sys
 
 from . import padgeom
 
-SNAPSHOT_VERSION = 10  # 10: footprint body outline (convex hull of its fabrication-layer shapes)
+SNAPSHOT_VERSION = 11  # 11: coordinates kept to 1 nm (KiCad's unit), each standard pad's exact core and radius
+                       #     (padgeom.core), each arc chord with its arc's centre and radius, padstacks per layer
+                       # 10: footprint body outline (convex hull of its fabrication-layer shapes)
                        # 9: pad shape, anchor size kept apart, sizes measured from the pad's polygon, paste
                        #    apertures as polygons (margins applied), polygons of pads with no copper
                        # 4: zones refilled in memory, every footprint field, pin types, file version; 5: back-drill;
@@ -108,7 +110,7 @@ def _chain_pts(chain):
     pts = []
     for k in range(n):
         p = chain.CPoint(k)
-        pts.append((round(p.x * NM, 5), round(p.y * NM, 5)))
+        pts.append((round(p.x * NM, 6), round(p.y * NM, 6)))
     return pts
 
 
@@ -156,6 +158,17 @@ def extract(board_path):
     ps = pcbnew.SHAPE_POLY_SET()
     b.GetBoardPolygonOutlines(ps, True)
     snap["outline"] = _polyset(ps)
+    # the circles of the outline's arcs: a distance to an outline chord on one of them carries the
+    # chord's sagitta as its error bound (exact.outline_index); straight edges are exact
+    arcs = []
+    for it in list(b.GetDrawings()) + [g for f in b.GetFootprints() for g in f.GraphicalItems()]:
+        try:
+            if it.GetLayer() == pcbnew.Edge_Cuts and it.GetShape() in (pcbnew.SHAPE_T_ARC, pcbnew.SHAPE_T_CIRCLE):
+                c = it.GetCenter()
+                arcs.append([c.x * NM, c.y * NM, it.GetRadius() * NM])
+        except AttributeError:
+            continue
+    snap["outline_arcs"] = arcs
 
     # nets and classes
     nets = {}
@@ -178,15 +191,16 @@ def extract(board_path):
                 "d": t.GetWidth(cu_ids[0]) * NM, "drill": t.GetDrillValue() * NM,
                 "net": net, "span": span, "flashed": flashed, "type": int(t.GetViaType()),
                 "backdrill": _backdrill(pcbnew, t, lid2name), "tented": _tented(pcbnew, t),
-                "mask_exp": _via_mask_exp(pcbnew, t),
+                "mask_exp": _via_mask_exp(pcbnew, t), "protect": _protect(pcbnew, t, b.GetDesignSettings()),
             })
         elif ty == pcbnew.PCB_ARC_T:
             # approximate arcs by chords of at most 10 degrees
             s, m, e = t.GetStart(), t.GetMid(), t.GetEnd()
             pts = _arc_points((s.x * NM, s.y * NM), (m.x * NM, m.y * NM), (e.x * NM, e.y * NM))
+            arc = _arc_circle((s.x * NM, s.y * NM), (m.x * NM, m.y * NM), (e.x * NM, e.y * NM)) or True
             for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
                 tracks.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "w": t.GetWidth() * NM,
-                               "layer": lid2name.get(t.GetLayer()), "net": net, "arc": True})
+                               "layer": lid2name.get(t.GetLayer()), "net": net, "arc": arc})
         else:
             s, e = t.GetStart(), t.GetEnd()
             tracks.append({"x1": s.x * NM, "y1": s.y * NM, "x2": e.x * NM, "y2": e.y * NM,
@@ -264,8 +278,33 @@ def extract(board_path):
             sz = p.GetSize(slay)
             px, py, rot = p.GetPosition().x * NM, p.GetPosition().y * NM, p.GetOrientationDegrees()
             dims = padgeom.measure(own, px, py, rot)
+            def core_of(lid):
+                shp_ = _shape_name(pcbnew, p.GetShape(lid))
+                sz_ = p.GetSize(lid)
+                dl = p.GetDelta(lid) if shp_ == "trapezoid" else None
+                return padgeom.core(shp_, sz_.x * NM, sz_.y * NM, px, py, rot, p.GetRoundRectCornerRadius(lid) * NM if shp_ in
+                                    ("roundrect", "chamfered_rect") else 0.0, (dl.x * NM, dl.y * NM) if dl is not None else (0.0, 0.0),
+                                    shp_ == "chamfered_rect" and p.GetChamferRectRatio(lid) > 0 and p.GetChamferPositions(lid) != 0)
+            core = core_of(slay)
+            # padstacks (KiCad 9+): a pad whose shape differs per copper layer gets every layer's polygon
+            # and core; `poly` stays the shape of its first copper layer
+            stack = {}
+            try:
+                if p.Padstack().Mode() != pcbnew.PADSTACK.MODE_NORMAL and len(layers) > 1:
+                    for ln in layers:
+                        lid = b.GetLayerID(ln)
+                        s_ = pcbnew.SHAPE_POLY_SET()
+                        p.TransformShapeToPolygon(s_, lid, 0, 2000, pcbnew.ERROR_INSIDE)
+                        sl = p.GetSize(lid)
+                        stack.setdefault("layer_poly", {})[ln] = _polyset(s_)
+                        stack.setdefault("layer_core", {})[ln] = core_of(lid)
+                        stack.setdefault("layer_size", {})[ln] = [sl.x * NM, sl.y * NM]
+                    stack["padstack"] = {pcbnew.PADSTACK.MODE_FRONT_INNER_BACK: "front_inner_back",
+                                         pcbnew.PADSTACK.MODE_CUSTOM: "custom"}.get(p.Padstack().Mode(), "other")
+            except AttributeError:
+                pass
             pads.append({
-                "ref": ref, "num": p.GetNumber(), "net": p.GetNetname(), "kind": kind,
+                "ref": ref, "num": p.GetNumber(), "net": p.GetNetname(), "kind": kind, "core": core,
                 "x": px, "y": py, "rot": rot, "shape": _shape_name(pcbnew, p.GetShape(slay)),
                 # sx, sy: the pad's extent in its own frame. A standard shape's size is exact; a custom
                 # pad's is measured from its polygon (its anchor, often 0.2 mm, is only `anchor` and no
@@ -276,7 +315,7 @@ def extract(board_path):
                 "drill": p.GetDrillSize().x * NM if kind in ("pth", "npth") else 0.0,
                 "drill_y": p.GetDrillSize().y * NM if kind in ("pth", "npth") else 0.0,
                 "layers": layers, "poly": polys, "pinfunc": p.GetPinFunction(), "pintype": p.GetPinType(),
-                **mp,
+                **mp, **stack,
             })
     snap["footprints"] = fps
     snap["pads"] = pads
@@ -360,6 +399,25 @@ def _tented(pcbnew, v):
     return out
 
 
+def _protect(pcbnew, v, ds):
+    """Via protection (KiCad 10, IPC-4761): {filled, capped, plugged: [front, back]}, each True / False
+    as the via or the board setup states it, None where nothing is stated (the setup's "no" is KiCad's
+    default, not a statement)."""
+    def one(mode, yes, no, board):
+        if mode == yes:
+            return True
+        if mode == no:
+            return False
+        return True if board else None
+    try:
+        return {"filled": one(v.GetFillingMode(), pcbnew.FILLING_MODE_FILLED, pcbnew.FILLING_MODE_NOT_FILLED, ds.m_FillVias),
+                "capped": one(v.GetCappingMode(), pcbnew.CAPPING_MODE_CAPPED, pcbnew.CAPPING_MODE_NOT_CAPPED, ds.m_CapVias),
+                "plugged": [one(v.GetFrontPluggingMode(), pcbnew.PLUGGING_MODE_PLUGGED, pcbnew.PLUGGING_MODE_NOT_PLUGGED, ds.m_PlugViasFront),
+                            one(v.GetBackPluggingMode(), pcbnew.PLUGGING_MODE_PLUGGED, pcbnew.PLUGGING_MODE_NOT_PLUGGED, ds.m_PlugViasBack)]}
+    except AttributeError:                    # KiCad before 9
+        return {"filled": None, "capped": None, "plugged": [None, None]}
+
+
 def _mask_shapes(pcbnew, b):
     """Graphic shapes on the mask layers (board and footprint level): further openings in the mask."""
     out = []
@@ -438,6 +496,18 @@ def _backdrill(pcbnew, v, lid2name):
 
 def _lid(pcbnew, board, name):
     return board.GetLayerID(name)
+
+
+def _arc_circle(s, m, e):
+    """[cx, cy, r] of the circle through an arc's start, mid and end; None for a straight one. Every
+    chord of the arc carries it, so that distances to the arc itself can be exact (geom.arc_dist)."""
+    (x1, y1), (x2, y2), (x3, y3) = s, m, e
+    d = 2 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+    if abs(d) < 1e-12:
+        return None
+    ux = ((x1 ** 2 + y1 ** 2) * (y2 - y3) + (x2 ** 2 + y2 ** 2) * (y3 - y1) + (x3 ** 2 + y3 ** 2) * (y1 - y2)) / d
+    uy = ((x1 ** 2 + y1 ** 2) * (x3 - x2) + (x2 ** 2 + y2 ** 2) * (x1 - x3) + (x3 ** 2 + y3 ** 2) * (x2 - x1)) / d
+    return [ux, uy, math.hypot(x1 - ux, y1 - uy)]
 
 
 def _arc_points(s, m, e, max_deg=10.0):

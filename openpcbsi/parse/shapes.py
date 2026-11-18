@@ -193,8 +193,8 @@ def rings(g):
     for p in geoms:
         if p.geom_type != "Polygon" or p.is_empty:
             continue
-        rs = [[(round(x, 5), round(y, 5)) for x, y in list(p.exterior.coords)[:-1]]]
-        rs += [[(round(x, 5), round(y, 5)) for x, y in list(h.coords)[:-1]] for h in p.interiors]
+        rs = [[(round(x, 6), round(y, 6)) for x, y in list(p.exterior.coords)[:-1]]]
+        rs += [[(round(x, 6), round(y, 6)) for x, y in list(h.coords)[:-1]] for h in p.interiors]
         out.append(rs)
     return out
 
@@ -249,3 +249,44 @@ def outline(items):
             g = g.difference(h)
         out += rings(g)
     return out
+
+
+def padstack(raw):
+    """(mode, {layer name: entry}) of a pad's (padstack ...) block, from its parsed s-expression; mode is
+    None when the pad has none."""
+    if not raw:
+        return None, {}
+    ps = next((it for it in raw[1:] if isinstance(it, list) and it and str(it[0]) == "padstack"), None)
+    if ps is None:
+        return None, {}
+    mode = _flag(ps, "mode") or "normal"
+    entries = {str(it[1]): it for it in ps[1:] if isinstance(it, list) and len(it) > 1 and str(it[0]) == "layer"}
+    return mode, entries
+
+
+def entry_params(e, base):
+    """A padstack layer entry's shape parameters, the pad's own where the entry gives none."""
+    q = dict(base)
+    sh = _flag(e, "shape")
+    if sh:
+        q["shape"] = sh
+    sz = _num(e, "size")
+    if sz:
+        q["sx"], q["sy"] = sz[0], sz[1] if len(sz) > 1 else sz[0]
+    for key, name in (("rratio", "roundrect_rratio"), ("chamfer", "chamfer_ratio")):
+        v = _num(e, name)
+        if v:
+            q[key] = v[0]
+    ch = next((it for it in e[1:] if isinstance(it, list) and it and str(it[0]) == "chamfer"), None)
+    if ch is not None:
+        q["corners"] = [str(c).lower() for c in ch[1:]]
+    d = _num(e, "rect_delta")
+    if d:
+        q["delta"] = (d[0], d[1] if len(d) > 1 else 0.0)
+    opt = next((it for it in e[1:] if isinstance(it, list) and it and str(it[0]) == "options"), None)
+    if opt is not None:
+        q["anchor"] = _flag(opt, "anchor") or q["anchor"]
+    pr = next((it for it in e[1:] if isinstance(it, list) and it and str(it[0]) == "primitives"), None)
+    if pr is not None:
+        q["prims"] = [it for it in pr[1:] if isinstance(it, list)]
+    return q

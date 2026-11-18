@@ -115,6 +115,11 @@ class Stackup:
         return rows
 
 
+def pad_poly(p, layer):
+    """A pad's polygons on one copper layer (by name): its padstack's shape there, else its one shape."""
+    return (p.get("layer_poly") or {}).get(layer, p["poly"])
+
+
 class Board:
     def __init__(self, snap, config=None, cache_dir=None):
         self.snap = snap
@@ -192,7 +197,7 @@ class Board:
         if li in self._rasters:
             return self._rasters[li]
         g = self.grid()
-        key = f"raster_{self.sha[:16]}_{g.res:.4f}_{li}{'_nn' if getattr(self, '_nonet', False) else ''}.npy"
+        key = f"raster_{self.sha[:16]}_v{self.snap.get('version', 0)}_{g.res:.4f}_{li}{'_nn' if getattr(self, '_nonet', False) else ''}.npy"
         cpath = os.path.join(self.cache_dir, key) if self.cache_dir else None
         if cpath and os.path.exists(cpath):
             r = np.load(cpath)
@@ -209,7 +214,7 @@ class Board:
             r[m] = nid
         for p in self.pads:
             if li in p["layer_ids"] and p["poly"]:
-                rings = [ring for poly in p["poly"] for ring in poly]
+                rings = [ring for poly in pad_poly(p, lname) for ring in poly]
                 m = geom.raster_rings(g, rings)
                 r[m] = p["net_id"]
         T = self.tracks
@@ -261,7 +266,8 @@ class Board:
             pb = np.full((len(self.pads), 4), np.nan)
             for k, p in enumerate(self.pads):
                 if p["poly"]:
-                    a = np.vstack([np.asarray(r, dtype=float) for poly in p["poly"] for r in poly])
+                    a = np.vstack([np.asarray(r, dtype=float) for pl in [p["poly"]] + list((p.get("layer_poly") or {}).values())
+                                   for poly in pl for r in poly])
                     pb[k] = (a[:, 0].min(), a[:, 1].min(), a[:, 0].max(), a[:, 1].max())
             on = np.zeros((len(self.layers), len(self.pads)), bool)
             for k, p in enumerate(self.pads):
@@ -286,7 +292,7 @@ class Board:
         pm = np.zeros(g.shape, dtype=bool) if pads else None
         for k in sel:
             p = self.pads[k]
-            m = geom.raster_rings(g, [ring for poly in p["poly"] for ring in poly])
+            m = geom.raster_rings(g, [ring for poly in pad_poly(p, self.layers[li]) for ring in poly])
             r[m] = p["net_id"]
             if pads:
                 pm |= m

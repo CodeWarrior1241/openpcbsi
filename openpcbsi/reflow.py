@@ -16,13 +16,17 @@ the assumed part bodies varied, and each part's difference from the median is gi
 MF8, chip level. A window around each two-terminal chip: its own copper layer at 50 um, the other
 layers at 200 um, the chip as two nodes heated over their own surface and joined to the pads
 through the unmelted paste and to each other through the body. The window's edge takes its values
-from the board model, so the planes do not end at the window. Two numbers per chip:
+from the board model, so the planes do not end at the window. One number per chip, the time between
+its two joints reaching liquidus:
   lag difference   tau = (K + H)^-1 C 1 is the first moment of a node's response; in a slow ramp
                    two joints reach liquidus tau_1 - tau_2 apart. Solved for every chip.
-  in this oven     the same window marched through the oven profile, giving the time between the
-                   two joints crossing liquidus directly. Run for the layouts at the top of the
-                   list, together with an error bar from the assumed paste, film coefficient and
-                   window size.
+  belt term        the belt carries one pad into each zone before the other: their distance along
+                   the belt over its speed. Added for the stated direction ([reflow] travel); with
+                   none stated the value excludes it and its range covers the four directions.
+The range adds the sensitivity to the assumed paste, film coefficient and window size. For the
+layouts at the top of the list, the same window marched through the oven profile is a consistency
+check of the value (two computations of one quantity); a disagreement beyond the sensitivity is
+reported as a problem.
 Timing is one input to tombstoning. The wetting forces (pad geometry, paste volume and offset,
 placement, alloy) are not modelled; the land-pattern geometry is listed beside the timing.
 
@@ -42,9 +46,11 @@ from .drc import finding
 from .thermal import K_CU, K_FR4_IN, K_FR4_THRU, RHOC_CU, RHOC_FR4
 
 # Variants of the model's parameters (not of its form): the spread of a result over them is its
-# sensitivity to those parameters, not an error bar. Bodies are not varied: a part without body data
-# is left out of the model and listed, instead of being given an assumed body.
-VARIANTS = (("film coefficient x 0.6", 0.6, 1.0), ("film coefficient x 1.6", 1.6, 1.0))
+# sensitivity to those parameters, not an error bar. A part without body data gets an estimated body
+# (packages.body_of: its fabrication outline and a typical height for its class), marked "estimated",
+# and the estimated bodies are varied x0.5 and x2.
+VARIANTS = (("film coefficient x 0.6", 0.6, 1.0), ("film coefficient x 1.6", 1.6, 1.0),
+            ("estimated bodies x 0.5", 1.0, 0.5), ("estimated bodies x 2", 1.0, 2.0))
 
 
 def _lu(A):
@@ -141,9 +147,6 @@ def build_model(ctx, fabr, h_scale=1.0, body_scale=1.0):
         if cov.sum() <= 0:
             continue
         body = packages.body_of(fp, cfg)
-        if body["assumed"]:
-            left_out.append({"ref": ref, "why": "no body data: give its mass or height in [reflow.parts." + ref + "], or a Mass / Height field"})
-            continue
         scale = body_scale if body["assumed"] else 1.0
         l = 0 if fp["side"] == "F" else L - 1
         w = cov / cov.sum()
@@ -164,8 +167,9 @@ def build_model(ctx, fabr, h_scale=1.0, body_scale=1.0):
     v = r["zone_mm"] / r["zone_s"]
     jj, ii = np.meshgrid(np.arange(nx), np.arange(ny))
     cx, cy = mesh["g"].x0 + (jj + 0.5) * mesh["cs"], mesh["g"].y0 + (ii + 0.5) * mesh["cs"]
-    axis = cx if "x" in r["travel"] else cy
-    lead = axis[bm].min() if r["travel"].startswith("-") else axis[bm].max()
+    trav = r["travel"] or "x"
+    axis = cx if "x" in trav else cy
+    lead = axis[bm].min() if trav.startswith("-") else axis[bm].max()
     delay = np.abs(lead - axis) / v
     off = np.zeros(N)
     for l in range(L):
@@ -236,7 +240,7 @@ def board(ctx, fabr, out_dir, log=print):
         row = {"ref": p["ref"], "x": p["x"], "y": p["y"], "side": "F" if p["layer"] == 0 else "B",
                "peak_c": round(float(T.max()), 1), "d_peak_c": round(ds[0], 1), "d_range_c": [round(min(ds), 1), round(max(ds), 1)],
                "tal_s": round(float(above.sum() * dt), 0), "lag_s": round(float(M["W"][k] @ tau), 1),
-               "body": p["body"]["source"], "assumed": p["body"]["assumed"]}
+               "body": p["body"]["source"], "assumed": p["body"]["assumed"], "estimated": p["body"]["assumed"]}
         if node_peak is not None and len(p["nodes"]) >= 4:
             row["within_c"] = round(float(node_peak[p["nodes"]].max() - node_peak[p["nodes"]].min()), 1)
         rows.append(row)
@@ -268,13 +272,14 @@ def board(ctx, fabr, out_dir, log=print):
         log(f"  {len(rows)} parts; spike zones shifted {shift:+.1f} C so that the median peak is {med:.1f} C"
             + (f" (target {target:g} C)" if target else "") + f"; belt {M['belt_mm_s']:.1f} mm/s, {M['delay_s']:.0f} s from leading to trailing edge")
         log(f"  coldest {rows[0]['ref']} {rows[0]['d_peak_c']:+.1f} C from the median (sensitivity {rows[0]['d_range_c'][0]:+.1f} to "
-            f"{rows[0]['d_range_c'][1]:+.1f}), hottest {rows[-1]['ref']} {rows[-1]['d_peak_c']:+.1f} C; {len(M.get('left_out', []))} footprints "
-            f"left out (no body data, or not a soldered part); {len(dev)} parameter variants")
+            f"{rows[0]['d_range_c'][1]:+.1f}), hottest {rows[-1]['ref']} {rows[-1]['d_peak_c']:+.1f} C; {n_assumed} parts with estimated bodies "
+            f"(give a mass or height in [reflow.parts.REF] or a Mass / Height field); {len(M.get('left_out', []))} footprints left out "
+            f"(not a soldered part); {len(dev)} parameter variants")
     params = {"cell_mm": r["cell_mm"], "dt_s": dt, "h_top": M["h_top"], "h_bot": M["h_bot"],
               "h_source": fabr.src("h_w_m2k") if not r["h_top"] else "board config", "zones_c": zones, "zone_s": r["zone_s"],
               "cool_c": r["cool_c"], "cool_s": r["cool_s"], "shift_c": round(shift, 1), "target_c": target,
               "target_source": "board config" if r["peak_target_c"] else fabr.src("reflow_peak_c"), "liquidus_c": liq,
-              "belt_mm_s": round(M["belt_mm_s"], 2), "travel": r["travel"], "variants": list(dev)}
+              "belt_mm_s": round(M["belt_mm_s"], 2), "travel": r["travel"] or "x (assumed: [reflow] travel not set)", "variants": list(dev)}
     return {"rule": "reflow", "spec": "MF7", "title": "Reflow: how far each part's peak lies from the board median (model)",
             "params": params, "findings": fs, "rows": rows, "image": img,
             "summary": {"parts": len(rows), "assumed_bodies": n_assumed, "median_peak_c": None if med is None else round(med, 1),
@@ -521,8 +526,9 @@ def chip_transient(Wm, I, liquidus):
     pfn, _ = profile_fn(r, I["shift"])
     v = M["belt_mm_s"]
     cx, cy, bm = M["cx"], M["cy"], M["mesh"]["board"]
-    axis, here = (cx, Wm["x"]) if "x" in r["travel"] else (cy, Wm["y"])
-    lead = axis[bm].min() if r["travel"].startswith("-") else axis[bm].max()
+    trav = r["travel"] or "x"
+    axis, here = (cx, Wm["x"]) if "x" in trav else (cy, Wm["y"])
+    lead = axis[bm].min() if trav.startswith("-") else axis[bm].max()
     off = abs(lead - here) / v
     T = np.full(int(free.sum()), float(r["start_c"]))
     sel = np.cumsum(free) - 1
@@ -650,11 +656,15 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
         geo = [pad_copper(ctx, pad, cache) for pad in pads]
         for q in geo:
             q["exposure"] = round((exposure or {}).get((fp["ref"], q["pad"]), 1.0), 3)
-        ax = "x" if "x" in r["travel"] else "y"
-        sgn = -1.0 if r["travel"].startswith("-") else 1.0
-        belt = sgn * (pads[a][ax] - pads[z][ax]) / (r["zone_mm"] / r["zone_s"])      # the first pad's lead into each zone (s)
+        # the belt carries one pad into each zone before the other: by the pads' distance along the belt
+        # over its speed. Added to the lag difference for the direction the board travels; with the
+        # direction not stated, the ranking value excludes it and its range covers all four
+        v = r["zone_mm"] / r["zone_s"]
+        belts = {dname: sgn * (pads[a][ax] - pads[z][ax]) / v for dname, ax, sgn in (("x", "x", 1), ("-x", "x", -1), ("y", "y", 1), ("-y", "y", -1))}
+        belt = belts[r["travel"]] if r["travel"] else 0.0
         return {"k": k, "ref": fp["ref"], "package": chip["code"], "kind": chip["kind"], "x": fp["x"], "y": fp["y"], "belt_s": round(belt, 3),
-                "layer": b.layers[pads[0]["layer_ids"][0]], "dt_s": abs(d), "first_pad": pads[a]["num"],
+                "belt_max_s": round(max(abs(x_) for x_ in belts.values()), 3), "lag_s": abs(d), "_belts": belts,
+                "layer": b.layers[pads[0]["layer_ids"][0]], "dt_s": abs(d) + belt, "first_pad": pads[a]["num"],
                 "first_net": pads[a]["net"], "last_pad": pads[z]["num"], "last_net": pads[z]["net"],
                 "first": a, "last": z, "pads": geo, "land": packages.land_pattern(chip, pads)}
     rows, problems = [], []
@@ -679,7 +689,7 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
         x = out[i]
         fp, chip, pads = scope[x["k"]]
         hp, hf = (h_top, h_bot) if fp["side"] == "F" else (h_bot, h_top)
-        res, vals, probs = {"variants": {}}, [x["dt_s"]], []
+        res, vals, probs = {"variants": {}}, [x["lag_s"]], []
         for name, kw, tkey, hs in (("paste x 0.5", {"paste_scale": 0.5}, "base", 1.0), ("paste x 2", {"paste_scale": 2.0}, "base", 1.0),
                                    ("window x 2", {"margin": 2 * p["margin_mm"]}, "base", 1.0),
                                    ("film coefficient x 0.6", {}, "film coefficient x 0.6", 0.6),
@@ -694,38 +704,42 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
                 vals.append(dv)
             except Exception as e:
                 probs.append(f"{fp['ref']} ({name}): {e}")
-        res["dt_range_s"] = [_sig(min(vals)), _sig(max(vals))]
+        # the range: the parameter variants, plus the belt term -- for the stated direction, or over all
+        # four when the direction is not known
+        if r["travel"]:
+            res["dt_range_s"] = [_sig(min(vals) + x["belt_s"]), _sig(max(vals) + x["belt_s"])]
+        else:
+            res["dt_range_s"] = [_sig(max(min(vals) - x["belt_max_s"], 0.0)), _sig(max(vals) + x["belt_max_s"])]
         if internal and internal.get("hist") is not None:
-            # the oven figure is another quantity than dt (the belt carries one pad into each zone first, and
-            # the oven is not a slow ramp): it gets its own sensitivity, from the same variants run through the oven
-            ov = []
-            for name, kw in (("nominal", {}), ("paste x 0.5", {"paste_scale": 0.5}), ("paste x 2", {"paste_scale": 2.0}),
-                             ("window x 2", {"margin": 2 * p["margin_mm"]})):
-                try:
-                    tc = chip_transient(chip_window(ctx, fp, chip, pads, hp, hf, p, **kw), internal, liq)
-                    if None not in tc:
-                        ov.append(tc[x["last"]] - tc[x["first"]])
-                        if name == "nominal":
-                            res["dt_oven_s"] = _sig(ov[-1])
-                except Exception as e:
-                    probs.append(f"{fp['ref']} (transient, {name}): {e}")
-            if res.get("dt_oven_s") is not None and len(ov) > 1:
-                res["dt_oven_range_s"] = [_sig(min(ov)), _sig(max(ov))]
-        # self-check: each nominal lies inside its own sensitivity range
-        for key, rk in (("dt_s", "dt_range_s"), ("dt_oven_s", "dt_oven_range_s")):
-            v = x["dt_s"] if key == "dt_s" else res.get(key)
-            if v is not None and res.get(rk) and not (res[rk][0] - 1e-6 <= v <= res[rk][1] + 1e-6):
-                probs.append(f"{fp['ref']}: {key} {v} outside its own sensitivity range {res[rk]}")
+            # a consistency check of the ranking value, not a second figure: the same window marched
+            # through the oven (with the board model's direction) against the lag difference plus that
+            # direction's belt term. The two are different computations of one quantity (a first moment
+            # and a transient); a disagreement larger than the parameter sensitivity is reported
+            trav = r["travel"] or "x"
+            try:
+                tc = chip_transient(chip_window(ctx, fp, chip, pads, hp, hf, p), internal, liq)
+                if None not in tc:
+                    oven = tc[x["last"]] - tc[x["first"]]
+                    est = x["lag_s"] + x["_belts"][trav]
+                    spread = max(vals) - min(vals)
+                    res["oven_check"] = {"direction": trav, "oven_s": _sig(oven), "lag_plus_belt_s": _sig(est),
+                                         "differ_s": _sig(oven - est), "sensitivity_s": _sig(spread)}
+                    if abs(oven - est) > max(spread, 0.05):
+                        probs.append(f"{fp['ref']}: the oven transient gives {oven:.3g} s, the lag difference plus the belt term "
+                                     f"{est:.3g} s (travel {trav}): they differ by more than the parameter sensitivity ({spread:.2g} s)")
+            except Exception as e:
+                probs.append(f"{fp['ref']} (transient): {e}")
         return res, probs
     top = range(min(p["detail"], len(out)))
     for i, (res, probs) in zip(top, par.pmap(detail, top, nw)):
         out[i].update(res)
         problems += probs
     for x in out:
-        for k in ("_sig", "k", "first", "last"):
+        for k in ("_sig", "k", "first", "last", "_belts"):
             x.pop(k, None)
     for x in out:
         x["dt_s"] = _sig(x["dt_s"])
+        x["lag_s"] = _sig(x["lag_s"])
     fs = []
     j = cfg["dfm"]["judge"]
     if j.get("source") and j.get("joint_dt_s") is not None:
@@ -739,18 +753,22 @@ def chips(ctx, fabr, internal=None, exposure=None, log=print):
                                   unit="s", part=x["ref"], kind="dt", basis=f"board config: {j['source']}"))
     if out:
         ds = np.array([x["dt_s"] for x in out for _ in range(x["n"])])
-        chk = [(x["dt_s"], x["dt_oven_s"]) for x in out if x.get("dt_oven_s") is not None]
+        chk = [(x["oven_check"]["lag_plus_belt_s"], x["oven_check"]["oven_s"]) for x in out if x.get("oven_check")]
         log(f"  {len(rows)} chips in {len(out)} layouts" + (f" ({skipped} left out by max_parts)" if skipped else "")
             + f": median {np.median(ds):.2f} s, largest {ds.max():.2g} s ({out[0]['refs'][0]}"
             + (f" and {out[0]['n'] - 1} like it" if out[0]["n"] > 1 else "") + ")")
         if chk:
-            log("  lag difference against the same window marched through the oven: "
+            log("  check: lag difference plus belt term against the same window marched through the oven: "
                 + ", ".join(f"{a:g} / {c:g} s" for a, c in chk[:6]))
+        if not r["travel"]:
+            log("  the belt direction is not stated ([reflow] travel): the time between the joints excludes the belt term, and its "
+                "range covers the four directions")
     for msg in problems[:5]:
         log(f"  problem: {msg}")
     params = {"cell_mm": p["cell_mm"], "coarse": p["coarse"], "margin_mm": p["margin_mm"], "paste_k": p["paste_k"],
               "paste_um": p["paste_um"], "h_top": h_top, "h_bot": h_bot, "edge": "board model" if M is not None else "insulated",
-              "detail": p["detail"], "liquidus_c": liq}
+              "detail": p["detail"], "liquidus_c": liq,
+              "travel": r["travel"] or "not stated: the value excludes the belt term; the range covers the four directions"}
     return {"rule": "chips", "spec": "MF8", "title": "Chips: time between the two joints reaching liquidus (model), with the land geometry",
             "params": params, "findings": fs, "rows": out, "problems": problems,
             "summary": {"chips": len(rows), "layouts": len(out), "not_solved": skipped + len(problems)}}

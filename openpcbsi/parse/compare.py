@@ -36,7 +36,9 @@ def _area(polys):
     return tot
 
 
-ALL = ("nets", "tracks", "vias", "zones", "footprints", "pads", "pad_polys", "mask", "paste", "outline", "stackup", "flash")
+ALL = ("nets", "tracks", "vias", "zones", "footprints", "pads", "pad_polys", "mask", "paste", "outline", "stackup", "flash", "core", "protect")
+# exact shapes (pad cores) come from the same numbers in both readers: they must agree to 10 nm
+CORE_TOL = 1e-5
 
 
 def differences(a, b, fields=None, limit=12):
@@ -105,6 +107,8 @@ def differences(a, b, fields=None, limit=12):
                 add(f"via at {k}: {x['d']}/{x['drill']} {x['net']} against {y['d']}/{y['drill']} {y['net']}")
             if "flash" in want and set(x.get("flashed", [])) != set(y.get("flashed", [])):
                 add(f"via at {k}: flashed on {sorted(x.get('flashed', []))} against {sorted(y.get('flashed', []))}")
+            if "protect" in want and "protect" in x and "protect" in y and x["protect"] != y["protect"]:
+                add(f"via at {k}: filling/capping/plugging {x['protect']} against {y['protect']}")
     if "zones" in want:
         # teardrops are zones that KiCad regenerates when it refills (kicad-cli does, as the editor does);
         # where a net and layer have teardrops, their area may differ by up to TEARDROP_REL of it
@@ -168,11 +172,28 @@ def differences(a, b, fields=None, limit=12):
                     add(f"pad {k}: drill {x.get('drill')} x {x.get('drill_y')} against {y.get('drill')} x {y.get('drill_y')}")
                 if "flash" in want and set(x.get("layers", [])) != set(y.get("layers", [])):
                     add(f"pad {k}: copper on {x['layers']} against {y['layers']}")
+                if "core" in want and ("core" in x or "core" in y):
+                    for ln in sorted(set((x.get("layer_core") or {}) | (y.get("layer_core") or {}))) or [None]:
+                        cx_ = (x.get("layer_core") or {}).get(ln) if ln else x.get("core")
+                        cy_ = (y.get("layer_core") or {}).get(ln) if ln else y.get("core")
+                        if (cx_ is None) != (cy_ is None) or (cx_ and ((cx_["pts"] is None) != (cy_["pts"] is None))):
+                            add(f"pad {k}{' ' + ln if ln else ''}: exact shape {cx_} against {cy_}")
+                        elif cx_ and cx_["pts"] is not None and (abs(cx_["r"] - cy_["r"]) > CORE_TOL or len(cx_["pts"]) != len(cy_["pts"]) or
+                                                                 max(math.hypot(u[0] - v[0], u[1] - v[1]) for u, v in zip(cx_["pts"], cy_["pts"])) > CORE_TOL):
+                            add(f"pad {k}{' ' + ln if ln else ''}: exact shape r {cx_['r']:.4f} {cx_['pts']} against r {cy_['r']:.4f} {cy_['pts']}")
                 if "pad_polys" in want:
                     ax, ay = _area(x["poly"]), _area(y["poly"])
                     # KiCad's own polygons lie up to 2 um inside an arc: about 1 % of a 0.45 mm round pad
                     if abs(ax - ay) > max(1e-4, AREA_REL * max(ax, ay), _perim(y["poly"]) * MASK_GROW):
                         add(f"pad {k} ({x.get('shape')}): copper area {ax:.4f} against {ay:.4f} mm2")
+                    # padstacks: every copper layer's own shape
+                    lx, ly = x.get("layer_poly") or {}, y.get("layer_poly") or {}
+                    if bool(lx) != bool(ly):
+                        add(f"pad {k}: a padstack in {'the first' if lx else 'the second'} reading only")
+                    for ln in set(lx) | set(ly):
+                        ax, ay = _area(lx.get(ln)), _area(ly.get(ln))
+                        if abs(ax - ay) > max(1e-4, AREA_REL * max(ax, ay), _perim(ly.get(ln)) * MASK_GROW):
+                            add(f"pad {k}: copper on {ln} {ax:.4f} against {ay:.4f} mm2 (padstack)")
                 if "mask" in want:
                     for m in set(x.get("mask", {})) | set(y.get("mask", {})):
                         ax, ay = _area(x.get("mask", {}).get(m, {}).get("polys")), _area(y.get("mask", {}).get(m, {}).get("polys"))

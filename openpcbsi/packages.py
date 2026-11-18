@@ -102,9 +102,26 @@ def body_of(fp, cfg):
         return {"C": chip["C"], "height": chip["H"], "area": chip["L"] * chip["W"], "source": chip["source"],
                 "assumed": False}
     if height is None:
-        height, hsrc = r["default_height_mm"], "assumed height"
+        # an estimate: the body drawn on the fabrication layer (else the courtyard, which includes its
+        # clearance), with a typical height for the package class; the review varies estimated bodies
+        # x0.5 and x2 and marks the parts "estimated"
+        body = fp.get("body")
+        if body and len(body) >= 3 and abs(_area(body)) > 0:
+            area, asrc = abs(_area(body)), "fabrication-layer outline"
+        else:
+            asrc = "courtyard"
+        cls = part_class(fp)
+        height = TYPICAL_HEIGHT_MM.get(cls, r["default_height_mm"])
+        hsrc = f"typical {cls} height" if cls in TYPICAL_HEIGHT_MM else "default height"
+        return {"C": rho * cp * area * height * 1e-9, "height": height, "area": area,
+                "source": f"estimated: {area:.1f} mm2 ({asrc}) x {height:g} mm ({hsrc}), moulded epoxy", "assumed": True}
     return {"C": rho * cp * area * height * 1e-9, "height": height, "area": area,
-            "source": f"block {area:.1f} mm2 x {height:g} mm ({hsrc}), moulded epoxy", "assumed": hsrc == "assumed height"}
+            "source": f"block {area:.1f} mm2 x {height:g} mm ({hsrc}), moulded epoxy", "assumed": False}
+
+
+# typical seated heights of moulded packages (mm), for parts with no body data; an estimate, varied
+# x0.5 and x2 by the reflow ranking
+TYPICAL_HEIGHT_MM = {"BGA": 1.8, "QFN": 0.9, "QFP": 1.6, "SOP": 1.6, "SOT": 1.1}
 
 
 def _area(ring):
@@ -207,29 +224,29 @@ def pin_pitch(pads, min_pins=4):
 def stencil_prediction(b, guide):
     """The stencil thickness a fabricator's guide gives for this board: per placed SMD part, the row for
     its chip size or its pin / ball pitch; the board's finest part decides. Returns {thickness_mm, part,
-    row, uncovered: [refs the guide does not cover]}."""
+    row, range_mm: the guide's recommended range for that row, uncovered: [refs the guide does not cover]}."""
     rows = guide.get("rows", [])
     larger = guide.get("larger_mm")
-    best, uncovered = None, []
+    found, uncovered = [], []
     for ref, fp in b.fps.items():
         pads = [p for p in b.pads_by_ref.get(ref, []) if p["kind"] == "smd" and p.get("layers")]
         if fp.get("dnp") or not fp.get("placed", True) or not pads:
             continue
         chip = chip_of(fp)
-        t, row = None, None
+        t, row, rng = None, None, None
         if chip:
             r = next((r for r in rows if r.get("kind") == "chip" and r.get("size") == chip["code"]), None)
             if r:
-                t, row = r["thickness_mm"], f"{chip['code']} chips"
+                t, row, rng = r["thickness_mm"], f"{chip['code']} chips", r.get("range_mm")
             elif size_rank(chip["code"]) < min((size_rank(r["size"]) for r in rows if r.get("kind") == "chip"), default=0):
                 uncovered.append(f"{ref} ({chip['code']})")
                 continue
             else:
-                t, row = larger, f"{chip['code']} chips (larger parts)"
+                t, row, rng = larger, f"{chip['code']} chips (larger parts)", guide.get("larger_range_mm")
         else:
             pitch = pin_pitch(pads)
             if pitch is None:
-                t, row = larger, "parts with fewer than 4 pins (larger parts)"
+                t, row, rng = larger, "parts with fewer than 4 pins (larger parts)", guide.get("larger_range_mm")
             else:
                 kind = "bga" if part_class(fp) == "BGA" else "ic"
                 cand = sorted((r for r in rows if r.get("kind") == kind), key=lambda r: r["pitch_mm"])
@@ -238,11 +255,17 @@ def stencil_prediction(b, guide):
                     uncovered.append(f"{ref} ({kind.upper()} pitch {pitch:.2f} mm)")
                     continue
                 r = fit[-1]
-                t, row = r["thickness_mm"], f"{kind.upper()} pitch {r['pitch_mm']:g} mm (this part: {pitch:.2f} mm)"
-        if t is not None and (best is None or t < best[0]):
-            best = (t, ref, row)
+                t, row, rng = r["thickness_mm"], f"{kind.upper()} pitch {r['pitch_mm']:g} mm (this part: {pitch:.2f} mm)", r.get("range_mm")
+        if t is not None:
+            found.append((t, ref, row, rng))
+    best = min(found, key=lambda f: (f[0], f[1])) if found else None
+    # parts that tie with the deciding one: the fabricator may choose any thickness recommended for any
+    # of them, so the range is the union of theirs
+    ties = [f for f in found if best and abs(f[0] - best[0]) < 1e-9 and f[3]]
+    rng = [min(f[3][0] for f in ties), max(f[3][1] for f in ties)] if ties else None
     return {"thickness_mm": None if (uncovered or best is None) else best[0], "part": best[1] if best else None,
-            "row": best[2] if best else None, "uncovered": uncovered}
+            "row": best[2] if best else None, "range_mm": rng, "range_from": sorted({f[1] for f in ties}) if ties else [],
+            "uncovered": uncovered}
 
 
 NOT_PARTS = ("FIDUCIAL", "TESTPOINT", "TEST_POINT", "MOUNTINGHOLE", "MOUNTING_HOLE")

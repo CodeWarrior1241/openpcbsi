@@ -31,13 +31,14 @@ fabricator publishes for BGA fields is used, where it publishes one.
 
 | Status | Exit | Means |
 |--------|------|-------|
-| `pass` | 0 | Every rule that ran passed, and nothing it relied on was assumed. |
-| `pass with assumptions` | 1 | Every rule passed, but the verdict rests on an order option the board config does not state (the via covering, the stencil thickness). The report lists them under *Assumed, not stated*; set them in `[dfm]` or state them in the order. |
+| `pass` | 0 | Every rule that ran passed, nothing it relied on was assumed, and the files that will be sent were checked (`--gerbers`). |
+| `pass with assumptions` | 1 | Every rule passed, but the verdict rests on something the board config or the files do not state: the covering of the vias in pads, the stencil thickness, the hole-spacing reading, or (without `--gerbers`) that the files plotted now are the ones sent. The report lists them under *Assumed, not stated*; set them in `[dfm]`, state them in the order, or give `--gerbers`. |
 | `warn` | 1 | At least one warning, no fail. |
 | `fail` | 2 | At least one fail. |
-| `could not check` | 3 | The review could not rely on its input: the board could not be read, or the two independent readings of the board differ (see [Reading the board](#reading-the-board)). |
+| `could not check` | 3 | The review could not rely on its input or a rule could not measure: the board could not be read, the two independent readings of the board differ, KiCad's plot of the board and the reading differ (see [Reading the board](#reading-the-board)), or a rule's measurement cases fail. A fail still shows as `fail`. |
 
-A rule's own status is `fail`, `could not check`, `warn`, `pass`, `nothing to check` or `not run`.
+A rule's own status is `fail`, `could not check`, `warn`, `pass with assumptions`, `pass`, `nothing
+to check` or `not run`. No `pass` or `warn` verdict stands on a rule that could not check.
 
 ## What a limit measures
 
@@ -60,9 +61,11 @@ A value's *use* is `limit` (judged by a rule), `order` (an order option: the ord
 For JLCPCB, read from its pages on 2026-11-16:
 
 - **Hole-to-hole spacing** (0.2 mm vias, 0.45 mm pad holes): no page says whether it is wall to wall
-  or centre to centre. It is judged centre to centre, the board owner's choice. Holes that touch or
-  overlap fail as such (geometry), and a pair that meets the figure centre to centre but not wall to
-  wall is noted (`info`).
+  or centre to centre. It is judged wall to wall: interpreted. Read centre to centre, the figure could
+  never fire, since holes of 0.2 mm or more closer than 0.2 mm centre to centre already overlap. Holes
+  that touch or overlap fail as such (geometry). A board config may read it centre to centre
+  (`[dfm] hole_spacing = "centre"`); that is then an assumption of the verdict and an item of the
+  order checklist.
 - **The smallest SMD pad** ("Minimum SMD pad: 0.25mm × 0.25mm") is read as too small in both
   directions: interpreted.
 - **Filled vias**: the capability page says "Compatible with via diameters from 0.15 to 0.55 mm"; the
@@ -79,16 +82,16 @@ For JLCPCB, read from its pages on 2026-11-16:
 
 | Check | Group (`--checks`) | Judges | Limit from |
 |-------|--------------------|--------|------------|
-| `rule_audit` (MF19) | `audit` | Each of KiCad's board-setup rules against every profile figure of the same measurand (KiCad's one hole clearance against the via, plated-hole, inner-layer and NPTH figures; its clearance against track-to-track and pad-to-track), the custom rules of the `.kicad_dru` that relax one of them, DRC tests set to ignore, rules not set. A rule is "as strict" only for the figures it meets, and the verdict names the rest. SMD pad-to-pad and the non-plated hole minimum have no KiCad board-setup rule that could hold them without forbidding other features; `mask_web` and `fab_drill` measure them. | profile |
+| `rule_audit` (MF19) | `audit` | Each of KiCad's board-setup rules against every profile figure of the same measurand (KiCad's one hole clearance against the via, plated-hole, inner-layer and NPTH figures; its clearance against track-to-track and pad-to-track), the custom rules of the `.kicad_dru` that relax one of them, DRC tests set to ignore, rules not set. A rule is "as strict" only for the figures it meets, and the verdict names the rest. A custom rule limited to the courtyards of BGA fields (`insideCourtyard('U1')`) is compared with the fabricator's BGA figures; any other condition is not read, and the finding says the rule was compared as if it applied everywhere. Since one KiCad number cannot hold every figure, a looser rule is listed (`info`) when the `dfm` check that measures the same figure runs in this review, and is a warning only when it does not. SMD pad-to-pad and the non-plated hole minimum have no KiCad board-setup rule that could hold them without forbidding other features; `mask_web` and `fab_drill` measure them. | profile |
 | `output_match` (MF20) | `output` | The files that are sent against the geometry the other checks worked on (see [The files](#the-files)). | the files |
 | `fab_track` (MF3) | `copper` | Track width per layer, at the row of that layer's copper weight; the BGA figure inside BGA fields. | published |
-| `fab_space` (MF12) | `copper` | The gap between copper of different nets, measured: track to track and pad to track, per layer's copper weight, with the BGA figures inside BGA fields. A gap within the measuring slack of the limit is `marginal` (a warning). | published |
+| `fab_space` (MF12) | `copper` | The gap between copper of different nets, measured: track to track and pad to track, per layer's copper weight, with the BGA figures inside BGA fields. A gap within the measuring slack of the limit is `marginal` (a warning; see [How the measurements are made](#how-the-measurements-are-made-and-how-exact-they-are)). | published |
 | `same_net_gap` (MF2) | `copper` | Gaps in copper of one net narrower than the same-net track spacing. Warns where a track bounds the gap; a gap between pads or pour copper only is information, since the published figure is for tracks. | published |
-| `fab_drill` (MF13) | `drill` | Via hole, via pad and via ring; through-hole annular ring (fail below the absolute minimum, warn below the recommended); non-plated hole, largest drill, plated slot width; castellated holes (diameter, spacing); hole to hole and holes that cut into each other; hole to copper of another net on every layer the hole passes; copper to the board edge (castellated pads excepted); board thickness. Slots are slots: an oval hole is a stadium, so its ends are judged. | published |
+| `fab_drill` (MF13) | `drill` | Via hole, via pad and via ring; through-hole annular ring (fail below the absolute minimum, warn below the recommended); non-plated hole, largest drill, plated slot width; castellated holes (diameter, spacing); hole to hole and holes that cut into each other; hole to copper of another net on every layer the hole passes, and copper to the board edge (castellated pads excepted), both measured exactly; board thickness. Hole-to-hole spacing is wall to wall. Slots are slots: an oval hole is a stadium, so its ends are judged. Annular rings use each copper layer's own pad (padstacks). | published |
 | `mask_web` (MF4) | `mask` | Pad spacing; the mask web as drawn (fail below the minimum, warn where openings merge); the web that would remain at the expansion the fabricator says it plots; pads of one net with no web between them (warn between parts); the smallest SMD pad, measured from its copper (a custom pad's anchor is not its size). | published |
 | `mask_exposed` (MF5) | `mask` | Copper of another net inside a pad's opening as drawn (fail), or closer to it than the opening-to-track clearance (warn). | published |
-| `via_pad` (MF14) | `mask` | A via in an SMD pad: with filled and capped vias, its drill against the process range; otherwise a fail. An untented via with no mask web to a pad; plugged-via rules. The covering is `[dfm] via_cover`; without it the fabricator's default for the layer count is assumed and the verdict is at best `pass with assumptions`. | published |
-| `paste` (MF15) | `paste` | Every paste aperture, from its own polygon (margins applied, custom apertures as drawn): area ratio and aspect ratio at the stencil thickness (IPC-7525: at least 0.66 and 1.5; the aperture's width is the largest disc that fits in it); the aperture against the stencil's minimum; an SMD part with no paste. See [Stencil thickness](#stencil-thickness). Also reports which standard thicknesses print every aperture. | standard, published |
+| `via_pad` (MF14) | `mask` | A via in an SMD pad: when filled and capped, its drill against the process range; otherwise a fail. An untented via with no mask web to a pad; plugged-via rules. Each via is judged by its own covering: as the design marks it (KiCad 10 stores filling, capping and plugging per via, and as board defaults), else `[dfm] via_cover` for every unmarked via, else the fabricator's default for the layer count, applied only to the vias in pads (JLCPCB fills the vias the order names) while every other via is judged as KiCad tents it. An assumed covering of vias in pads makes the verdict at best `pass with assumptions`, and the order checklist asks to name them. | published |
+| `paste` (MF15) | `paste` | Every paste aperture, from its own polygon (margins applied, custom apertures as drawn): area ratio and aspect ratio at the stencil thickness (IPC-7525: at least 0.66 and 1.5; the aperture's width is the largest disc that fits in it); the aperture against the stencil's minimum; an SMD part with no paste. A predicted stencil is judged at every thickness of the guide's recommended range (see [Stencil thickness](#stencil-thickness)). Also reports which standard thicknesses print every aperture. | standard, published |
 | `footprint` (MF16) | `parts` | Two-pad chip land patterns: fails when the pads are further apart than the chip's EIA body is long, so the part cannot reach both pads. The chip table holds nominal lengths with no sourced tolerance, so the nominal length is the limit and the finding says so. Nothing else about the land pattern is judged; the toe of the pads beyond the body and the ratio of the pad areas are listed in the `chips` ranking. | EIA body size |
 | `part_spacing` (MF17) | `parts` | The distance between neighbouring parts, outline to outline (pads and the body drawn on the fabrication layer), as the assembler's measurement diagram shows, against its table by package class. A part's class comes from its EIA size, KiCad's library (`Package_DFN_QFN`, `Package_QFP`, ...), its name, then its pads; a part of no class is listed with the reason, not judged. | published (recommended) |
 | `assembly` (MF18) | `parts` | Smallest package, pin and ball pitch, parts on both sides, fiducials, for the assembly service chosen. | published |
@@ -97,7 +100,9 @@ For JLCPCB, read from its pages on 2026-11-16:
 
 The report lists what the order must state for the verdict to hold, since the fabricator otherwise
 chooses: the via covering (with the number of vias in pads and the fabricator's own words on saying
-which to fill), the stencil thickness, edge rails for the assembly service, the solder-mask colour.
+which to fill), the stencil thickness, the files to send (those checked with `--gerbers`, or those
+plotted by the run), the hole-spacing reading when the board config chose centre to centre, edge
+rails for the assembly service, the solder-mask colour.
 
 ### Stencil thickness
 
@@ -107,39 +112,53 @@ let JLCPCB engineer to select the appropriate thickness for you based on your Ge
 
 - With `[dfm] stencil_mm` set, the paste rules judge at that thickness.
 - Without it, the review predicts the fabricator's choice from the profile's `[guidance.stencil]`
-  table. For JLCPCB that is the "commonly used" column of its article "How to choose a solder paste
-  stencil": a thickness per package type and pitch. The board's finest-pitch part decides, as
+  table. For JLCPCB that is its article "How to choose a solder paste stencil": per package type and
+  pitch, a recommended range and a commonly used thickness. The board's finest-pitch part decides, as
   JLCPCB's stencil design guide says ("Give most of your attention to the board's smallest pitch
   component"). The report names the part and the table row.
+- Since the fabricator may choose any thickness of that row's recommended range, the apertures are
+  judged at the commonly used one and at every standard thickness within the range (for 0.5 mm-pitch
+  ICs: 0.12, 0.13 and 0.15 mm). An aperture that prints at the commonly used thickness but not at a
+  thicker one in the range is a warning, naming the thickest stencil that prints it.
 - A predicted thickness is an assumption: the verdict is at best `pass with assumptions`, and the
   order checklist asks for that thickness. Setting `stencil_mm` removes the assumption.
 - A part the table does not cover (01005 chips, pitches finer than its rows) leaves the thickness
   unknown: the paste check is `could not check` until `stencil_mm` is set.
 
 The guide is a JLCPCB article, not its capability page, so its figures are marked as guidance. Its
-pages disagree in places: the article counts 0.13 mm as a free thickness, which the capability and
-ordering pages do not, and its quick answer gives 0.10 mm for every pitch up to 0.5 mm while its table
-gives 0.12 mm for 0.5 mm-pitch ICs. The table is used.
+pages disagree in places: the article lists 0.13 mm among the standard thicknesses, which the
+capability and ordering pages do not (a predicted stencil is judged at 0.13 mm too), and its quick
+answer gives 0.10 mm for every pitch up to 0.5 mm while its table gives 0.12 mm for 0.5 mm-pitch ICs.
+The table is used.
 
 ### How the measurements are made, and how exact they are
 
 - **Pads** are measured from their polygons. A custom pad's anchor (often 0.2 mm) is kept as
   `anchor` and no check reads it; paste-only and mask-only pads are measured from their own openings.
+  A padstack pad has a polygon per copper layer.
 - **Rasters.** Copper is drawn per layer at 25 µm with one label per net. Pads without a net
   (fiducials, mounting pads) get a label of their own, so they are copper for every check. Candidate
-  places are found there and measured again on a finer raster drawn from the vector data.
+  places are found there and measured again from the vector data.
 - **Spacing (MF12)** is measured at 6.25 µm. A gap more than one fine pixel below the limit fails; a
   gap within one pixel of the limit either side is `marginal`, a warning: neither a pass nor a fail
   can be shown.
-- **Hole to copper and copper to the edge** are measured at 2.5 µm against the exact hole (a circle
-  or a slot's stadium) and the board outline polygon. The slack is 3.3 µm (half a pixel and KiCad's
-  2 µm arc approximation). A reading within the slack of the limit is `marginal`; KiCad's DRC with the
-  clearance set to the limit settles such a place exactly.
+- **Hole to copper and copper to the edge** are measured exactly, on the vector data: the hole as its
+  circle or a slot's stadium; a straight track as its centre line and half width; an arc track as its
+  arc (each chord carries the arc's circle); a via as its circle; a standard pad (round, oval,
+  rectangle, rounded rectangle, trapezoid) as an exact core and radius, with no arc approximation; a
+  zone fill as the polygon KiCad wrote. A limit is met when the distance is within 10 nm of it: KiCad
+  stores whole nanometres, and copper drawn at a limit can sit a few nanometres short from rounding.
+  Two things are not exact and carry a stated bound instead: a custom pad or a chamfered pad with
+  round corners (its polygon lies up to 2 µm inside the true shape), and an arc of the board outline
+  (each chord lies its sagitta inside, well under 1 µm). Only where the limit falls inside such a bound
+  is the place `marginal`. On the pilot board, the 2,928 vias that sat in the old 3.3 µm band measure
+  0.2005 mm against 0.2 mm (KiCad's zone filler keeps about 0.5 µm beyond the clearance) and pass.
 - **Same-net gaps (MF2).** A ball of radius 0.125 mm is rolled through the space between copper;
   what it cannot reach, where every wall is copper of one net, is a pocket. A pocket of constant
   width is a gap. The radius is a measuring scale, not a property of a process.
 
-A rule that passes means: the geometry meets the limit plus the stated slack.
+A rule that passes means: the geometry meets the limit, to 10 nm where the measurement is exact and
+by the stated bound where it is not.
 
 ### The files
 
@@ -153,14 +172,22 @@ With `--gerbers DIR` the files in that folder are read: these should be the file
   pixels.
 - **Holes** from the drill files, by position and size.
 - **Outline**: every draw of the Edge.Cuts file on the board outline, and its length the outline's.
-- **Placement** (a `pos` file among the files): fitted parts, positions to 2 µm, sides.
+- **Placement** (a `pos` file among the files): fitted parts, positions to 2 µm, sides, and rotation
+  to 0.01° (KiCad's placement file gives each part its footprint's own angle on both sides; checked on
+  the reference corpus).
 - **BOM** (a CSV with a Reference or Designator column among the files): the board's fitted parts,
-  DNP and BOM-excluded footprints respected.
+  DNP and BOM-excluded footprints respected, and each part's value and footprint (values compared in
+  one spelling: case, spaces, ohm and micro signs do not matter). A different value or footprint
+  fails: it orders another part.
 
-Without `--gerbers`, the files are plotted with `kicad-cli` into `dfm/fab_files/`. Comparing those
-only shows that the plotter and the reader agree: the check's status is `could not check` (a
-self-test), never a pass. A construct the reader does not draw (an aperture with a hole,
-step-and-repeat) is named and that file is not compared in part.
+The board is also always plotted by `kicad-cli` into `dfm/fab_files/` and compared the same way. That
+is KiCad's own rendering of every pad (custom primitives, padstacks), mask and paste opening and the
+outline, against what the reader read: the run-time check of the reader on everything the KiCadFiles
+cross-check does not read. A difference there means the checks may have worked on wrong geometry: the
+check, and the review, are `could not check`. Without `--gerbers`, the plotted files stand in for the
+ones sent: the verdict is at best `pass with assumptions`, and the order checklist says to send those
+files. A construct the reader does not draw (an aperture with a hole, step-and-repeat) is named and
+that file is not compared in part.
 
 ### What has been compared with something independent
 
@@ -174,6 +201,13 @@ step-and-repeat) is named and that file is not compared in part.
 - **The files against the board** compare two independent paths: KiCad's plotter and this tool's own
   reading of the board. Test 45 plants file faults the images cannot see: tracks plotted 40 µm narrow,
   a layer moved by 10 µm, a missing paste aperture, a cut outline, a moved part, a BOM missing a part.
+- **Every pad shape against KiCad** (test 53): on a generated board with padstacks (front/inner/back
+  and per layer), turned oval, rounded, trapezoid and chamfered pads, a custom pad, paste-only and
+  mask-only pads, arc tracks and filled, capped and plugged vias, the file reader equals pcbnew's
+  reading in every field, every vertex of KiCad's own pad polygons lies within 1 nm of the exact pad
+  shapes, and KiCad's plot agrees with the reading.
+- **At the limit** (test 54): copper exactly at the hole-to-copper limit passes and 0.5 µm inside it
+  fails, for a straight track, an arc track, a turned rounded pad's corner and a plated slot.
 - **The pilot board's known answers** (test 51): a custom pad is judged by its copper, paste
   apertures by their own outline, 0.3 mm vias in pads against the drill range, part spacing outline to
   outline.
@@ -186,7 +220,11 @@ The board is read from the file by openpcbsi's file reader, on kicad-monkey (pin
 `deps/parsers.lock`). Zones are refilled first by `kicad-cli pcb drc --refill-zones --save-board` on a
 copy in the cache; the board file itself is never written. Every polygon (pads of every shape,
 custom pads with all their primitives, mask openings and paste apertures with their margins, the
-board outline) is computed by openpcbsi.
+board outline) is computed by openpcbsi. Padstacks (KiCad 9 and later: a pad whose shape differs per
+copper layer, front/inner/back or per layer) are read per layer; a padstack feature the reader does
+not model (another mode, a per-layer offset) stops the review (exit 3) instead of being guessed. Each
+standard pad also carries its exact shape (a core and a radius) for the exact measurements, and each
+via its filling, capping and plugging.
 
 For the review, the board is read a second time by an independent parser, KiCadFiles, and the two
 readings are compared on the fields KiCadFiles reads: nets, tracks and arcs, via position, size, drill
@@ -194,9 +232,9 @@ and net, footprint placement and value, pad number, type, net, size, drill and p
 area per net and layer. KiCadFiles turns KiCad 10's name-only nets into net 0; for KiCad 10 files the
 net names of its items are read from the file text by openpcbsi instead (`net_names_from` in the
 report). It does not read pad and via copper layers, custom-pad primitives, mask and paste openings,
-the outline, dielectric plies or footprint attributes; the report lists these as not cross-checked. A
-difference makes the review `could not check` (exit 3) and blocks `signoff`. `--no-cross-check` skips
-the second reading.
+the outline, dielectric plies or footprint attributes; those are checked at run time against KiCad's
+own plot of the board instead (see [The files](#the-files)). A difference makes the review `could not
+check` (exit 3) and blocks `signoff`. `--no-cross-check` skips the second reading.
 
 Both readers are compared with KiCad's own reading (the pcbnew snapshot) and KiCad's IPC-2581 export
 on a reference corpus of real boards (acceptance test 50): the pilot board, Antmicro's SI test board
@@ -222,31 +260,37 @@ copper, and each part as a lump on the cells under it. Both faces and the sides 
 heat with the oven air through a film coefficient; each point of the board enters a zone when the
 belt carries it there. The spike zones are shifted until the median peak over the parts is the
 assembler's stated reflow temperature, so the absolute peak is an input and only the differences
-between parts are a result. The run is repeated with the film coefficient at 0.6 and 1.6 times; each
-part's difference from the median is given with its spread over those runs. That spread is the
-result's sensitivity to that parameter, not an error bar: the runs share one model form.
+between parts are a result. The run is repeated with the film coefficient at 0.6 and 1.6 times and the
+estimated bodies at 0.5 and 2 times; each part's difference from the median is given with its spread
+over those runs. That spread is the result's sensitivity to those parameters, not an error bar: the
+runs share one model form.
 
 Only soldered parts are modelled. Fiducials, test points, mounting holes, board-only and BOM-excluded
 footprints and footprints with no paste are left out and listed. A part's body is its `[reflow.parts]`
-entry in the board config, a Mass or Height field, or the chip table; a part with none of these is
-left out of the model and listed (`left_out`), with what to give for it, instead of being given an
-assumed body. Its thermal mass is then missing from the model, which the report says.
+entry in the board config, a Mass or Height field, or the chip table. A part with none of these is
+modelled with an estimated body: the outline drawn on its fabrication layer (else its courtyard) times
+a typical seated height for its package class (BGA 1.8 mm, QFN 0.9, QFP and SOP 1.6, SOT 1.1, others
+1.0), as moulded epoxy. Its row is marked `estimated`, and the run is repeated with every estimated
+body at 0.5 and 2 times, so its range shows how much the estimate matters. Giving the part's mass or
+height replaces the estimate.
 
 **Chips (MF8).** A window around each chip: its own copper layer at 50 µm, the others at 200 µm, the
 chip as two nodes heated over their own surface and joined to the pads through the unmelted paste and
 to each other through the body. The window's edge takes its values from the board model, so planes
-do not end at the window. Two numbers, each with its own sensitivity:
+do not end at the window. One number per chip, *dt*, the time between its two joints reaching
+liquidus:
 
-- *dt*: the difference of the two joints' lag times, τ = (K + H)⁻¹ C 1. In a slow ramp the two
-  joints reach liquidus that far apart. Solved for every chip; its sensitivity is over the paste
-  conductance (0.5 and 2 times), the film coefficient (0.6 and 1.6 times) and a window twice as large.
-- *in this oven*: the same window marched through the oven profile, giving the time between the two
-  joints crossing liquidus directly. It also includes the belt carrying one pad into each zone before
-  the other, so it is another quantity than *dt*. Its sensitivity is over the paste conductance and
-  the window, each run through the oven. Run for the first `detail` layouts.
+- the difference of the two joints' lag times, τ = (K + H)⁻¹ C 1 (in a slow ramp the two joints reach
+  liquidus that far apart), solved for every chip;
+- plus the belt term: the belt carries one pad into each zone before the other, by their distance
+  along the belt over its speed. It is added for the direction the board travels, `[reflow] travel`.
+  When that is not stated, *dt* excludes it and the range covers all four directions.
 
-A self-check asserts that each nominal figure lies inside its own sensitivity range. Chips with the
-same layout and nearly the same result share a row. Timing is one input to tombstoning. The wetting
+The range is over the paste conductance (0.5 and 2 times), the film coefficient (0.6 and 1.6 times), a
+window twice as large, and the belt term. For the first `detail` layouts the same window is also
+marched through the oven profile: a check of *dt* (two computations of one quantity), not a second
+figure. A disagreement larger than the parameter sensitivity is reported as a model problem. Chips
+with the same layout and nearly the same result share a row. Timing is one input to tombstoning. The wetting
 forces (pad geometry, paste volume and offset, placement, alloy) are not modelled; the toe of the pads
 beyond the body and the ratio of the pad areas are listed beside the timing, with the copper leaving
 each pad, whether it sits in a pour, and vias in or near it.
@@ -289,10 +333,12 @@ kind = "tombstone"
 count = 3                  # on how many of the boards (default 1)
 ```
 
-For each ranking it reports the share of (defective, sound) pairs it puts in the right order (0.5 is
-chance, 1 is perfect), with its bootstrap 95 % interval and the counts it rests on. With fewer than 5
-defective parts it reports "insufficient data" instead of a score. That is the evidence a limit in
-`[dfm.judge]` should rest on.
+Each part's defect rate is its count over `boards_built` (listed in the report). For each ranking it
+reports the share of (defective, sound) pairs it puts in the right order, each defective part
+weighted by its rate (0.5 is chance, 1 is perfect; a part that failed on 30 of 50 boards counts thirty
+times one that failed once), with its bootstrap 95 % interval and the counts it rests on. A count
+above `boards_built` is refused. With fewer than 5 defective parts it reports "insufficient data"
+instead of a score. That is the evidence a limit in `[dfm.judge]` should rest on.
 
 ## Not checked
 
@@ -335,8 +381,9 @@ Every key has a default.
 fab = "jlcpcb"                 # profile name or file
 mask_color = "green"           # black and white need a wider pad spacing at some fabricators
 assembly_service = "standard"  # which column of the assembler's table applies
-via_cover = ""                 # tented, plugged or filled; "" = the fabricator's default (an assumption)
+via_cover = ""                 # tented, plugged or filled, for vias the design does not mark; "" = the fabricator's default for vias in pads (an assumption)
 stencil_mm = 0.0               # the stencil thickness that will be ordered; 0 = the fabricator guide's choice (an assumption)
+hole_spacing = ""              # "centre": read hole-to-hole figures centre to centre (an assumption); "" = the profile's (wall to wall)
 bga_refs = []                  # parts treated as BGA fields besides those whose footprint name says BGA
 gerbers = ""                   # folder of the files that will be sent (also --gerbers)
 workers = 0                    # worker processes; 0 = a quarter of the CPUs, at most 8
@@ -348,7 +395,7 @@ mask_web_mm = 0.12
 zones_c = [110, 140, 160, 175, 185, 200, 260, 270]   # oven air per zone
 zone_s = 30
 zone_mm = 350                  # with zone_s: the belt speed
-travel = "x"                   # board axis along the belt
+travel = ""                    # board axis along the belt (x, -x, y, -y); "" = not known: chip timing covers all four
 
 [reflow.parts.L1]
 mass_g = 2.4

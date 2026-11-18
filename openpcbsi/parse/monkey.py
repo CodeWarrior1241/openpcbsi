@@ -115,7 +115,7 @@ def extract(board_path, refill_dir=None):
     from kicad_monkey.kicad_pcb_layer_policy import PcbLayerFlashResolver, copper_layer_stack
     from shapely import geometry, ops
     from .. import padgeom
-    from ..snapshot import file_sha256, parse_stackup, _arc_points, _dnp_field
+    from ..snapshot import file_sha256, parse_stackup, _arc_points, _arc_circle, _dnp_field
     text = open(board_path, encoding="utf-8").read()
     pcb = KiCadPcb(board_path)
     copper = list(copper_layer_stack(pcb))
@@ -135,6 +135,20 @@ def extract(board_path, refill_dir=None):
         chains += _graphic_chains([g for g in (fp.fp_lines + fp.fp_arcs + fp.fp_rects + fp.fp_circles + fp.fp_polys)
                                    if getattr(g, "layer", None) == "Edge.Cuts"], tf)
     snap["outline"] = shapes.outline(chains)
+    arcs = []
+    for items, tf in [(pcb.top_level_outline_items("Edge.Cuts"), None)] + [
+            ([g for g in (fp.fp_arcs + fp.fp_circles) if getattr(g, "layer", None) == "Edge.Cuts"], _xform(fp)) for fp in pcb.footprints]:
+        t = tf or (lambda x, y: (x, y))
+        for g in items:
+            kind = type(g).__name__.lower()
+            if "arc" in kind:
+                c = _arc_circle(t(g.start_x, g.start_y), t(g.mid_x, g.mid_y), t(g.end_x, g.end_y))
+                if c:
+                    arcs.append(c)
+            elif "circle" in kind:
+                cx_, cy_ = t(g.center_x, g.center_y)
+                arcs.append([cx_, cy_, math.hypot(g.end_x - g.center_x, g.end_y - g.center_y)])
+    snap["outline_arcs"] = arcs
     # nets: KiCad 10 files carry names only; classes come from the project
     names = set()
     for coll in (pcb.segments, pcb.arcs, pcb.vias, pcb.zones):
@@ -156,11 +170,27 @@ def extract(board_path, refill_dir=None):
         tracks.append({"x1": t.start_x, "y1": t.start_y, "x2": t.end_x, "y2": t.end_y, "w": t.width, "layer": t.layer, "net": t.net.name or ""})
     for a in pcb.arcs:
         pts = _arc_points((a.start_x, a.start_y), (a.mid_x, a.mid_y), (a.end_x, a.end_y))
+        arc = _arc_circle((a.start_x, a.start_y), (a.mid_x, a.mid_y), (a.end_x, a.end_y)) or True
         for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
-            tracks.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "w": a.width, "layer": a.layer, "net": a.net.name or "", "arc": True})
+            tracks.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "w": a.width, "layer": a.layer, "net": a.net.name or "", "arc": arc})
     snap["tracks"] = tracks
     vias = []
     vtype = {None: 3, "through": 3, "blind": 2, "buried": 2, "micro": 1}    # pcbnew's VIATYPE values
+    # via protection (KiCad 10, IPC-4761): the board setup's defaults, overridden per via. Only a "yes"
+    # in the setup is a statement (its "no" is KiCad's default); a via's own yes or no is one.
+    def _setup(key, side=None):
+        it = next((x for x in (pcb.setup_sexp or [])[1:] if isinstance(x, list) and x and str(x[0]) == key), None)
+        if it is None:
+            return None
+        if side:
+            it = next((x for x in it[1:] if isinstance(x, list) and x and str(x[0]) == side), None)
+            if it is None:
+                return None
+        return True if len(it) > 1 and str(it[1]) == "yes" else None
+    board_prot = {"filled": _setup("filling"), "capped": _setup("capping"), "plugged": [_setup("plugging", "front"), _setup("plugging", "back")]}
+
+    def _yn(v):
+        return None if v is None else bool(v)
     for v in pcb.vias:
         fl = [l for l in flash.via_flash_layers(v) if l in copper]
         span = list(v.layers or [copper[0], copper[-1]])
@@ -182,7 +212,13 @@ def extract(board_path, refill_dir=None):
         vias.append({"x": v.at_x, "y": v.at_y, "d": v.size, "drill": v.drill, "net": v.net.name or "", "span": span[:2],
                      "flashed": fl, "type": vtype.get(str(v.via_type).lower() if v.via_type else None, 3), "backdrill": backdrill,
                      "tented": [getattr(ten, "front", None), getattr(ten, "back", None)] if ten is not None else [None, None],
-                     "mask_exp": None})
+                     "mask_exp": None,
+                     "protect": {"filled": _yn(v.filling) if v.filling is not None else board_prot["filled"],
+                                 "capped": _yn(v.capping) if v.capping is not None else board_prot["capped"],
+                                 "plugged": [_yn(getattr(v.plugging, "front", None)) if v.plugging is not None and getattr(v.plugging, "front", None) is not None
+                                             else board_prot["plugged"][0],
+                                             _yn(getattr(v.plugging, "back", None)) if v.plugging is not None and getattr(v.plugging, "back", None) is not None
+                                             else board_prot["plugged"][1]]}})
     snap["vias"] = vias
     zones = []
     for z in pcb.zones:
@@ -195,7 +231,7 @@ def extract(board_path, refill_dir=None):
                 continue
             zones.append({"net": z.net.name if z.net else "", "layer": fpoly.layer, "priority": int(z.priority or 0), "name": z.name,
                           "teardrop": "teardrop" in str(getattr(z, "_raw_sexp", "")),
-                          "polys": [[[(round(x, 5), round(y, 5)) for x, y in fpoly.points]]]})
+                          "polys": [[[(round(x, 6), round(y, 6)) for x, y in fpoly.points]]]})
     snap["zones"] = zones
     fps, pads, mask_shapes = [], [], []
     board_mask = float(pcb.pad_to_mask_clearance or 0.0)
@@ -244,12 +280,40 @@ def extract(board_path, refill_dir=None):
             loc = shapes.pad_local(shp, p.size_x, p.size_y, p.roundrect_rratio or 0.0, p.chamfer_ratio or 0.0, corners,
                                    (p.rect_delta_x or 0.0, p.rect_delta_y or 0.0), anchor, prims)
             g = shapes.to_board(loc, px, py, rot)
+            # padstacks (KiCad 9+): the pad's own fields are its F.Cu shape; (padstack (mode ...) (layer
+            # "Inner" | "B.Cu" | "In1.Cu" ...)) gives the others
+            base = {"shape": shp, "sx": p.size_x, "sy": p.size_y, "rratio": p.roundrect_rratio or 0.0, "chamfer": p.chamfer_ratio or 0.0,
+                    "corners": corners, "delta": (p.rect_delta_x or 0.0, p.rect_delta_y or 0.0), "anchor": anchor, "prims": prims}
+            mode, entries = shapes.padstack(getattr(p, "_raw_sexp", None))
+            if mode not in (None, "normal", "front_inner_back", "custom") or any(
+                    any(isinstance(it, list) and it and str(it[0]) == "offset" for it in e[1:]) for e in entries.values()):
+                from ..snapshot import InputError
+                raise InputError(f"{ref}.{p.number}: a padstack openpcbsi does not read (mode {mode}, or a per-layer offset); "
+                                 f"the review cannot rely on its pad geometry")
+            stack, g_of = {}, {}
+            if mode and mode != "normal" and len(cu_on) > 1:
+                for ln in cu_on:
+                    e = entries.get(ln) if mode == "custom" else (entries.get("B.Cu") if ln == copper[-1] else
+                                                                   None if ln == copper[0] else entries.get("Inner"))
+                    q = shapes.entry_params(e, base) if e is not None else base
+                    gl = shapes.to_board(shapes.pad_local(q["shape"], q["sx"], q["sy"], q["rratio"], q["chamfer"], q["corners"], q["delta"],
+                                                          q["anchor"], q["prims"]), px, py, rot)
+                    g_of[ln] = gl
+                    chm = bool(q["chamfer"] > 0 and q["corners"])
+                    stack.setdefault("layer_poly", {})[ln] = shapes.rings(gl)
+                    stack.setdefault("layer_core", {})[ln] = None if q["shape"] == "custom" else padgeom.core(
+                        "roundrect" if (q["shape"] == "roundrect" or chm) else q["shape"], q["sx"], q["sy"], px, py, rot,
+                        max(0.0, min(q["rratio"], 0.5)) * min(q["sx"], q["sy"]) if q["shape"] == "roundrect" else 0.0, q["delta"], chm)
+                    stack.setdefault("layer_size", {})[ln] = [q["sx"], q["sy"]]
+                stack["padstack"] = mode
             polys = shapes.rings(g) if cu_on else []
             mask, paste, paste_poly = {}, {}, {}
             # KiCad applies mask and paste margins only to pads on a copper layer: an aperture pad (paste-
             # or mask-only) is its drawn shape
             on_cu = any(l.endswith(".Cu") for l in lays)
             for mname, pname in (("F.Mask", "F.Paste"), ("B.Mask", "B.Paste")):
+                g_main = g
+                g = g_of.get(copper[-1] if mname == "B.Mask" else copper[0], g_main)
                 if mname in lays:
                     exp = next((v for v in (p.solder_mask_margin, fp.solder_mask_margin) if v is not None), board_mask) if on_cu else 0.0
                     mask[mname] = {"exp": float(exp), "polys": shapes.rings(shapes.grow(g, float(exp)))}
@@ -267,6 +331,7 @@ def extract(board_path, refill_dir=None):
                     else:
                         pg = g
                     paste_poly[pname] = shapes.rings(pg)
+                g = g_main
             own = polys or next((v for v in paste_poly.values() if v), None) or next((v["polys"] for v in mask.values() if v["polys"]), None) or []
             dims = padgeom.measure(own, px, py, rot)
             custom = shp == "custom"
@@ -274,12 +339,16 @@ def extract(board_path, refill_dir=None):
             dy_ = dx_
             if kind in ("pth", "npth") and getattr(p, "drill_oval", False):
                 dx_, dy_ = float(p.drill_width or dx_), float(p.drill_height or dx_)
-            rec = {"ref": ref, "num": p.number or "", "net": (p.net.name if getattr(p, "net", None) else "") or "", "kind": kind,
+            chamfered = bool((p.chamfer_ratio or 0.0) > 0 and corners)
+            core = None if custom else padgeom.core("roundrect" if (shp == "roundrect" or chamfered) else shp, p.size_x, p.size_y, px, py, rot,
+                                                    max(0.0, min(p.roundrect_rratio or 0.0, 0.5)) * min(p.size_x, p.size_y) if shp == "roundrect" else 0.0,
+                                                    (p.rect_delta_x or 0.0, p.rect_delta_y or 0.0), chamfered)
+            rec = {"ref": ref, "num": p.number or "", "net": (p.net.name if getattr(p, "net", None) else "") or "", "kind": kind, "core": core,
                    "x": px, "y": py, "rot": rot, "shape": shp,
                    "sx": dims["w"] if (dims and custom) else p.size_x, "sy": dims["h"] if (dims and custom) else p.size_y,
                    "anchor": [p.size_x, p.size_y], "dims": dims, "drill": dx_, "drill_y": dy_,
                    "layers": cu_on, "poly": polys, "pinfunc": p.pinfunction or "", "pintype": p.pintype or "",
-                   "mask": mask, "paste": paste, "paste_poly": paste_poly}
+                   "mask": mask, "paste": paste, "paste_poly": paste_poly, **stack}
             pads.append(rec)
             fpads.append(rec)
         allpts = [q for r_ in fpads for poly in r_["poly"] for q in poly[0]] + [q for c in fab for q in c]

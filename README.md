@@ -185,12 +185,12 @@ BGA fields included (with the figures the fabricator publishes for them).
 | Rule | What it judges |
 |------|----------------|
 | `rule_audit` | KiCad's board-setup rules against the fabricator's limits: whether a clean KiCad DRC is evidence at all. |
-| `output_match` | The Gerber and drill files (`--gerbers DIR`, else plotted now) against the copper, mask openings and holes that were checked. |
+| `output_match` | The Gerber, drill, placement and BOM files (`--gerbers DIR`) against the copper, mask openings, holes and parts that were checked. KiCad's own plot of the board is always compared too, as the run-time check of the reader; without `--gerbers` the review assumes those plotted files are the ones sent ("pass with assumptions"). |
 | `fab_track`, `fab_space` | Track width; the measured gap between copper of different nets. |
 | `same_net_gap` | Gaps beside a track narrower than the fabricator's same-net track spacing. |
-| `fab_drill` | Via and hole sizes, annular rings, hole to hole, hole to copper on every layer, copper to the board edge. |
-| `mask_web`, `mask_exposed`, `via_pad` | Mask webs as drawn and at the fabricator's own expansion; copper inside or beside an opening; vias in or beside pads. |
-| `paste` | Stencil aperture area and aspect ratios (IPC-7525) at the stencil thickness the board config gives (`[dfm] stencil_mm`), else the one the fabricator's guide gives for the finest-pitch part (then an assumption, and the review is "pass with assumptions"), and which standard thicknesses print every aperture. |
+| `fab_drill` | Via and hole sizes, annular rings, hole to hole (wall to wall), hole to copper on every layer and copper to the board edge, measured exactly on the vector data (to 10 nm). |
+| `mask_web`, `mask_exposed`, `via_pad` | Mask webs as drawn and at the fabricator's own expansion; copper inside or beside an opening; vias in or beside pads, each by its own covering (KiCad's per-via filling and plugging). |
+| `paste` | Stencil aperture area and aspect ratios (IPC-7525) at the stencil thickness the board config gives (`[dfm] stencil_mm`), else the one the fabricator's guide gives for the finest-pitch part, judged across the guide's recommended range for it (then an assumption, and the review is "pass with assumptions"), and which standard thicknesses print every aperture. |
 | `footprint`, `part_spacing`, `assembly` | Two-pad chip land patterns whose pads are further apart than the chip's EIA body can reach; spacing between parts; pin pitch, package size, sides and fiducials for the assembly service. |
 
 **Rankings** order places on the board by a measurement or a model that no published limit covers

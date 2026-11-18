@@ -80,6 +80,7 @@ DEFAULTS = {
         "fab_limits": {},              # overrides of resolved limits, e.g. mask_web_mm = 0.12
         "via_cover": "",               # how the vias are ordered: tented, plugged or filled; "" = the profile's default
         "stencil_mm": 0.0,             # stencil thickness; 0 = the thinnest standard stencil of the profile
+        "hole_spacing": "",            # "centre": read the hole-to-hole figures centre to centre (an assumption); "" = the profile's reading
         "bga_refs": [],                # parts treated as BGA fields besides those whose footprint name says BGA
         "gerbers": "",                 # folder of the Gerber and drill files that will be sent (also --gerbers)
         "workers": 0,                  # worker processes; 0 = a quarter of the CPUs, at most 8
@@ -121,7 +122,8 @@ DEFAULTS = {
         "zone_s": 30.0,
         "cool_c": [120.0, 60.0], "cool_s": 30.0,
         "zone_mm": 350.0,                 # length of a zone: with zone_s it gives the belt speed
-        "travel": "x",                    # board axis along the belt: x, -x, y or -y
+        "travel": "",                     # board axis along the belt: x, -x, y or -y; "" = not known (the chip
+                                          # timing then covers all four, the board model assumes x)
         "calibrate": True, "spike_zones": 2,
         "peak_target_c": 0.0,             # 0 = the fabricator's stated reflow temperature
         "liquidus_c": 217.0,              # SAC305

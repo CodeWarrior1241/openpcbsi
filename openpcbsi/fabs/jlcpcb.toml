@@ -103,8 +103,8 @@ via_diameter_min_mm = { value = 0.25, page = "main", quote = "2-layer: 0.15mm ho
 via_diameter_over_hole_mm = { value = 0.10, page = "main", quote = "Via diameter should be 0.1mm(0.15mm preferred) larger than Via hole size.", measurand = "via_pad_minus_drill" }
 npth_min_mm = { value = 0.50, page = "main", quote = "Min. Non-plated holes: 0.50mm", measurand = "drill" }
 drill_max_mm = { value = 6.3, page = "main", quote = "Drill Diameter: Multilayer: 0.15 – 6.3 mm", measurand = "drill" }
-via_hole_spacing_mm = { value = 0.20, page = "main", quote = "Via Hole-to-Hole Spacing: 0.2mm", measurand = "hole_centre_to_centre", certainty = "chosen", note = "no JLCPCB page says whether hole-to-hole spacing is measured wall to wall or centre to centre; the board owner chose centre to centre (the lenient reading: a pair that passes it but not wall to wall is noted)" }
-pad_hole_spacing_mm = { value = 0.45, page = "main", quote = "Pad Hole-to-Hole Spacing: 0.45mm", measurand = "hole_centre_to_centre", certainty = "chosen", note = "as via_hole_spacing_mm" }
+via_hole_spacing_mm = { value = 0.20, page = "main", quote = "Via Hole-to-Hole Spacing: 0.2mm", measurand = "hole_wall_to_wall", certainty = "interpreted", note = "no JLCPCB page says whether hole-to-hole spacing is wall to wall or centre to centre; wall to wall is used, as centre to centre cannot fire before holes of 0.2 mm or more already overlap. A board config may read it centre to centre ([dfm] hole_spacing = \"centre\"), recorded as an assumption" }
+pad_hole_spacing_mm = { value = 0.45, page = "main", quote = "Pad Hole-to-Hole Spacing: 0.45mm", measurand = "hole_wall_to_wall", certainty = "interpreted", note = "as via_hole_spacing_mm" }
 plated_slot_min_2l_mm = { value = 0.50, page = "main", quote = "Min. Plated Slots Width: 2-layer: 0.5mm", measurand = "slot_width" }
 plated_slot_min_ml_mm = { value = 0.35, page = "main", quote = "Min. Plated Slots Width: Multi-layer: 0.35mm", measurand = "slot_width" }
 castellated_hole_min_mm = { value = 0.50, page = "main", quote = "Min. Castellated Holes: 0.5mm; ① Hole diameter (Φ): ≥ 0.5 mm", measurand = "drill", conflict = "the castellated-PCB guide gives 0.6 mm minimum, 0.8 mm recommended (castellated page)" }
@@ -195,7 +195,7 @@ rails_economic = { value = false, page = "assembly", quote = "Edge Rails: Not ne
 
 # ---- stencil ----------------------------------------------------------------------------------------
 [published.stencil]
-thickness_mm = { value = [0.10, 0.12, 0.15, 0.18, 0.20], page = "stencil", quote = "Standard thickness ( no extra cost): 0.10 mm, 0.12 mm, 0.15 mm, 0.18 mm, 0.20 mm.", measurand = "stencil_thickness", use = "input", conflict = "the stencil-choice article also lists 0.13 mm as free (stencil_guide page)" }
+thickness_mm = { value = [0.10, 0.12, 0.15, 0.18, 0.20], page = "stencil", quote = "Standard thickness ( no extra cost): 0.10 mm, 0.12 mm, 0.15 mm, 0.18 mm, 0.20 mm.", measurand = "stencil_thickness", use = "input", conflict = "the stencil-choice article also lists 0.13 mm among the standard options (stencil_guide page); a predicted stencil is judged at 0.13 mm too" }
 engineer_chooses = { value = true, page = "stencil_order", quote = "You can either select a thickness by yourself, or you can just let JLCPCB engineer to select the appropriate thickness for you based on your Gerber file features.", measurand = "order_option", use = "order" }
 aperture_min_mm = { value = 0.08, page = "stencil", quote = "Minimum Aperture Size: >0.08mm", measurand = "aperture_width" }
 
@@ -228,8 +228,10 @@ area_ratio_min = 0.66               # IPC-7525: aperture area / aperture wall ar
 aspect_ratio_min = 1.5              # IPC-7525: aperture width / stencil thickness
 
 # ---- the fabricator's design guidance (articles, not capability pages) ------------------------------
-# Stencil thickness JLCPCB's article gives as "commonly used" per package and pitch: the review
-# predicts the thickness from the board's finest-pitch part when `[dfm] stencil_mm` is not set.
+# Stencil thickness JLCPCB's article gives as "commonly used" per package and pitch, and its
+# "recommended range": the review predicts the thickness from the board's finest-pitch part when
+# `[dfm] stencil_mm` is not set, and judges the apertures over the whole range (the fabricator may
+# choose any of it).
 # `kind` is ic (QFN, QFP, SOP, ...), bga or chip (EIA size); `pitch_mm` the part's pitch (ic, bga).
 [guidance.stencil]
 page = "stencil_guide"
@@ -238,17 +240,17 @@ finest_pitch_quote = "Give most of your attention to the board's smallest pitch 
 finest_pitch_page = "stencil_design"
 conflict = "the same article's quick answer gives 0.10 mm for every pitch up to 0.5 mm; its table gives 0.12 mm for 0.5 mm-pitch ICs. The table is used."
 rows = [
-    { kind = "ic", pitch_mm = 0.3, thickness_mm = 0.08 },
-    { kind = "ic", pitch_mm = 0.4, thickness_mm = 0.10 },
-    { kind = "ic", pitch_mm = 0.5, thickness_mm = 0.12 },
-    { kind = "ic", pitch_mm = 0.65, thickness_mm = 0.15 },
-    { kind = "bga", pitch_mm = 0.4, thickness_mm = 0.10 },
-    { kind = "bga", pitch_mm = 0.5, thickness_mm = 0.10 },
-    { kind = "bga", pitch_mm = 0.65, thickness_mm = 0.12 },
-    { kind = "bga", pitch_mm = 0.8, thickness_mm = 0.15 },
-    { kind = "bga", pitch_mm = 1.27, thickness_mm = 0.15 },
-    { kind = "chip", size = "0201", thickness_mm = 0.10 },
-    { kind = "chip", size = "0402", thickness_mm = 0.12 },
+    { kind = "ic", pitch_mm = 0.3, thickness_mm = 0.08, range_mm = [0.07, 0.10] },
+    { kind = "ic", pitch_mm = 0.4, thickness_mm = 0.10, range_mm = [0.10, 0.12] },
+    { kind = "ic", pitch_mm = 0.5, thickness_mm = 0.12, range_mm = [0.12, 0.15] },
+    { kind = "ic", pitch_mm = 0.65, thickness_mm = 0.15, range_mm = [0.15, 0.18] },
+    { kind = "bga", pitch_mm = 0.4, thickness_mm = 0.10, range_mm = [0.08, 0.10] },
+    { kind = "bga", pitch_mm = 0.5, thickness_mm = 0.10, range_mm = [0.10, 0.12] },
+    { kind = "bga", pitch_mm = 0.65, thickness_mm = 0.12, range_mm = [0.12, 0.13] },
+    { kind = "bga", pitch_mm = 0.8, thickness_mm = 0.15, range_mm = [0.13, 0.15] },
+    { kind = "bga", pitch_mm = 1.27, thickness_mm = 0.15, range_mm = [0.15, 0.20] },
+    { kind = "chip", size = "0201", thickness_mm = 0.10, range_mm = [0.08, 0.12] },
+    { kind = "chip", size = "0402", thickness_mm = 0.12, range_mm = [0.10, 0.13] },
 ]
 # larger parts: "Used for larger components, including ICs ≥ 0.65 mm pitch and BGAs ≥ 0.8 mm pitch." (0.15 mm)
 larger_mm = 0.15

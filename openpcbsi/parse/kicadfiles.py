@@ -8,7 +8,10 @@ DNP); it was released before KiCad 10. The cross-check therefore compares only w
     value, library id, position, rotation and side, pad number / type / net / size (the size written in
     the file: a custom pad's anchor) / drill / position, and zone fill area per net and layer.
 
-Everything else is listed as not cross-checked in the review.
+Everything else is listed as not cross-checked in the review. Pads (every copper layer, custom
+primitives, padstacks), mask and paste openings and the outline are instead checked at run time
+against KiCad's own plot of the board (dfm.rule_output), and both readers against pcbnew on generated
+and real boards (acceptance tests 50 and 53).
 """
 import math
 
