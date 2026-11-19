@@ -12,6 +12,10 @@ generalised to geometry cut from any KiCad board.
     max_timesteps = 400000
     end_criteria = 1e-4
     lead_mm = 2.0                           # synthetic straight lead-in at each port
+    rotate_deg = 0                          # turn the board about rotate_about (default: the box centre) first
+    include_mm = 1.0                        # other nets' copper beyond this from the region's copper is left out
+    term_ohm = 50                           # load at a pad where a region net ends in the box (terminate = false: none)
+    max_hours = 6                           # refused before solving when the run is predicted to take longer
     preflight_only = false
 
 The model (built here in KiCad's python, run by em3d.py in the openEMS python):
@@ -24,10 +28,17 @@ The model (built here in KiCad's python, run by em3d.py in the openEMS python):
 - at each crossing of a port net with the box edge, the track is extended straight out of the box by
   `lead_mm` (zero-thickness, as openEMS's microstrip port expects) and fed by an MSLPort beyond the
   absorbing layer; P/N pairs on one side are driven +1/-1 in one run (mixed-mode parameters);
-- PML on the four sides, MUR top and bottom with 1 mm of air; mesh lines on copper edges by the 1/3-2/3
-  rule, >= 5 cells across the narrowest track and gap, graded outwards, lines closer than 5 um merged;
-- pre-flight refuses a model with copper running along the absorbing layer, or ports shorter than the
-  PML plus the feed-to-measurement distance;
+- a region net that ends on a part's pad in the box: a lumped port of term_ohm from the pad to the
+  nearest reference plane under it (the receiver's or cable's load, and a measured port), not an open end;
+- the nets beyond the region's series parts (and their partners) join the region; other nets' copper
+  farther than include_mm from the region's copper is left out, nearer copper meshed coarser;
+- PML on the four sides, MUR top and bottom with 1 mm of air; mesh lines on the region copper's edges by
+  the 1/3-2/3 rule, >= 5 cells across the narrowest track and gap, graded outwards; no two lines closer
+  than 5 um (10 um in z), after mirroring about a pair too (merge_lines);
+- pre-flight refuses a model with copper ending in or running along the absorbing layer, ports shorter
+  than the PML plus the feed-to-measurement distance, a lane that reaches no other port or termination,
+  a pair cut by a box corner, a port off square; run() then refuses a model predicted to stop on the
+  step limit or to take longer than max_hours (run_estimate), all before anything is solved;
 - two grids; each run records whether it ended by the energy criterion or by the time-step limit; the
   result is accepted only if both ended by the criterion and agree on line impedance and TDR;
 - the line impedance of the model is read from the TDR (renormalised to the port's measured impedance)
@@ -72,6 +83,10 @@ T_RUN_S = 0.5e-9      # a series C whose 100 ohm time constant exceeds this is l
 PML_CELLS = 8
 KEEP_H = 5.0          # pre-flight clearance from the absorbing boundary: at least this many field heights
 AIR_UM = 1000.0
+COARSE = 2.5          # other nets' copper: cells this many times the region lines' fine cell
+TERM_OHM = 50.0       # a region net that ends on a pad in the box: its load to the reference plane
+INCLUDE_MM = 1.0      # other nets' copper farther than this from the region's copper is left out (see _inclusion)
+MAX_PORT_ANGLE = 10.0  # degrees between a port's track and the side's normal
 
 
 # ---- geometry helpers (um) --------------------------------------------------------------------
@@ -216,7 +231,38 @@ def mesh_axis(lo, hi, fixed, zones, hmax, ratio=1.3, min_space=5.0):
             break
         for i in sorted(bad, reverse=True):
             lines.insert(i + 1, (lines[i] + lines[i + 1]) / 2)
-    return [round(v, 3) for v in lines]
+    return merge_lines([round(v, 3) for v in lines], fset, min_space)
+
+
+def merge_lines(lines, fixed, min_space):
+    """No two lines closer than min_space. The FDTD time step follows the smallest cell (Courant), so one
+    pair of lines 1 nm apart makes every step ~1000 times shorter for the whole model. Of two lines too
+    close, a fixed line (a copper sheet's face, a port, the 1/3-2/3 lines of an edge) wins over a graded
+    one; two fixed lines become one between them (each moves by under min_space / 2); the domain's
+    ends always stay."""
+    lines = sorted(lines)
+    if len(lines) < 2:
+        return lines
+    lo, hi = lines[0], lines[-1]
+    isfix = lambda v: round(v, 3) in fixed
+    out = [lo]
+    for v in lines[1:]:
+        if v - out[-1] >= min_space - 1e-9:
+            out.append(v)
+            continue
+        if len(out) == 1:                          # out[-1] is the domain's first line: it stays
+            if v == hi:
+                out.append(v)                      # a domain thinner than min_space: keep both ends
+            continue
+        if v == hi:
+            out[-1] = v                            # the domain's last line replaces the one before it
+        elif isfix(v) and not isfix(out[-1]):
+            out[-1] = v
+        elif isfix(v) and isfix(out[-1]):
+            out[-1] = round((out[-1] + v) / 2, 3)
+            fixed = set(fixed) | {round(out[-1], 3)}
+        # else: a graded line too close to the last one is dropped
+    return out
 
 
 def mesh_axis_sym(lo, hi, c, fixed, zones, hmax, **kw):
@@ -230,12 +276,14 @@ def mesh_axis_sym(lo, hi, c, fixed, zones, hmax, **kw):
             if bb >= c:
                 zr.append((max(aa, c), bb, h))
     half = mesh_axis(c, c + R, fr, zr, hmax, **kw)
-    full = sorted({round(2 * c - v, 3) for v in half} | set(half))
-    full = [v for v in full if lo <= v <= hi]
-    for v in (lo, hi):
-        if not full or min(abs(v - x) for x in full) > 1e-3:
-            full.append(round(v, 3))
-    return sorted(full)
+    # mirrored as offsets from c: the centre line is one line (mirroring the rounded values gave it twice,
+    # 1 nm apart: a 1 nm cell, and a time step ~1000 times too short)
+    off = [v - half[0] for v in half]
+    full = sorted({round(c - d, 3) for d in off} | {round(c + d, 3) for d in off})
+    full = [v for v in full if lo + 1e-3 < v < hi - 1e-3] + [round(lo, 3), round(hi, 3)]
+    ms = kw.get("min_space", 5.0)
+    fixed = {round(f, 3) for f in fixed} | {round(2 * c - f, 3) for f in fixed} | {round(c, 3)}
+    return merge_lines(sorted(set(full)), fixed, ms)
 
 
 def thirds(edges, h):
@@ -247,9 +295,62 @@ def thirds(edges, h):
 
 
 # ---- the model ---------------------------------------------------------------------------------
+class Rotated:
+    """The board seen in a frame turned by `deg` (counter-clockwise in board coordinates) about (cx, cy)
+    mm: tracks, pads (centres and outlines), vias and zone fills turned; everything else the board's own.
+    A route at 45 degrees becomes a route along an axis, so a box side can cut it square and its port
+    lead continues it straight (an axis-aligned box cuts a diagonal pair at an angle, with a bend at each
+    lead and the legs' spacing wrong along the edge). Planes and other copper at 45 degrees in the turned
+    frame follow the rectilinear mesh as staircases at its resolution."""
+
+    def __init__(self, b, deg, cx, cy):
+        self._b = b
+        c, s_ = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+
+        def R(x, y):
+            x, y = np.asarray(x, float) - cx, np.asarray(y, float) - cy
+            return cx + c * x - s_ * y, cy + s_ * x + c * y
+
+        def ring(r):
+            if not r:
+                return r
+            X, Y = R([q[0] for q in r], [q[1] for q in r])
+            return [(float(a), float(b_)) for a, b_ in zip(X, Y)]
+        T = dict(b.tracks)
+        T["x1"], T["y1"] = R(b.tracks["x1"], b.tracks["y1"])
+        T["x2"], T["y2"] = R(b.tracks["x2"], b.tracks["y2"])
+        self.tracks = T
+        pads = []
+        for p in b.snap["pads"]:
+            x, y = R(p["x"], p["y"])
+            q = dict(p, x=float(x), y=float(y))
+            if p.get("poly"):
+                q["poly"] = [[ring(r) for r in poly] for poly in p["poly"]]
+            if abs(s_) > 0.99:                        # a quarter turn: the pad's sides swap
+                q["sx"], q["sy"] = p["sy"], p["sx"]
+            pads.append(q)
+        vias = []
+        for v in b.snap["vias"]:
+            x, y = R(v["x"], v["y"])
+            vias.append(dict(v, x=float(x), y=float(y)))
+        zones = [dict(z, polys=[[ring(r) for r in poly] for poly in z.get("polys") or []]) for z in b.snap["zones"]]
+        self.snap = dict(b.snap, pads=pads, vias=vias, zones=zones)
+        self.pads_by_ref = {}
+        for p in pads:
+            self.pads_by_ref.setdefault(p["ref"], []).append(p)
+        self.deg, self.about = deg, (cx, cy)
+
+    def __getattr__(self, k):
+        return getattr(self._b, k)
+
+
 class Region:
     def __init__(self, ctx, spec, res_scale=1.0):
         self.ctx, self.spec, self.b = ctx, spec, ctx.b
+        if spec.get("rotate_deg"):
+            # the box is given in the turned frame (see Rotated), about rotate_about or the box's centre
+            cx, cy = spec.get("rotate_about") or ((spec["box"][0] + spec["box"][2]) / 2, (spec["box"][1] + spec["box"][3]) / 2)
+            self.b = Rotated(ctx.b, float(spec["rotate_deg"]), cx, cy)
         self.res_scale = res_scale
         self.um = 1000.0
         bx = [v * self.um for v in spec["box"]]
@@ -300,9 +401,97 @@ class Region:
         thick = {c["name"]: c["t"] * self.um for c in st.copper}
         return Z, diel, mask, thick
 
+    def _inclusion(self, Z, diel):
+        """(test, distance in um): the test says whether a piece of other nets' copper comes within the
+        inclusion distance of the region's own copper (its nets' tracks, pads and vias in the box, and the
+        series parts between them). Copper farther out is left out of the model: its coupling to the
+        region's lines falls as 1 / (1 + (d/h)^2) (under 1 % beyond 10 field heights h), and the absorbing
+        sides already stand for the board beyond the box with a matched continuation, so a far stub or via
+        adds nothing but an end near the absorber. Planes (zone fills) always go in. The distance is
+        `include_mm` (the spec's, else OPENPCBSI_EM_INCLUDE_MM, else INCLUDE_MM), at least 2 KEEP_H field
+        heights; `include_mm = 0` keeps all copper (the model as before the inclusion distance)."""
+        b, um = self.b, self.um
+        x0, y0, x1, y1 = self.box
+        inc = self.spec.get("include_mm", os.environ.get("OPENPCBSI_EM_INCLUDE_MM", INCLUDE_MM))
+        if not float(inc):
+            return None, None
+        from .parse import use
+        use()                                          # shapely, from the pinned parsers' site
+        from shapely.geometry import LineString, Point
+        from shapely.ops import unary_union
+        from shapely.prepared import prep
+        sig = [Z[l] for l in self.signal_layers if l in Z]
+        fh = max([min([d["z1"] - d["z0"] for d in diel if min(abs(d["z0"] - z), abs(d["z1"] - z)) < 1.0] or [0.0]) for z in sig] or [0.0])
+        D = max(float(inc) * um, 2 * KEEP_H * fh)
+        nets = set(self.nets)
+        geo = []
+        T_ = b.tracks
+        for n in nets:
+            if n not in b.net_id:
+                continue
+            for k in b.tracks_of(n):
+                cl = _clip_seg(T_["x1"][k] * um, T_["y1"][k] * um, T_["x2"][k] * um, T_["y2"][k] * um, self.box)
+                if cl is not None:
+                    geo.append(LineString([cl[:2], cl[2:]]).buffer(float(T_["w"][k]) * um / 2, 8))
+        for p in b.snap["pads"]:
+            if p["net"] in nets and x0 < p["x"] * um < x1 and y0 < p["y"] * um < y1:
+                geo.append(Point(p["x"] * um, p["y"] * um).buffer(max(p["sx"], p["sy"]) * um / 2, 8))
+        for v in b.snap["vias"]:
+            if v["net"] in nets and x0 < v["x"] * um < x1 and y0 < v["y"] * um < y1:
+                geo.append(Point(v["x"] * um, v["y"] * um).buffer(v["d"] * um / 2, 8))
+        for f in b.snap["footprints"]:                 # series parts between region nets: their pads
+            ps = [p for p in b.pads_by_ref.get(f["ref"], []) if p["net"]]
+            if len(ps) == 2 and {ps[0]["net"], ps[1]["net"]} <= nets:
+                for p in ps:
+                    geo.append(Point(p["x"] * um, p["y"] * um).buffer(max(p["sx"], p["sy"]) * um / 2, 8))
+        if not geo:
+            return None, None
+        zone = prep(unary_union(geo).buffer(D, 8))
+
+        def test(kind, *a):
+            if kind == "seg":
+                (xa, ya, xb, yb), w = a
+                return zone.intersects(LineString([(xa, ya), (xb, yb)]).buffer(w / 2, 4))
+            if kind == "poly":
+                return zone.intersects(Polygon(a[0]).buffer(0))
+            x, y, r = a
+            return zone.intersects(Point(x, y).buffer(r, 8))
+        from shapely.geometry import Polygon
+        return test, round(D, 1)
+
+    def _series_nets(self):
+        """The region's nets with the nets beyond its series parts in the box (an AC-coupling capacitor,
+        a series resistor or inductor) and their pair partners: a lane runs through its series parts to
+        a port or a termination, never into a capacitor's pad as if that were its end."""
+        b, um = self.b, self.um
+        x0, y0, x1, y1 = self.box
+        ref = set(self.ctx.cfg.reference_nets or []) | {z["net"] for z in b.snap["zones"] if z.get("net") and z.get("polys")}
+        nets, added = list(self.nets), []
+        for _ in range(4):
+            grew = False
+            for f in b.snap["footprints"]:
+                ps = [p for p in b.pads_by_ref.get(f["ref"], []) if p["net"]]
+                if len(ps) != 2 or f.get("dnp") or not re.match(r"(C|R|L|FB)\d", f["ref"]):
+                    continue
+                if not all(x0 < p["x"] * um < x1 and y0 < p["y"] * um < y1 for p in ps):
+                    continue
+                a, c = ps[0]["net"], ps[1]["net"]
+                for u, v in ((a, c), (c, a)):
+                    if u in nets and v not in nets and v not in ref:
+                        for n in (v, self.ctx.partner.get(v)):
+                            if n and n not in nets and n in b.net_id:
+                                nets.append(n)
+                                added.append(n)
+                                grew = True
+            if not grew:
+                break
+        self.nets, self.added_nets = nets, added
+
     def build(self):
         b, ctx = self.b, self.ctx
         um = self.um
+        if not hasattr(self, "added_nets"):
+            self._series_nets()
         x0, y0, x1, y1 = self.box
         # signal layers of the region's nets (for the inner sheet faces)
         self.signal_layers = sorted({b.layers[int(b.tracks["layer"][k])] for n in self.nets if n in b.net_id
@@ -343,8 +532,10 @@ class Region:
                         run = math.hypot(inner[0][0] - px, inner[0][1] - py) - max(2 * w_, 300.0)
                     else:
                         run = (x1 - x0) if ax == "x" else (y1 - y0)
+                    sl = math.hypot(xb - xa, yb - ya)
+                    ang = math.degrees(math.acos(min(1.0, abs((xb - xa) if ax == "x" else (yb - ya)) / sl))) if sl > 0 else 90.0
                     ports.append({"net": net, "side": side, "x": px, "y": py, "layer": L[int(T_["layer"][k])],
-                                  "w": w_, "run_um": round(max(run, 0.0), 1)})
+                                  "w": w_, "run_um": round(max(run, 0.0), 1), "angle_deg": round(ang, 1)})
         # one port per (net, side): the crossing nearest the middle of the side
         uniq = {}
         for p in ports:
@@ -355,6 +546,25 @@ class Region:
                 uniq[k2] = (d, p)
         ports = [v[1] for v in uniq.values()]
         sides = sorted({p["side"] for p in ports})
+        # ports the model cannot measure correctly: refused in the pre-flight, (side, message)
+        self.port_problems = []
+        part = self.ctx.partner
+        by_net = {}
+        for p in ports:
+            by_net.setdefault(p["net"], set()).add(p["side"])
+        for n, sd in sorted(by_net.items()):
+            q = part.get(n)
+            if q in by_net and n < q and sd != by_net[q]:
+                odd = sorted(sd ^ by_net[q])
+                self.port_problems.append((odd[0], f"pair {n}/{q} leaves the box on different sides ({n}: {', '.join(sorted(sd))}; "
+                                                   f"{q}: {', '.join(sorted(by_net[q]))}): a box corner cuts the pair, so its legs "
+                                                   "would get single-ended ports"))
+        for p in ports:
+            if p["angle_deg"] > MAX_PORT_ANGLE:
+                self.port_problems.append((p["side"], f"port {p['net']} ({p['side']}): the track crosses the box edge at "
+                                                      f"{p['angle_deg']:.0f} degrees to its normal; the straight port lead meets it "
+                                                      "with a bend at the edge (a pair's legs also get the wrong spacing): the side "
+                                                      "must cut the route where it runs square to it"))
         # domain: the box, extended by the lead on every side that carries a port
         dom = [x0 - (self.lead if "xmin" in sides else 0), y0 - (self.lead if "ymin" in sides else 0),
                x1 + (self.lead if "xmax" in sides else 0), y1 + (self.lead if "ymax" in sides else 0)]
@@ -379,8 +589,14 @@ class Region:
                 p["ref"] = None
             else:
                 p["ref"] = best[1]
-        # ---- metal ------------------------------------------------------------------------------
+        # ---- which copper goes in -------------------------------------------------------------------
         box = (x0, y0, x1, y1)
+        keep_in, inc_um = self._inclusion(Z, diel)
+        # the region's own copper on inner layers with its real thickness (a zero-thickness sheet reads a
+        # stripline's impedance ~9 % high against 2D); other nets' inner copper stays a sheet
+        thick_inner = bool(self.spec.get("thick_inner", True)) and not self.spec.get("lossy")
+        left_out = {"tracks": 0, "pads": 0, "vias": 0}
+        # ---- metal ------------------------------------------------------------------------------
         sheets = []           # {"layer", "z", "pts", "metal", "prio", "thick"}
         sig_edges_x, sig_edges_y, fine_boxes = [], [], []
         w_min, gap_min = 1e9, 1e9
@@ -390,6 +606,11 @@ class Region:
             if max(xa, xb) + w < x0 or min(xa, xb) - w > x1 or max(ya, yb) + w < y0 or min(ya, yb) - w > y1:
                 continue
             ln = L[int(T_["layer"][k])]
+            own = b.net_names[int(T_["net"][k])] in self.nets
+            if keep_in is not None and b.net_names[int(T_["net"][k])] not in self.nets and \
+                    not keep_in("seg", (xa, ya, xb, yb), w):
+                left_out["tracks"] += 1
+                continue
             # tracks along an axis: an exact rectangle (clean mesh edges); others: a capsule
             if abs(ya - yb) < 1e-6 or abs(xa - xb) < 1e-6:
                 xa2, xb2, ya2, yb2 = min(xa, xb), max(xa, xb), min(ya, yb), max(ya, yb)
@@ -404,9 +625,10 @@ class Region:
                 # the uncut centreline goes with the sheet: the pre-flight judges how the track meets the
                 # absorbing boundary (crosses it, ends near it, runs along it), which the clipped outline hides
                 sheets.append({"layer": ln, "z": Z[ln], "pts": cr, "metal": True, "prio": 50, "thick": thick[ln], "kind": "track",
-                               "net": b.net_names[int(T_["net"][k])], "seg": [round(v, 3) for v in (xa, ya, xb, yb)], "w": w})
+                               "net": b.net_names[int(T_["net"][k])], "seg": [round(v, 3) for v in (xa, ya, xb, yb)], "w": w,
+                               "thick_inner": own and ln not in (top_cu, bot_cu) and thick_inner})
                 tm = mask_t.get(ln, 0.0)
-                if tm:
+                if tm and own:
                     if abs(ya - yb) < 1e-6 or abs(xa - xb) < 1e-6:
                         gx = [p_[0] for p_ in ring]
                         gy = [p_[1] for p_ in ring]
@@ -421,6 +643,9 @@ class Region:
                         elif abs(xa - xb) < 1e-6:
                             mask_edges_x += [min(p_[0] for p_ in gr), max(p_[0] for p_ in gr)]
                 xs, ys = [p[0] for p in cr], [p[1] for p in cr]
+                if not own:                    # other nets' copper: resolved coarser (it couples to the
+                    fine_boxes.append((min(xs), min(ys), max(xs), max(ys), w, COARSE)) # region's lines only weakly)
+                    continue
                 fine_boxes.append((min(xs), min(ys), max(xs), max(ys), w))
                 w_min = min(w_min, w)
                 if abs(ya - yb) < 1e-6:
@@ -428,6 +653,11 @@ class Region:
                 elif abs(xa - xb) < 1e-6:
                     sig_edges_x += [(min(xs), +1), (max(xs), -1)]
         for p in b.snap["pads"]:
+            if keep_in is not None and p["net"] not in self.nets and p.get("poly") and \
+                    not any(keep_in("poly", [(x * um, y * um) for x, y in poly[0]]) for poly in p["poly"] if len(poly[0]) >= 3):
+                if x0 < p["x"] * um < x1 and y0 < p["y"] * um < y1:
+                    left_out["pads"] += 1
+                continue
             for ln in p["layers"]:
                 for poly in p.get("poly") or []:
                     ring = [(x * um, y * um) for x, y in poly[0]]
@@ -439,6 +669,9 @@ class Region:
                             if gr:
                                 sheets[-1]["mask_pts"] = gr
                         xs, ys = [q[0] for q in cr], [q[1] for q in cr]
+                        if p["net"] not in self.nets:
+                            fine_boxes.append((min(xs), min(ys), max(xs), max(ys), min(max(xs) - min(xs), max(ys) - min(ys)), COARSE))
+                            continue
                         fine_boxes.append((min(xs), min(ys), max(xs), max(ys), min(max(xs) - min(xs), max(ys) - min(ys))))
                         sig_edges_x += [(min(xs), +1), (max(xs), -1)]
                         sig_edges_y += [(min(ys), +1), (max(ys), -1)]
@@ -502,6 +735,9 @@ class Region:
             x, y = v["x"] * um, v["y"] * um
             if not (x0 < x < x1 and y0 < y < y1):
                 continue
+            if keep_in is not None and v["net"] not in self.nets and not keep_in("pt", x, y, v["d"] * um / 2):
+                left_out["vias"] += 1
+                continue
             zs_ = [Z[l] for l in v["span"] if l in Z]
             vias.append({"x": x, "y": y, "r": v["drill"] * um / 2, "pad_r": v["d"] * um / 2, "z0": min(zs_), "z1": max(zs_),
                          "pads": [Z[l] for l in v["flashed"] if l in Z], "net": v["net"]})
@@ -524,6 +760,8 @@ class Region:
             unit = re.search(r"[0-9.]\s*[pnuµm]?\s*([FHR])", f.get("value", ""), re.I)
             if pre not in ("C", "L", "FB", "R"):  # an unusual prefix: the value's unit decides
                 pre = {"F": "C", "H": "L", "R": "R"}.get(unit.group(1).upper(), pre) if unit else pre
+            if pre not in ("C", "L", "FB", "R"):  # a connector or IC with two pads on region nets: no series part
+                continue
             if val is None:
                 self.problems.append(f"{f['ref']} value '{f.get('value')}' not understood: modelled as 0 ohm")
             ax = "x" if abs(xb - xa) >= abs(yb - ya) else "y"
@@ -578,6 +816,47 @@ class Region:
                 el.update(R=max(val or 0.0, 1e-3))      # a plain lumped resistor (no series L: see above)
             lumped.append(el)
             fine_boxes.append((min(start[0], stop[0]), min(start[1], stop[1]), max(start[0], stop[0]), max(start[1], stop[1]), 50.0))
+        # ---- terminations ----------------------------------------------------------------------------
+        # A region net that ends on a part's pad inside the box (a connector pin, a BGA ball, a receiver)
+        # would be an open end in a board-only model: |S11| = 1 by construction. Its pad gets a lumped port
+        # of `term_ohm` (default TERM_OHM) to the nearest reference plane under it: the receiver's or the
+        # mated cable's load, and a measured second port. Two legs of a pair: 100 ohm differential and
+        # 25 ohm common mode, which is how a GTH, LVDS or PCIe receiver terminates on die.
+        terms = []
+        r_t = float(self.spec.get("term_ohm", TERM_OHM))
+        series_refs = {e["ref"] for e in lumped}
+        if self.spec.get("terminate", True):
+            for p in b.snap["pads"]:
+                if p["net"] not in region_nets or p.get("ref") in series_refs or not p["layers"]:
+                    continue
+                px, py = p["x"] * um, p["y"] * um
+                if not (x0 < px < x1 and y0 < py < y1):
+                    continue
+                lns = [l for l in p["layers"] if l in Z]
+                on = [l for l in lns if any(b.layers[int(T_["layer"][k])] == l for k in b.tracks_of(p["net"])
+                                            if math.hypot(T_["x1"][k] * um - px, T_["y1"][k] * um - py) < max(p["sx"], p["sy"]) * um
+                                            or math.hypot(T_["x2"][k] * um - px, T_["y2"][k] * um - py) < max(p["sx"], p["sy"]) * um)]
+                ln = (on or lns or [None])[0]
+                if ln is None:
+                    continue
+                best = None
+                for lr, zs in fills.items():
+                    if lr == ln:
+                        continue
+                    for z in zs:
+                        for poly in z["polys"]:
+                            if pip(p["x"], p["y"], poly[0]) and not any(pip(p["x"], p["y"], h) for h in poly[1:]):
+                                d = abs(Z[lr] - Z[ln])
+                                if best is None or d < best[0]:
+                                    best = (d, lr)
+                if best is None:
+                    self.problems.append(f"{p.get('ref')} pad {p.get('num')} ({p['net']}): no reference plane under it for its termination")
+                    continue
+                h = min(p["sx"], p["sy"]) * um / 2
+                terms.append({"net": p["net"], "ref": p.get("ref"), "pad": p.get("num"), "x": px, "y": py, "layer": ln,
+                              "ref_layer": best[1], "R": r_t, "w": 2 * h,
+                              "start": [px - h, py - h, Z[best[1]]], "stop": [px + h, py + h, Z[ln]]})
+                fine_boxes.append((px - h, py - h, px + h, py + h, 2 * h))
         # ---- leads and ports ------------------------------------------------------------------------
         leads = []
         for p in ports:
@@ -597,8 +876,10 @@ class Region:
         # pairs and excitation
         part = self.ctx.partner
         order = []
-        for side in sides:
-            here = [p for p in ports if p["side"] == side]
+        for side, lyr in sorted({(p["side"], p["layer"]) for p in ports}):
+            # one group per side and layer: a route that leaves on the side it came in, on another layer
+            # after a via, has its two ports on one side
+            here = [p for p in ports if p["side"] == side and p["layer"] == lyr]
             done = set()
             for p in sorted(here, key=lambda q: q["net"]):
                 if p["net"] in done:
@@ -611,17 +892,37 @@ class Region:
                 else:
                     order.append({"kind": "se", "side": side, "ports": [p]})
                     done.add(p["net"])
-        exc_side = sides[0] if sides else None
+        # the excited group: a pair when the region has one (never one leg of a pair on its own), on the
+        # side whose lanes run longest into the box (the line reading and calibration need that run)
+        paired = [g for g in order if g["kind"] == "pair"]
+        cand = paired or [g for g in order if part.get(g["ports"][0]["net"]) not in by_net]
+        if self.spec.get("excite_side"):
+            cand = [g for g in cand if g["side"] == self.spec["excite_side"]] or cand
+        exc = max(cand, key=lambda g: (min(p["run_um"] for p in g["ports"]), g["side"] == (sides[0] if sides else None))) if cand else None
         k = 1
         for grp in order:
             for i, p in enumerate(grp["ports"]):
                 p["n"] = k
                 k += 1
-                if grp["side"] == exc_side and grp is next(g for g in order if g["side"] == exc_side):
+                if grp is exc:
                     common = self.spec.get("excite_mode") == "common"
                     p["excite"] = (1.0 if (i == 0 or common) else -1.0) if grp["kind"] == "pair" else 1.0
                 else:
                     p["excite"] = 0.0
+        # the terminations as groups of their own (side "pad"), numbered after the line ports
+        done = set()
+        for t in sorted(terms, key=lambda q: (q["ref"] or "", q["net"])):
+            if id(t) in done:
+                continue
+            q = min((r for r in terms if r is not t and id(r) not in done and r["net"] == part.get(t["net"])),
+                    key=lambda r: (r["ref"] != t["ref"], math.hypot(r["x"] - t["x"], r["y"] - t["y"])), default=None)
+            grp_t = [t, q] if q else [t]
+            grp_t.sort(key=lambda r: (not r["net"].endswith(("P", "+")), r["net"]))
+            for r in grp_t:
+                r["n"], r["excite"], r["side"] = k, 0.0, "pad"
+                k += 1
+                done.add(id(r))
+            order.append({"kind": "pair" if q else "se", "side": "pad", "ports": grp_t})
         # ---- mesh ---------------------------------------------------------------------------------
         er_max = max([d["er"] for d in diel] + [1.0])
         lam = C0 / self.fmax / math.sqrt(er_max) * 1e6
@@ -631,17 +932,19 @@ class Region:
         fine *= self.res_scale
         h_lead = min(50.0, hmax) * self.res_scale
         zx, zy = [], []
-        for (a, b_, c, d, w) in fine_boxes:
+        for fb in fine_boxes:
+            a, b_, c, d, w = fb[:5]
+            hf = min(fine * fb[5], hmax) if len(fb) > 5 else fine
             # fine across a straight track only; along it the cell follows the wavelength
             if (c - a) > 4 * (d - b_):
-                zy.append((b_ - 3 * fine, d + 3 * fine, fine))
+                zy.append((b_ - 3 * hf, d + 3 * hf, hf))
                 zx.append((a, c, min(h_lead * 2, hmax)))
             elif (d - b_) > 4 * (c - a):
-                zx.append((a - 3 * fine, c + 3 * fine, fine))
+                zx.append((a - 3 * hf, c + 3 * hf, hf))
                 zy.append((b_, d, min(h_lead * 2, hmax)))
             else:
-                zx.append((a - 3 * fine, c + 3 * fine, fine))
-                zy.append((b_ - 3 * fine, d + 3 * fine, fine))
+                zx.append((a - 3 * hf, c + 3 * hf, hf))
+                zy.append((b_ - 3 * hf, d + 3 * hf, hf))
         for p in leads:
             la = p["lead"]
             if p["side"][0] == "x":
@@ -656,19 +959,23 @@ class Region:
                 fy += [v["y"] - r, v["y"] + r]
             fx.append(v["x"])
             fy.append(v["y"])
-            zx.append((v["x"] - v["pad_r"] - 3 * fine, v["x"] + v["pad_r"] + 3 * fine, fine * 1.5))
-            zy.append((v["y"] - v["pad_r"] - 3 * fine, v["y"] + v["pad_r"] + 3 * fine, fine * 1.5))
+            hv = fine * 1.5 if v.get("net") in self.nets else min(fine * COARSE, hmax)
+            zx.append((v["x"] - v["pad_r"] - 3 * fine, v["x"] + v["pad_r"] + 3 * fine, hv))
+            zy.append((v["y"] - v["pad_r"] - 3 * fine, v["y"] + v["pad_r"] + 3 * fine, hv))
         for el in lumped:
             bx_ = el.get("body") or el
             fx += [bx_["start"][0], bx_["stop"][0]]
             fy += [bx_["start"][1], bx_["stop"][1]]
+        for t in terms:
+            fx += [t["start"][0], t["stop"][0]]
+            fy += [t["start"][1], t["stop"][1]]
         for p in leads:
             la = p["lead"]
             if p["side"][0] == "x":
                 fy += thirds([(la[1], +1), (la[3], -1)], fine)
             else:
                 fx += thirds([(la[0], +1), (la[2], -1)], fine)
-        pair = next((g for g in order if g["kind"] == "pair"), None)
+        pair = exc if (exc and exc["kind"] == "pair") else next((g for g in order if g["kind"] == "pair" and g["side"] != "pad"), None)
         if pair and pair["side"][0] == "x":           # pair along x: mirror the y mesh about its centre
             c = (pair["ports"][0]["y"] + pair["ports"][1]["y"]) / 2
             X = mesh_axis(dom[0], dom[2], fx, zx, hmax)
@@ -704,7 +1011,13 @@ class Region:
         for el in lumped:
             if el.get("body"):
                 zfix += [el["body"]["z0"], el["body"]["z1"]]
-        Zl = mesh_axis(zb - AIR_UM, zt + AIR_UM, zfix, zones_z, hmax * 0.8, ratio=1.4, min_space=10.0)
+        z_ms = 10.0
+        for ln in {s_["layer"] for s_ in sheets if s_.get("thick_inner")}:
+            t = thick.get(ln, 0.0)
+            if t > 0:                         # both faces of the inner copper, about its sheet's z
+                zfix += [Z[ln] - t / 2, Z[ln] + t / 2]
+                z_ms = min(z_ms, 0.45 * t)
+        Zl = mesh_axis(zb - AIR_UM, zt + AIR_UM, zfix, zones_z, hmax * 0.8, ratio=1.4, min_space=z_ms)
         # field height: the largest spacing from a layer with signal copper in the box to its nearest
         # neighbouring copper (the dielectric that holds its field); the pre-flight's clearance floor
         field_h = 0.0
@@ -713,12 +1026,14 @@ class Region:
             if adj:
                 field_h = max(field_h, min(adj))
         self.model = {"domain": dom, "box": list(box), "z_sheets": Z, "dielectrics": diel, "mask": mask,
-                      "sheets": sheets, "vias": vias, "lumped": lumped, "ports": leads, "groups": order,
+                      "sheets": sheets, "vias": vias, "lumped": lumped, "ports": leads, "terms": terms, "groups": order,
                       "mesh": {"x": X, "y": Y, "z": Zl}, "fmax": self.fmax, "lossy": bool(self.spec.get("lossy", False)),
                       "end_criteria": float(self.spec.get("end_criteria", 1e-4)),
                       "max_timesteps": int(self.spec.get("max_timesteps", 400000)),
                       "pml_cells": PML_CELLS, "fine_um": fine, "w_min_um": w_min, "gap_min_um": gap_min,
-                      "field_h_um": round(field_h, 2),
+                      "field_h_um": round(field_h, 2), "include_um": inc_um, "left_out": left_out,
+                      "port_problems": self.port_problems, "nets": list(self.nets), "added_nets": self.added_nets,
+                      "rotate_deg": float(self.spec.get("rotate_deg") or 0.0),
                       "excite_mode": self.spec.get("excite_mode", "odd"),
                       "problems": self.problems}
         return self.model
@@ -824,10 +1139,21 @@ class Region:
             for side, d in (("xmin", v["x"] - dom[0]), ("xmax", dom[2] - v["x"]), ("ymin", v["y"] - dom[1]), ("ymax", dom[3] - v["y"])):
                 if d - v["pad_r"] < keep[side]:
                     why.append((side, f"via at ({v['x'] / 1000:.2f}, {v['y'] / 1000:.2f}) mm within {keep[side]:.0f} um of the {side} boundary"))
+        why += [(side, w) for side, w in m.get("port_problems", [])]
+        # every lane must run through the box to a port on another side or to a termination: a lane that
+        # does not is an open end (|S11| = 1 whatever the layout) or a break the solver would take as one
+        if m["ports"]:
+            conn, by = self.path_connected()
+            if not conn:
+                cut = [k for k, v in by.items() if not v]
+                why.append((None, f"not connected through the box: {', '.join(cut)} reach{'es' if len(cut) == 1 else ''} no port on "
+                                  "another side and no termination (an open end, or a break the model would solve as one)"))
+        if not any(p.get("excite") for p in m["ports"]):
+            why.append((None, "no port is driven"))
         for g in m["groups"]:
             if g["kind"] == "pair" and self.spec.get("excite_mode") != "common":
                 e = [p["excite"] for p in g["ports"]]
-                if e[0] != -e[1]:
+                if e[0] != -e[1] or (g["side"] == "pad" and any(e)):
                     why.append((None, f"pair {g['ports'][0]['net']}/{g['ports'][1]['net']} not driven with opposite polarity"))
         uniq, sides = [], {}
         for side, w in why:
@@ -866,38 +1192,65 @@ class Region:
                 l = b.layers[int(T_["layer"][k])]
                 na, nb = ("t", k, 0), ("t", k, 1)
                 union(na, nb)
-                pts += [(seg[0], seg[1], l, na, float(T_["w"][k]) * um), (seg[2], seg[3], l, nb, float(T_["w"][k]) * um)]
-        def near(x, y, l, r):
-            return [nd for (px, py, pl, nd, w) in pts if (l is None or pl == l) and math.hypot(px - x, py - y) <= r + w / 2 + 5]
+                pts += [(seg[0], seg[1], l, na, float(T_["w"][k]) * um, net), (seg[2], seg[3], l, nb, float(T_["w"][k]) * um, net)]
+
+        def near(x, y, l, r, net=None):
+            return [nd for (px, py, pl, nd, w, n_) in pts if (l is None or pl == l) and (net is None or n_ == net)
+                    and math.hypot(px - x, py - y) <= r + w / 2 + 5]
+        # tracks that meet: an end of one on the copper of another (same net and layer), end to end or a T
+        segs = []
+        for net in nets:
+            if net not in b.net_id:
+                continue
+            for k in b.tracks_of(net):
+                seg = _clip_seg(T_["x1"][k] * um, T_["y1"][k] * um, T_["x2"][k] * um, T_["y2"][k] * um, box)
+                if seg is not None:
+                    segs.append((k, net, b.layers[int(T_["layer"][k])], seg, float(T_["w"][k]) * um))
+        for i, (ka, na_, la, sa, wa) in enumerate(segs):
+            for kb, nb_, lb, sb, wb in segs[i + 1:]:
+                if la != lb or na_ != nb_:
+                    continue
+                d = min(_pt_seg(sa[0], sa[1], *sb), _pt_seg(sa[2], sa[3], *sb), _pt_seg(sb[0], sb[1], *sa), _pt_seg(sb[2], sb[3], *sa))
+                if d <= max(wa, wb) / 2 + 1.0:
+                    union(("t", ka, 0), ("t", kb, 0))
         for v in self.model["vias"]:
-            ns = near(v["x"], v["y"], None, v["pad_r"])
+            ns = near(v["x"], v["y"], None, v["pad_r"], v.get("net"))
             for nd in ns[1:]:
                 union(ns[0], nd)
         for f in b.snap["footprints"]:
             pads = [p for p in b.pads_by_ref.get(f["ref"], []) if p["net"] in nets]
             for p in pads:                        # tracks ending on a pad join through the pad
-                ns = near(p["x"] * um, p["y"] * um, None, max(p["sx"], p["sy"]) * um / 2)
+                ns = near(p["x"] * um, p["y"] * um, None, max(p["sx"], p["sy"]) * um / 2, p["net"])
                 for nd in ns[1:]:
                     union(ns[0], nd)
         for e in self.model["lumped"]:            # series parts join their two pads' copper
             pads = [p for p in b.pads_by_ref.get(e["ref"], []) if p["net"]]
-            groups = [near(p["x"] * um, p["y"] * um, None, max(p["sx"], p["sy"]) * um / 2) for p in pads]
+            groups = [near(p["x"] * um, p["y"] * um, None, max(p["sx"], p["sy"]) * um / 2, p["net"]) for p in pads]
             if len(groups) == 2 and groups[0] and groups[1]:
                 union(groups[0][0], groups[1][0])
         node_of = {}
-        for p in self.model["ports"]:
-            ns = near(p["x"], p["y"], p["layer"], p["w"])
+        for p in self.model["ports"] + self.model.get("terms", []):
+            ns = near(p["x"], p["y"], p["layer"], p["w"], p["net"])
             node_of[p["n"]] = find(ns[0]) if ns else None
         res = {}
         groups = self.model["groups"]
         for g in groups:
             for i, p in enumerate(g["ports"]):
-                others = [q for g2 in groups if g2 is not g and g2["kind"] == g["kind"] and g2["side"] != g["side"]
+                others = [q for g2 in groups if g2 is not g and g2["kind"] == g["kind"]
+                          and (g2["side"], g2["ports"][0]["layer"]) != (g["side"], g["ports"][0]["layer"])
                           for j, q in enumerate(g2["ports"]) if j == i]
-                key = f"{p['net']}@{p['side']}"
+                key = f"{p['net']}@{p['side']}" + (f"/{p['layer']}" if sum(q["net"] == p["net"] and q["side"] == p["side"]
+                                                                             for g2 in groups for q in g2["ports"]) > 1 else "")
                 res[key] = bool(others) and node_of.get(p["n"]) is not None and \
                     any(node_of.get(q["n"]) == node_of[p["n"]] for q in others)
         return (all(res.values()) if res else False), res
+
+
+def _pt_seg(px, py, x1, y1, x2, y2):
+    dx, dy = x2 - x1, y2 - y1
+    L2 = dx * dx + dy * dy
+    t = 0.0 if L2 <= 0 else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
+    return math.hypot(px - x1 - t * dx, py - y1 - t * dy)
 
 
 def _clip_seg(x1, y1, x2, y2, box):
@@ -1039,6 +1392,62 @@ def _track_band_problems(m, keep, cell):
     return out
 
 
+# ---- what a run will cost ---------------------------------------------------------------------------
+SPEED_MCS = 350.0        # Mcells/s assumed for a machine that has finished no grid yet (measured runs: 300-900)
+SETTLE = 2.0             # simulated time to the -40 dB end criterion, in excitation lengths (J1 launch: 1.6)
+STEP_CAP = 4.0         # a run's step limit: this many times the steps its excitation needs (run_estimate)
+TAIL_DB = -50.0        # a run cut on the step limit counts when every port is this far below the largest peak
+MAX_HOURS = 6.0          # a region (all its grids) predicted to take longer is refused before it starts
+
+
+def run_estimate(model, speed_mcs=None):
+    """The FDTD time step (Courant, from the smallest cell on each axis: openEMS's own step is at most
+    ~1.3 times longer), the simulated time a run needs (openEMS's Gaussian excitation, 2 * 9 / (2 pi fc),
+    then SETTLE excitation lengths to the end criterion), the time steps that takes, whether the step
+    limit cuts the run short, and the hours at `speed_mcs` Mcells/s: typical (`hours`, a structure that
+    settles) and at most (`hours_max`, a run that goes to its step limit, which is enforced)."""
+    d = [float(np.min(np.diff(np.array(model["mesh"][a])))) * 1e-6 for a in "xyz"]
+    dt = 1.0 / (C0 * math.sqrt(sum(1.0 / v ** 2 for v in d)))
+    fc = model["fmax"] / 2
+    exc = 2 * 9.0 / (2 * math.pi * fc)
+    need = SETTLE * exc
+    steps = need / dt
+    cap = int(model.get("max_timesteps", 400000))
+    cells = len(model["mesh"]["x"]) * len(model["mesh"]["y"]) * len(model["mesh"]["z"])
+    sp = float(speed_mcs or SPEED_MCS)
+    return {"dt_fs": round(dt * 1e15, 3), "min_cell_um": [round(v * 1e6, 3) for v in d], "sim_ps": round(need * 1e12, 1),
+            "steps": int(steps), "step_limit": cap, "hits_step_limit": steps > cap, "cells": cells,
+            "speed_mcs": round(sp, 1), "speed_measured": speed_mcs is not None,
+            "hours": round(cells * min(steps, cap) / (sp * 1e6) / 3600, 2),
+            "hours_max": round(cells * cap / (sp * 1e6) / 3600, 2)}
+
+
+def measured_speed(cache_dir):
+    """This machine's openEMS speed (Mcells/s): the slowest of the last grids it finished (a bound must hold
+    when several solves share the machine; small models run up to twice as fast), or None."""
+    try:
+        v = json.load(open(os.path.join(cache_dir, "em_speed.json"))).get("mcs", [])
+        return float(np.min(v)) if v else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _record_speed(cache_dir, logtxt):
+    m = re.findall(r"Speed:\s*([0-9.]+)\s*MCells/s", logtxt)
+    if not m or not cache_dir:
+        return
+    p = os.path.join(cache_dir, "em_speed.json")
+    try:
+        v = json.load(open(p)).get("mcs", [])
+    except (OSError, ValueError):
+        v = []
+    v = (v + [float(m[-1])])[-10:]
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp = p + f".{os.getpid()}.tmp"
+    json.dump({"mcs": v}, open(tmp, "w"))
+    os.replace(tmp, p)
+
+
 # ---- running ---------------------------------------------------------------------------------------
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "em3d.py")
 
@@ -1063,12 +1472,13 @@ def _reuse_grid(gdir, key):
             return None
         if not ports.get("ports") or any(len(v.get("a_re", [])) != len(ports["freq_hz"]) for v in ports["ports"].values()):
             return None
-        return {"ports": ports, "ended_by": done["ended_by"], "seconds": done["seconds"], "cells": ports["cells"], "reused": True}
+        return {"ports": ports, "ended_by": done["ended_by"], "seconds": done["seconds"], "cells": ports["cells"], "reused": True,
+                "tail_db": done.get("tail_db", tail_db(ports))}
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
-def _run_grid(model, od, gi, threads, log):
+def _run_grid(model, od, gi, threads, log, cache_dir=None):
     from .si import inside
     gdir = inside(od, os.path.join(od, f"grid{gi}"))
     os.makedirs(gdir, exist_ok=True)
@@ -1091,6 +1501,8 @@ def _run_grid(model, od, gi, threads, log):
                            env=dict(os.environ, OMP_NUM_THREADS=str(th)))
     logtxt = p.stdout + "\n" + p.stderr
     open(os.path.join(gdir, "runner.log"), "w").write(logtxt)
+    if p.returncode == 0:
+        _record_speed(cache_dir, logtxt)
     if p.returncode != 0:
         raise RuntimeError(f"openEMS run failed (grid {gi}): {logtxt[-1500:]}")
     ports = json.load(open(os.path.join(gdir, "ports.json")))
@@ -1098,16 +1510,28 @@ def _run_grid(model, od, gi, threads, log):
     # the run stopped on the limit
     ended = "timesteps" if re.search(r"number of timesteps was reached", logtxt) else "end_criteria"
     secs = round(time.time() - t0, 1)
-    log(f"  grid {gi}: {ports['cells']} cells, {secs:.0f} s, ended by {ended}")
+    tdb = tail_db(ports)
+    log(f"  grid {gi}: {ports['cells']} cells, {secs:.0f} s, ended by {ended}" + (f" (port waves {tdb:.0f} dB below their peak)" if tdb is not None else ""))
     # written last, atomically: its presence means this grid finished (an interrupted run leaves none)
-    rec = {"key": key, "ended_by": ended, "seconds": secs, "cells": ports["cells"],
+    rec = {"key": key, "ended_by": ended, "seconds": secs, "cells": ports["cells"], "tail_db": tdb,
            "ports_sha256": hashlib.sha256(open(os.path.join(gdir, "ports.json"), "rb").read()).hexdigest(),
            "date": time.strftime("%Y-%m-%d %H:%M:%S")}
     tmp = os.path.join(gdir, f"done.json.{os.getpid()}.tmp")
     with open(tmp, "w") as fh:
         json.dump(rec, fh, indent=1)
     os.replace(tmp, os.path.join(gdir, "done.json"))
-    return {"ports": ports, "ended_by": ended, "seconds": secs, "cells": ports["cells"]}
+    return {"ports": ports, "ended_by": ended, "seconds": secs, "cells": ports["cells"], "tail_db": tdb}
+
+
+def tail_db(ports):
+    """The ports' voltage over the last tenth of the run against the largest port peak, in dB; None
+    for a grid solved before the runner recorded it."""
+    P = list(ports.get("ports", {}).values())
+    pk = max([v.get("u_peak") or 0.0 for v in P] or [0.0])
+    tl = [v.get("u_tail") for v in P if v.get("u_tail") is not None]
+    if not pk or not tl or any(t != t for t in tl):
+        return None
+    return round(20 * math.log10(max(max(tl), 1e-30) / pk), 1)
 
 
 def _post(model, run):
@@ -1176,6 +1600,17 @@ def _post(model, run):
     return out
 
 
+def excited_port(model):
+    """The excited group's first port (P of a pair, driven +1), whatever order the nets were listed in; its
+    run is the shorter of the group's (the line reading needs both legs uniform). None without one."""
+    g = next((g for g in model["groups"] if any(p.get("excite") for p in g["ports"])), None)
+    if g is None:
+        return None
+    p = dict(g["ports"][0])
+    p["run_um"] = min(q.get("run_um") or 0.0 for q in g["ports"])
+    return p
+
+
 def tdr_rise_ps(fmax):
     return max(35e-12, 0.7 / fmax) * 1e12
 
@@ -1189,7 +1624,7 @@ def _line_z(model, post):
     if not len(t):
         return None
     box = model["box"]
-    p = next(q for q in model["ports"] if q["excite"])
+    p = excited_port(model)
     L = p.get("run_um") or ((box[2] - box[0]) if p["side"][0] == "x" else (box[3] - box[1]))
     ee = model.get("eps_eff_2d") or 3.0
     tl = 2 * L * 1e-6 * math.sqrt(ee) / C0 * 1e12            # round trip along the run, ps
@@ -1229,17 +1664,56 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
         model["eps_eff_2d"] = res.get("eps_eff_2d")
     except Exception as e:
         res["two_d_error"] = str(e)
+    res["terminations"] = [{k: t[k] for k in ("ref", "pad", "net", "R", "ref_layer")} for t in model.get("terms", [])]
+    res["left_out"] = dict(model.get("left_out") or {}, include_um=model.get("include_um"))
+    # what the run will cost, every grid built first: refused before solving when a run would stop on the
+    # step limit or take longer than max_hours (a 1 nm cell made one model need weeks)
+    grids = []
+    for scale in spec.get("res_scales", [1.0, 0.7]):
+        m2 = Region(ctx, spec, scale).build()
+        m2["eps_eff_2d"] = model.get("eps_eff_2d")
+        # the step limit: STEP_CAP times the steps the excitation needs (the spec's max_timesteps at most).
+        # A structure that keeps ringing (a plane fragment between ground planes, which the real board's
+        # decoupling damps) stops there instead of running for hours; it is accepted when its port waves
+        # have died away (TAIL_DB), whatever is left in the planes
+        e0 = run_estimate(m2)
+        m2["max_timesteps"] = int(min(m2["max_timesteps"], max(20000, STEP_CAP * e0["steps"])))
+        grids.append((scale, m2))
+    speed = measured_speed(cache_dir)
+    est = [dict(run_estimate(m2, speed), res_scale=sc) for sc, m2 in grids]
+    hours = round(sum(e["hours"] for e in est), 2)
+    hours_max = round(sum(e["hours_max"] for e in est), 2)
+    max_h = float(spec.get("max_hours", os.environ.get("OPENPCBSI_EM_MAX_HOURS", MAX_HOURS)))
+    res["estimate"] = {"grids": est, "hours": hours, "hours_max": hours_max, "max_hours": max_h}
+    for e in est:
+        if e["hits_step_limit"]:
+            pf["problems"].append(f"grid {e['res_scale']}: a run needs {e['steps']} time steps of {e['dt_fs']} fs (smallest cells "
+                                  f"{e['min_cell_um']} um) and would stop on the limit of {e['step_limit']} before the end criterion")
+    if hours_max > max_h:
+        pf["problems"].append(f"predicted up to {hours_max:.1f} h (typically {hours:.1f} h) for {len(est)} grids ({', '.join(str(e['cells']) for e in est)} cells at "
+                              f"{est[0]['speed_mcs']:.0f} Mcells/s{'' if speed else ', not yet measured on this machine'}), over "
+                              f"max_hours = {max_h:g}: make the box smaller or raise max_hours")
+    # calibration: whether the excited lane's uniform run can hold a TDR plateau, said before solving
+    need = plateau_um(model["fmax"], model.get("eps_eff_2d"))
+    pe = excited_port(model)
+    if pe:
+        res["calibration_plan"] = {"run_um": pe.get("run_um"), "needs_um": round(need), "possible": (pe.get("run_um") or 0) >= need}
+    pf["n_problems"] = len(pf["problems"])
+    pf["ok"] = not pf["problems"]
+    cp = res.get("calibration_plan") or {}
+    log(f"  {spec.get('name')}: predicted {hours:.1f} h, at most {hours_max:.1f} h ({', '.join(str(e['cells']) for e in est)} cells, step {est[0]['dt_fs']} fs, "
+        f"{est[0]['speed_mcs']:.0f} Mcells/s); {len(res['terminations'])} terminations; line calibration "
+        + ("possible" if cp.get("possible") else f"not possible in this box (uniform run {(cp.get('run_um') or 0) / 1000:.2f} mm, "
+           f"needs {(cp.get('needs_um') or 0) / 1000:.1f} mm): TDR against the 2D impedance of the same geometry"))
     if spec.get("preflight_only") or not pf["ok"]:
         res["ran"] = False
+        res["verdict"] = verdict(res)
         json.dump(res, open(os.path.join(od, "result.json"), "w"), indent=1)
         return res
     threads = int(spec.get("threads", os.environ.get("OPENPCBSI_EM_THREADS", 0)))   # 0: the job slot's share
     runs = []
-    for gi, scale in enumerate(spec.get("res_scales", [1.0, 0.7])):
-        r2 = Region(ctx, spec, scale)
-        m2 = r2.build()
-        m2["eps_eff_2d"] = model.get("eps_eff_2d")
-        rr = _run_grid(m2, od, gi, threads, log)
+    for gi, (scale, m2) in enumerate(grids):
+        rr = _run_grid(m2, od, gi, threads, log, cache_dir)
         rr["post"] = _post(m2, rr)
         rr["z_line_ohm"] = _line_z(m2, rr["post"])
         rr["res_scale"] = scale
@@ -1248,7 +1722,7 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
     res.update({k: v for k, v in fine["post"].items()})
     res["runs_per_grid"] = 1
     res["z_line_ohm"] = fine["z_line_ohm"]
-    pe = next((q for q in model["ports"] if q["excite"]), None)
+    pe = excited_port(model)
     if pe:                                     # the box length along the excited port's axis
         bx = model["box"]
         res["line_length_mm"] = round(((bx[2] - bx[0]) if pe["side"][0] == "x" else (bx[3] - bx[1])) / 1000.0, 3)
@@ -1270,10 +1744,21 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
         za_p, zb_p = runs[0]["post"].get("z_port_ohm"), runs[-1]["post"].get("z_port_ohm")
         if za_p and zb_p:
             conv["tdr_shape_diff_pct"] = round(float(np.max(np.abs(ta[:n] / za_p - tb[:n] / zb_p))) * 100, 2)
-    if any(r["ended_by"] != "end_criteria" for r in runs):
-        conv["converged"], conv["reason"] = False, "a run hit the time-step limit before the energy criterion"
+    cut = [r for r in runs if r["ended_by"] != "end_criteria"]
+    loud = [r for r in cut if r.get("tail_db") is None or r["tail_db"] > TAIL_DB]
+    for r, rr in zip(conv["runs"], runs):
+        rr_t = rr.get("tail_db")
+        if rr_t is not None:
+            r["tail_db"] = rr_t
+    if loud:
+        conv["converged"], conv["reason"] = False, ("a run hit the time-step limit with its port waves still "
+                                                    f"{max((r.get('tail_db') or 0) for r in loud):.0f} dB from their peak (limit {TAIL_DB:g} dB)")
     elif conv.get("z_line_diff_pct", 0) > Z_GRID_TOL_PCT or conv.get("tdr_shape_diff_pct", 0) > SHAPE_TOL_PCT:
         conv["converged"], conv["reason"] = False, "the two grids disagree on line impedance or TDR shape"
+    elif cut:
+        conv["converged"], conv["reason"] = True, (f"both grids agree; {len(cut)} run(s) stopped on the step limit with the port waves "
+                                                   f"{max(r['tail_db'] for r in cut):.0f} dB below their peak (energy left ringing in the "
+                                                   "model's planes, which the board's decoupling would damp)")
     else:
         conv["converged"], conv["reason"] = True, "both runs settled; line impedance and TDR shape agree"
     res["convergence"] = conv
@@ -1284,28 +1769,101 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
                               "renormalised": abs(ag) > 2.0,
                               "note": "TDR reported relative to the model's own line" if abs(ag) > 2.0 else "within 2 % of 2D"}
     elif res.get("z_2d_ohm"):
-        pe = next((q for q in model["ports"] if q["excite"]), {})
+        pe = excited_port(model) or {}
         res["calibration"] = {"z_model_ohm": None, "z_2d_ohm": res["z_2d_ohm"], "agree_pct": None, "renormalised": False,
                               "note": f"not calibrated: the excited port's track runs {pe.get('run_um', 0) / 1000:.1f} mm "
                                       "uniform inside the box, too short for a TDR plateau at this rise time "
                                       "(move the box edge further from the first part or via)"}
+    res["tdr_excursion"] = tdr_excursion(model, res)
+    res["reflection_floor_db"] = reflection_floor(res)
     if res.get("passive") is False:
         res.setdefault("problems", []).append("result is not passive")
     res["ran"] = True
     res["seconds"] = round(time.time() - t0, 1)
+    res["verdict"] = verdict(res)
     json.dump(res, open(os.path.join(od, "result.json"), "w"), indent=1)
     return res
 
 
+def tdr_excursion(model, res):
+    """The TDR's lowest and highest point inside the box (from 0.6 rise times after the port to one rise
+    time past the box's round trip along the excited port's axis), in % of the reference line: the
+    model's own calibrated line, else the 2D impedance of the same geometry. (The port's own reading of
+    its zero-thickness lead is not a reference: it reads ~7 % above the line on the calibration case.)"""
+    t, z = np.array(res.get("tdr_t_ps") or []), np.array(res.get("tdr_z_ohm") or [])
+    ref, what = (res.get("z_line_ohm"), "the model's calibrated line") if res.get("z_line_ohm") else (res.get("z_2d_ohm"), "2D")
+    pe = excited_port(model)
+    if not len(t) or not ref or not pe:
+        return None
+    box = model["box"]
+    L = (box[2] - box[0]) if pe["side"][0] == "x" else (box[3] - box[1])
+    tl = 2 * L * 1e-6 * math.sqrt(model.get("eps_eff_2d") or 3.0) / C0 * 1e12
+    rise = tdr_rise_ps(model["fmax"])
+    # inside the box: past the near lead's step, short of the far one (both are the model's, not the board's)
+    lo, hi = 0.6 * rise, tl - 0.6 * rise
+    if any(g["side"] == "pad" for g in model["groups"]):
+        hi = tl + rise                  # a termination inside the box: its pad is part of what is judged
+    m = (t > lo) & (t < hi)
+    if hi <= lo or not m.any():
+        return None
+    return {"min_pct": round(float(z[m].min() / ref - 1) * 100, 2), "max_pct": round(float(z[m].max() / ref - 1) * 100, 2),
+            "ref_ohm": round(float(ref), 2), "ref": what, "window_ps": [round(lo, 1), round(hi, 1)]}
+
+
+def reflection_floor(res):
+    """The reflection a uniform line shows in this model, in dB: the port lead's own reading against the
+    S-parameters' reference (50 ohm a leg), plus the step from the zero-thickness lead to the board's
+    track at each box edge (|z_port - z_line| / (z_port + z_line), twice), added in phase. On the
+    validation lines this bounds the measured |S11| (-23.3 vs -23, -21.3 vs -17, -19.7 vs -18 dB): an
+    S11 or Sdd11 near or below it is the model's, not the layout's."""
+    zp, zt = res.get("z_port_ohm"), res.get("z_line_ohm") or res.get("z_2d_ohm")
+    zr = {"pair": 100.0, "pair, common mode": 25.0}.get(res.get("line_kind"), 50.0)
+    if not zp or not zt:
+        return None
+    g = abs(zp - zr) / (zp + zr) + 2 * abs(zp - zt) / (zp + zt)
+    return round(20 * math.log10(max(g, 1e-6)), 1)
+
+
+def plateau_um(fmax, eeff=None):
+    """The uniform run a line needs inside the box for its TDR plateau (see _line_z) at fmax's rise time."""
+    rise = tdr_rise_ps(fmax)
+    tl = max(1.2 * rise + 20.0, (1.2 * rise) / 0.75)          # round trip, ps
+    return tl * 1e-12 * C0 / (2 * math.sqrt(eeff or 3.0)) * 1e6
+
+
+def verdict(res):
+    """One line: what the region result is good for."""
+    if not res.get("ran"):
+        pf = res.get("preflight", {})
+        if pf.get("ok"):
+            return "checked only (not run)"
+        return f"refused before solving: {'; '.join(pf.get('problems', [])[:2])}"
+    conv, cal = res.get("convergence", {}), res.get("calibration", {})
+    bad = []
+    if not conv.get("converged"):
+        bad.append(f"not converged ({conv.get('reason')})")
+    if res.get("passive") is False:
+        bad.append("not passive")
+    if bad:
+        return "not usable: " + "; ".join(bad)
+    ex = res.get("tdr_excursion") or {}
+    note = "" if cal.get("agree_pct") is not None else \
+        f" (line not calibrated in this box: TDR against {ex.get('ref', '2D')}, {ex.get('ref_ohm', res.get('z_2d_ohm'))} ohm)"
+    tdr = f"; TDR {ex['min_pct']:+.1f} / {ex['max_pct']:+.1f} %" if ex else ""
+    fl = res.get("reflection_floor_db")
+    fl_s = f"; S11/Sdd11 below {fl:.0f} dB is the model's own (port leads), not resolved" if fl is not None else ""
+    return "usable: both grids agree" + tdr + fl_s + note
+
+
 def _two_d(ctx, model):
     from . import xsec
-    p = next((q for q in model["ports"] if q["excite"]), None)
+    p = excited_port(model)
     if p is None:
         return {}
     b = ctx.b
     li = b.L[p["layer"]]
     refs = [b.layers[r] for r in ctx.ref_layers(li)]
-    grp = next(g for g in model["groups"] if p in g["ports"])
+    grp = next(g for g in model["groups"] if any(q["n"] == p["n"] for q in g["ports"]))
     xc = ctx.cfg["xsec"]
     if grp["kind"] == "pair":
         q = grp["ports"][1]

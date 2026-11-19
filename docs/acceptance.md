@@ -14,18 +14,18 @@ physics invariant). `blocked` means the test needs an input this machine does no
 | 6 | Interface standards: the same layout is judged by the standard its nets belong to | pass | PCIe limit {None, 1.0}, LVDS limit {None} |
 | 7 | Tolerance corners bracket the nominal impedance and match closed-form sensitivity | pass | Z0 38.6-54.6 ohm, closed form spread 16.3 ohm |
 | 8 | Correlation with a measured board: Antmicro's SI test board (published VNA data) | pass | stub_short peak -4.6 %; stub_long peak +4.6 %; stub_long null +0.3 % (one board, 0.2-6 GHz, outer-layer microstrip; see README) |
-| 9 | 3D line ports: a straight microstrip reads its 2D impedance within 2 % and is passive | pass | 3D 46.9 vs 2D 46.6 ohm in 6 min |
+| 9 | 3D line ports: a straight microstrip reads its 2D impedance within 2 % and is passive | pass | 3D 46.9 vs 2D 46.6 ohm in 4 min |
 | 10 | 3D differential drive: Sdd and Scd from one run; a straight pair has Scd21 < -40 dB | pass | Scd21 max -121.2 dB |
 | 11 | 3D series parts: an AC-coupled pair transmits (the capacitor is modelled) | pass | Sdd21(5 GHz) -0.42 dB; passive, converged |
 | 12 | 3D clipping keeps the signal path: a layer change through a via still transmits | pass | connected, S21(5 GHz) -0.15 dB |
 | 13 | 3D pre-flight refuses a bad setup; full stack with absorbing boundaries runs | pass | bad box refused, good box passes with PML sides |
 | 14 | 3D mesh: >= 4 cells across tracks and gaps, no lines closer than 5 um | pass | 12 cells across track, 14 across gap |
-| 15 | 3D convergence: each run records how it ended; a run cut short is not accepted | pass | runs cut short are flagged and not accepted |
+| 15 | 3D convergence: each run records how it ended; a run that would be cut short is refused before solving | pass | a 2000-step run refused before solving; full run: [('end_criteria', -37.6), ('end_criteria', -36.7)] |
 | 16 | 3D calibration: each class/layer line is solved in the same mesh and compared with 2D | pass | model line 101.3 vs 2D 99.6 ohm |
 | 17 | TDR recovers a known impedance step within 2 % | pass | step at the port 80.17 ohm; delayed step 100.0 -> 80.0 ohm |
 | 18 | 3D lossy materials: microstrip loss within 25 % of the closed form | pass | S21(10 GHz) -1.188 dB vs closed form -1.486 dB over 28.0 mm |
 | 19 | Automatic 3D regions with fix variants at each discontinuity type | pass | 2 regions planned (layer_change, series_cap), each with its fix variant, all pass pre-flight |
-| 20 | 3D regression cases pass: calibration line, coupled pair, symmetric via | pass | three 3D cases pass in 28 min |
+| 20 | 3D regression cases pass: calibration line, coupled pair, symmetric via | pass | three 3D cases pass in 10 min |
 | 21 | Multi-terminal nets (T and fly-by) are extracted, one result per receiver | pass | T: 2 receivers, fly-by: 3 receivers |
 | 22 | PDN: target judged only inside the rail's band; package/die model and load step reported | pass | judged in band; load step R 20.0 mV (20), L 103 mV (100); fixture 26883 mV (no capacitors) |
 | 23 | Board-wide stitching map: percentiles and the largest via-free area match the construction | pass | median 1.25 mm, void 96 mm2 |
@@ -35,7 +35,7 @@ physics invariant). `blocked` means the test needs an input this machine does no
 | 27 | Planeless boards and split grounds: return path judged without planes; ground network solved | pass | planeless rule; AGND/DGND split crossing found; ground rise 32.8 mV (I R 32.8) |
 | 28 | Current and heat: IPC-2152 trace rise within 30 % of IPC-2221; via current judged | pass | rise 234 C (IPC-2221 234 C) |
 | 29 | Layout stage: an unrouted board gives 'pending', not fails | pass | unrouted connections are pending |
-| 30 | Speed: rule checks on a 100 x 100 mm 6-layer board in < 30 s; results written per check | pass | 11.4 s |
+| 30 | Speed: rule checks on a 100 x 100 mm 6-layer board in < 30 s; results written per check | pass | 21.4 s |
 | 31 | Guidance: DC drop budget sums to the total; fix hints; width for a target impedance | pass | budget sums; hint present; plan w=0.1195 mm |
 | 32 | Library API and live board: a snapshot, and the board open in KiCad, give the CLI's findings | pass | API = CLI (4 RP findings); live board through KiCad's IPC API = saved file (8 findings) |
 | 33 | Concurrent runs: a job lock and a shared thread budget; parallel runs agree | pass | 3 parallel runs agree, lock present |
@@ -64,9 +64,11 @@ physics invariant). `blocked` means the test needs an input this machine does no
 | 56 | Input and profile: a board using a KiCad 10.99 construct is refused (also when its header says 10.0); a reading with footprints away from their pads is refused; cached readings are keyed by refill and kicad-cli; fab-check finds a profile's quotes and reports a changed one | pass | 10.99 construct refused; misplaced reading refused; cache keyed file_refill_cli10.0.8 / file_norefill_cli10.0.8; fab-check: 74 quotes found, a changed figure re |
 | 57 | The plot folder: openpcbsi empties only a folder it made; a folder of other files is refused, not cleared | pass | a foreign file kept and the run refused; openpcbsi's own folder marked and reused |
 | 58 | Automatic 3D regions on a multi-sheet design: hierarchical and '../' net names give safe job files and run folders | pass | /serdes/ -> ['cap_C1', 'via_serdes_LANE0_RXC_P']; /../../../../ESC3/ -> ['cap_C2', 'via_ESC3_LANE0_RXC_N']; region run folders inside runs/em; nothing written o |
-| 59 | 3D pre-flight: another net's track crossing the absorbing side cleanly (45 degrees) passes; one ending near it or running along it is refused | pass | diagonal crossing passes; end and parallel run refused; clearance floor 644 um |
+| 59 | 3D pre-flight: another net's track crossing the absorbing side cleanly (45 degrees) passes; one ending near it or running along it is refused | pass | diagonal crossing passes; end and parallel run refused; far stub left out; clearance floor 1250 um |
 | 60 | Automatic 3D regions: a planned box the pre-flight refuses is moved until it passes; when no box passes the job says why | pass | moved [0.0, 0.0, 0.0, 0.5] mm in 4 pre-flights; fenced: 'track of BUS0 on F.Cu is cut at the box edge beside a port lead, runs along it f...' |
 | 61 | 3D runner: a rerun reuses a finished grid whose inputs hash the same; an interrupted, damaged or changed grid is solved again | pass | interrupted run: grid 0 reused, grid 1 solved; complete rerun solves nothing; damaged/changed grids solved again |
 | 62 | ref_plane does not fail a track over the void pad_plane asks for under its own pad; any other void, or more void than asked, still fails | pass | own-pad voids excused (0.40 mm on LANE0_RX_P); the slot and the oversized void still fail; with pad_plane off they fail |
 | 63 | No interpreter or folder of the author's machine in the shipped files; an unset interpreter variable is a clear error | pass | no absolute user paths in 92 shipped files; both interpreter variables required by name |
-| 64 | 3D runner with openEMS: the second run of a solved region reuses both grids and gives the same result (slow) | not run |  |
+| 64 | 3D runner with openEMS: the second run of a solved region reuses both grids and gives the same result (slow) | pass | first run 6.6 min, rerun 1 s with both grids reused |
+| 65 | 3D mesh and cost: no two mesh lines closer than 5 um after mirroring about a pair; a run predicted to take too long or to stop on the step limit is refused before solving | pass | mirrored min cell 6.5 um, fixed-line min cell 5.1 um; refused at 0.57 h > 0.001 h, time step 13.36 fs |
+| 66 | 3D lanes: multi-segment routes connect; a break, a pair cut by a box corner, a diagonal port are refused; a turned frame boxes a diagonal pair; a lane ending on a pad gets its termination | pass | broken, corner-cut and diagonal-port models refused; turned frame passes; J1 terminated [('1', 'In1.Cu'), ('2', 'In1.Cu')] |

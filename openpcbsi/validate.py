@@ -7,7 +7,7 @@ import time
 
 from . import xsec
 
-SOLVER_VERSIONS = {"xsec2d": "xsec-1", "pdn": "pdn-1", "dc": "dc-1", "thermal": "th-1", "si": "si-1", "em3d": "em3d-1",
+SOLVER_VERSIONS = {"xsec2d": "xsec-1", "pdn": "pdn-1", "dc": "dc-1", "thermal": "th-1", "si": "si-1", "em3d": "em3d-2",
                    "etch": "etch-2", "reflow": "rf-2"}
 
 
@@ -119,7 +119,9 @@ def _save(path, db):
 def run3d(cache_dir, runs_dir, log=print):
     """#20: the openEMS cases that must pass before any 3D region counts (G8 / FS1-FS3):
     calibration line (3D within 2 % of 2D), coupled pair (Zodd and Zeven within 2 % of 2D), and a
-    symmetric via transition (Scd21 below -40 dB: catches P/N sign errors and asymmetric meshes).
+    symmetric via transition (Scd21 below -40 dB: catches P/N sign errors and asymmetric meshes), a line
+    ending on a terminated pad (matched, not open), and another net's copper just beyond the inclusion
+    distance (leaving it out moves the TDR by under 1 %).
     Minutes each; results are cached by model hash."""
     import os
     from . import boardgen, region3d, run as runmod
@@ -170,6 +172,66 @@ def run3d(cache_dir, runs_dir, log=print):
     sc = max(rv.get("Scd21_db") or [0.0])
     cases.append({"case": "symmetric via (Scd21 below -40 dB)", "pass": sc < -40.0 and rv.get("convergence", {}).get("converged") is True,
                   "value": round(sc, 1), "reference": -40.0, "note": rv.get("convergence", {}).get("reason")})
+    # stripline pair: the region's own inner-layer copper with its thickness (as a zero-thickness sheet it
+    # read 8.9 % high). Tolerance 3 %, not 2: the two grids converge on 2D from below (90.6, 92.4 ohm
+    # against 95.0) and the coarse grid's level is what is left; 3 % is also the grids' own agreement limit
+    p = os.path.join(d, "strip.kicad_pcb")
+    b = boardgen.Board(p, layers=4, size=(30, 16))
+    b.plane("F.Cu", "GND"); b.plane("In2.Cu", "GND")
+    b.pair("In1.Cu", "LANE0_TX", 3, 27, 8, ends=False)
+    b.save()
+    _, _, ctx = runmod.load(p)
+    rs = region3d.run(ctx, {"name": "val_strip_odd", "nets": ["LANE0_TX_P", "LANE0_TX_N"], "box": [8, 3, 22, 13], "fmax_ghz": 10},
+                      cache_dir, runs_dir, log)
+    ag = rs.get("calibration", {}).get("agree_pct")
+    cases.append({"case": "inner-layer pair (Zdiff 3D vs 2D, 3 %)", "pass": ag is not None and abs(ag) <= 3.0
+                  and rs.get("convergence", {}).get("converged") is True, "value": rs.get("z_line_ohm"), "reference": rs.get("z_2d_ohm"),
+                  "note": rs.get("convergence", {}).get("reason")})
+    # terminated line: a line that ends on a pad gets its termination (a lumped port to the plane), so the
+    # model is a matched two-port, not an open end (|S11| = 1). Reference: the 0.22 mm line (~47 ohm, the
+    # calibration case) into 50 ohm reflects -29 dB; the pad and the port's own height may add to that,
+    # up to -15 dB (an open end gives 0 dB)
+    p = os.path.join(d, "term.kicad_pcb")
+    b = boardgen.Board(p, layers=4, size=(30, 16))
+    b.plane("In1.Cu", "GND"); b.plane("In2.Cu", "GND")
+    b.track("F.Cu", [(3, 8), (18, 8)], 0.22, "LINE0")
+    b.footprint("U9", "RX", 18, 8, [{"num": 1, "net": "LINE0", "dx": 0, "dy": 0, "sx": 0.4, "sy": 0.4}])
+    b.save()
+    _, _, ctx = runmod.load(p)
+    rt = region3d.run(ctx, {"name": "val_term", "nets": ["LINE0"], "box": [8, 3, 22, 13], "fmax_ghz": 10}, cache_dir, runs_dir, log)
+    f = rt.get("freq_ghz") or []
+    s11 = max([v for fq, v in zip(f, rt.get("S11_db") or []) if 0.5 <= fq <= 10.0] or [0.0])
+    s21 = min([v for fq, v in zip(f, rt.get("S21_db") or []) if 0.5 <= fq <= 10.0] or [-99.0])
+    cases.append({"case": "terminated line (|S11| below -15 dB, |S21| above -1 dB)", "pass": bool(rt.get("terminations")) and s11 < -15.0
+                  and s21 > -1.0 and rt.get("convergence", {}).get("converged") is True,
+                  "value": [round(s11, 1), round(s21, 2)], "reference": [-15.0, -1.0], "note": rt.get("convergence", {}).get("reason")})
+    # copper left out: another net's track just beyond the inclusion distance changes the result by less
+    # than 1 % of the line (the grids themselves agree to 2 %); include_mm = 0 keeps it in the model
+    from . import region3d as r3
+    p = os.path.join(d, "incl.kicad_pcb")
+    b = boardgen.Board(p, layers=4, size=(30, 20))
+    b.plane("In1.Cu", "GND"); b.plane("In2.Cu", "GND")
+    b.track("F.Cu", [(3, 10), (27, 10)], 0.22, "LINE0")
+    b.save()
+    _, _, ctx = runmod.load(p)
+    spec = {"name": "val_incl", "nets": ["LINE0"], "box": [8, 3, 22, 17], "fmax_ghz": 10}
+    m0 = r3.Region(ctx, dict(spec)).build()
+    dy = (m0["include_um"] or 1000.0) / 1000.0 + 0.11 + 0.2          # beyond the distance from the line's edge
+    b = boardgen.Board(p, layers=4, size=(30, 20))
+    b.plane("In1.Cu", "GND"); b.plane("In2.Cu", "GND")
+    b.track("F.Cu", [(3, 10), (27, 10)], 0.22, "LINE0")
+    b.track("F.Cu", [(12, 10 + dy), (18, 10 + dy)], 0.12, "OTHER")
+    b.save()
+    _, _, ctx = runmod.load(p)
+    ra = region3d.run(ctx, dict(spec), cache_dir, runs_dir, log)
+    rb = region3d.run(ctx, dict(spec, name="val_incl_all", include_mm=0), cache_dir, runs_dir, log)
+    ta, tb = ra.get("tdr_z_ohm") or [], rb.get("tdr_z_ohm") or []
+    n = min(len(ta), len(tb))
+    dz = max(abs(x - y) for x, y in zip(ta[:n], tb[:n])) / (ra.get("z_port_ohm") or 1.0) * 100 if n else 99.0
+    cases.append({"case": f"copper left out {dy:.2f} mm from the line (TDR within 1 %)", "pass": dz <= 1.0
+                  and (ra.get("left_out") or {}).get("tracks", 0) >= 1 and (rb.get("left_out") or {}).get("tracks", 1) == 0
+                  and ra.get("convergence", {}).get("converged") is True and rb.get("convergence", {}).get("converged") is True,
+                  "value": round(dz, 3), "reference": 1.0, "note": f"{ra.get('convergence', {}).get('reason')}; {rb.get('convergence', {}).get('reason')}"})
     for c in cases:
         log(f"  [{'PASS' if c['pass'] else 'FAIL'}] {c['case']:50s} {c['value']} vs {c['reference']}  ({c['note']})")
     register(cache_dir, "em3d", [{"solver": "em3d", "case": c["case"], "pass": c["pass"], "value": 0.0, "reference": 0.0,

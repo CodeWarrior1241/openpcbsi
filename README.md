@@ -247,8 +247,48 @@ box = [118.0, 62.0, 126.0, 70.0]      # mm
 fmax_ghz = 20
 ```
 
-A region runs only after a pre-flight check of the model, on two grids, and is accepted only when
-both runs settle and agree. The grids must agree on the shape of the TDR (each normalised to its own
+Optional keys: `rotate_deg` turns the board about `rotate_about` (default the box's centre) before the
+box is applied, so that a 45-degree route runs along an axis and a side can cut it square (the planner
+sets `rotate_deg = -45` where the box's sides cut its nets at 45 degrees); `include_mm` (default 1.0, at
+least 10 field heights) is how far from the region's own copper other nets' copper is kept in the model
+(farther copper is left out, as the absorbing sides already stand for the board beyond them; 0 keeps
+everything); `term_ohm` (default 50) and `terminate = false` set or remove the load at a pad where a
+region net ends inside the box; `max_hours` (default 6, or `OPENPCBSI_EM_MAX_HOURS`) caps the
+predicted run time.
+
+Before anything is solved, the pre-flight refuses a model that would give no usable answer:
+- a lane that does not run through the box to a port on another side or to a termination (an open
+  end, or a break); routes are followed segment by segment, through vias, pads and series parts;
+- a pair whose legs leave the box on different sides (a box corner cuts it), or a port whose track
+  crosses the box edge more than 10 degrees off square;
+- copper that ends in or runs along the absorbing boundary (see the pre-flight's own text);
+- a run predicted to stop on the time-step limit before the excitation has passed, or that could take
+  longer than `max_hours`: the time step follows the smallest mesh cell (no two lines are closer than
+  5 um), each run's step limit is 4 times the steps its excitation needs, and the speed is this
+  machine's own from its last finished grids (350 Mcells/s until it has some), so the bound holds.
+
+A run that stops on its step limit (a plane fragment that keeps ringing, which the board's decoupling
+would damp) is accepted when every port's voltage over the last tenth of the run is at least 50 dB
+below the largest port peak; the figure is recorded per grid.
+
+A region net that ends on a part's pad inside the box (a connector pin, a BGA ball) gets a 50 ohm
+lumped port from the pad to the nearest reference plane under it: the receiver's or cable's load (100
+ohm differential for a pair) and a measured second port, instead of an open end that reflects
+everything. Its height is part of that load: a pad over a cut-out reaches a plane further down.
+
+The region's own copper on inner layers has its real thickness, as on the outer layers (a zero-
+thickness sheet read an inner-layer pair 8.9 % high against 2D); other nets' inner copper stays a sheet.
+
+The port leads are zero-thickness strips (openEMS's line port measures current on a sheet), so their
+impedance differs from the board's thick track: about 7 % on a microstrip, 13 to 16 % on pairs. That step
+at each box edge, and the lead's own mismatch to the 50 ohm-per-leg reference, put a floor under every
+S11 / Sdd11: a uniform line shows -20 to -23 dB. Each result states this floor (`reflection_floor_db`,
+from the port's and the line's readings); a return loss near or below it is the model's, not the
+layout's. The TDR excursion (`tdr_excursion`) is read inside the box, past the near lead's step and short
+of the far one, against the model's calibrated line or else the 2D impedance of the same geometry; it is
+what the planner's FS9 findings judge.
+
+A region runs on two grids and is accepted only when both runs settle and agree. The grids must agree on the shape of the TDR (each normalised to its own
 port reading) within 2 % and on the line impedance within 3 %. The absolute level of a 3D run moves with
 the mesh by up to about 2.5 % (on one pair, three grids gave 98.95, 101.09 and 99.9 ohm against 99.6 ohm
 in 2D), so that level is checked against the 2D solver instead: the model's line is compared with 2D

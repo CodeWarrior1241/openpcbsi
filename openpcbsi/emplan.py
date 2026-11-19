@@ -10,7 +10,9 @@ the standard fix as a variant, so the 3D result says whether the fix is worth it
 Fast class: Nyquist at or above `[em] fast_ghz` (default 3 GHz). A job is a region spec for region3d
 (nets + box) plus `variant`; `evaluate --em plan` lists them, `--em run` runs them (minutes each).
 
-Each planned box is then fitted to region3d's own pre-flight (fit_box): on a real board another net's
+A job whose box sides cut its nets where they run at 45 degrees is planned in a frame turned by -45
+degrees (orient), so a side cuts the route square. Each planned box is then fitted to region3d's own
+pre-flight (fit_box): on a real board another net's
 track, pad or via often ends near a box edge, which the pre-flight refuses. The fit moves each side that
 has a problem, a step at a time, outwards up to FIT_GROW or inwards down to the features the job is about
 (they stay FIT_CORE clear of the edge), keeping the same ports, and keeps the first box that passes. A job
@@ -137,10 +139,53 @@ def plan(ctx, report, fast_ghz=3.0, fit=True, log=None):
             j["name"], k = f"{n}_{k}", k + 1
         used.add(j["name"])
     jobs = jobs[:MAX_JOBS]
+    inc = ctx.cfg.data.get("em", {}).get("include_mm")
+    for j in jobs:
+        if inc is not None:
+            j["include_mm"] = inc
+        orient(ctx, j)
     if fit:
         for j in jobs:
             fit_box(ctx, j, log=log)
     return jobs
+
+
+def orient(ctx, job):
+    """Turn the job's frame by -45 degrees when the box's sides cut its nets mostly where they run at 45
+    or 135 degrees: an axis-aligned box cuts a diagonal pair at an angle, which the pre-flight refuses
+    (see region3d.Rotated). The box and core are kept about their centre."""
+    b = ctx.b
+    x0, y0, x1, y1 = job["box"]
+    diag = ortho = 0
+    T = b.tracks
+    # where the box's sides cut the job's nets: the ports' tracks (a 45-degree fan-out inside the box
+    # does not matter; the route the sides cut does)
+    for n in job["nets"]:
+        if n not in b.net_id:
+            continue
+        for k in b.tracks_of(n):
+            xa, ya, xb, yb = (float(T[c][k]) for c in ("x1", "y1", "x2", "y2"))
+            L = math.hypot(xb - xa, yb - ya)
+            if L <= 0:
+                continue
+            cuts = 0
+            for c, (pa, pb, qa, qb, lo, hi) in ((x0, (xa, xb, ya, yb, y0, y1)), (x1, (xa, xb, ya, yb, y0, y1)),
+                                               (y0, (ya, yb, xa, xb, x0, x1)), (y1, (ya, yb, xa, xb, x0, x1))):
+                if (pa - c) * (pb - c) < 0:
+                    q = qa + (c - pa) / (pb - pa) * (qb - qa)
+                    cuts += lo < q < hi
+            if not cuts:
+                continue
+            a = math.degrees(math.atan2(yb - ya, xb - xa)) % 90.0
+            if abs(a - 45.0) < 10.0:
+                diag += cuts
+            elif a < 10.0 or a > 80.0:
+                ortho += cuts
+    if diag > ortho:
+        bx = job["box"]
+        job["rotate_deg"] = -45.0
+        job["rotate_about"] = [round((bx[0] + bx[2]) / 2, 3), round((bx[1] + bx[3]) / 2, 3)]
+    return job
 
 
 def region_spec(job, variant=False):
@@ -155,7 +200,7 @@ def _check(ctx, job, box):
     reg = region3d.Region(ctx, spec)
     reg.build()
     pf = reg.preflight()
-    return pf, sorted({(p["net"], p["side"]) for p in reg.model["ports"]})
+    return pf, sorted({p["net"] for p in reg.model["ports"]})
 
 
 SIDE_AX = {"xmin": (0, -1), "ymin": (1, -1), "xmax": (2, +1), "ymax": (3, +1)}   # box index, outward sign
@@ -164,8 +209,10 @@ SIDE_AX = {"xmin": (0, -1), "ymin": (1, -1), "xmax": (2, +1), "ymax": (3, +1)}  
 def fit_box(ctx, job, log=None, tries=FIT_TRIES):
     """Fit the job's box to region3d's pre-flight (see the module text); records `fit` in the job and
     updates `box`. The search is per side: a side whose pre-flight problems name it moves out or in, a
-    step at a time, nearest first, until its problems are gone without adding any elsewhere; the ports
-    (net, side) must stay those of the planned box, so the job still measures what it was planned for."""
+    step at a time, nearest first, until its problems are gone without adding any elsewhere; the nets with
+    ports must stay those of the planned box (a side may move off a corner that cut a pair, so a port can
+    change side), and the job's own features stay inside (`core`), so it still measures what it was
+    planned for."""
     box0 = list(job["box"])
     core = job.get("core") or box0
     job["planned_box"] = box0
@@ -181,7 +228,7 @@ def fit_box(ctx, job, log=None, tries=FIT_TRIES):
         if pf["ok"] or n >= tries:
             break
         bad = [s for s in SIDE_AX if pf.get("by_side", {}).get(s)]
-        if not bad or pf.get("by_side", {}).get("other"):
+        if not bad:
             break                                 # nothing a side move can fix (no reference plane, no port)
         progress = False
         for side in bad:
@@ -204,7 +251,8 @@ def fit_box(ctx, job, log=None, tries=FIT_TRIES):
                 n += 1
                 if ports2 != ports0:
                     continue
-                if not pf2.get("by_side", {}).get(side) and pf2["n_problems"] < pf["n_problems"]:
+                if not pf2.get("by_side", {}).get(side) and pf2["n_problems"] <= pf["n_problems"] and \
+                        (pf2["n_problems"] < pf["n_problems"] or len(pf2.get("by_side", {}).get("other", [])) < len(pf.get("by_side", {}).get("other", []))):
                     box, pf, progress = cand, pf2, True
                     break
             if pf["ok"]:

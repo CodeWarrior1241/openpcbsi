@@ -304,10 +304,17 @@ def main(argv=None):
                 return 3
             path = os.path.join(res["dir"], "result.json")
             pf = res["preflight"]
+            est = res.get("estimate") or {}
+            if est:
+                print(f"region estimate: {est['hours']:.1f} h, at most {est.get('hours_max', est['hours']):.1f} h for {len(est['grids'])} grids "
+                      f"({', '.join(str(g['cells']) for g in est['grids'])} cells, time step {est['grids'][0]['dt_fs']} fs)")
             if not pf["ok"]:
                 print("region pre-flight refused the model:\n  " + "\n  ".join(pf["problems"]), file=sys.stderr)
+            print(f"region verdict: {res.get('verdict')}")
             print(f"region result: {path}")
-            return 0 if pf["ok"] else 2
+            if not pf["ok"]:
+                return 2
+            return 0 if (not res.get("ran") or str(res.get("verdict", "")).startswith("usable")) else 1
         region.run(ctx, spec, runmod.CACHE, runmod.RUNS)
     elif a.cmd == "snapshot":
         from . import snapshot

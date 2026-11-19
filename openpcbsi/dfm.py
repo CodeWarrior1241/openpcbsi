@@ -1291,6 +1291,14 @@ def rule_output(ctx, fabr, od, gerber_dir, log):
         checked += sent["compared"]
         if not sent["compared"] and not unchecked:
             unchecked = "no file given with --gerbers could be compared"
+        elif reader_bad and sent["compared"] and not any(f["severity"] == "error" for f in sent["fs"]):
+            # the files that will be made agree with the reading everywhere, also where KiCad's plot today
+            # does not: what is made is what was checked. The plot's difference is the plotter's (another
+            # KiCad version, a downgraded copy), not the board's; it is listed, not a reason to stop.
+            unchecked = ""
+            fs = [dict(f, severity="info", msg=f["msg"] + "; the files sent agree with the reading here, so what is made is what was "
+                                                 "checked: the difference is KiCad's plotter's (version or downgraded copy), not the board's")
+                  if (f.get("kind") or "").startswith("reader:") else f for f in fs]
     else:
         params["source"] = "plotted now by kicad-cli (no --gerbers)"
         assumption = (f"the files sent are the ones plotted in {src}: no --gerbers DIR was given, so files plotted earlier "

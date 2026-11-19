@@ -527,11 +527,16 @@ def run(board, cfg_path=None, waivers=None, families=None, checks=None, out_dir=
                 log("  " + msg)
                 if em == "plan":
                     findings.append(_f("em_region", "FS", "FS9", "info", msg, j["nets"], j.get("parts", []), extra=j["name"]))
+        if em == "plan":                          # listed, not solved: not run (never "unvalidated")
+            skipped["em_region"] = f"--em plan: {len(em_jobs)} regions planned, {nfit} with a box; solved only with --em run"
         if em == "run":
+            val["em_region"] = validate.status(runmod.CACHE, "em3d")
             for j in em_jobs:
                 spec = emplan.region_spec(j)
                 base = region3d.run(ctx, spec, runmod.CACHE, runmod.RUNS, log)
-                j["result"] = {k: base.get(k) for k in ("dir", "ran", "convergence", "calibration", "z_line_ohm", "preflight")}
+                j["result"] = {k: base.get(k) for k in ("dir", "ran", "convergence", "calibration", "z_line_ohm", "preflight",
+                                                         "estimate", "terminations", "verdict")}
+                log(f"  {j['name']}: {base.get('verdict')}")
                 if j.get("variant"):
                     var = region3d.run(ctx, emplan.region_spec(j, variant=True), runmod.CACHE, runmod.RUNS, log)
                     j["variant_result"] = {k: var.get(k) for k in ("dir", "ran", "convergence", "z_line_ohm")}

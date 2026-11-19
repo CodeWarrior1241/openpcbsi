@@ -1,8 +1,9 @@
 """Fixture boards for the 3D-region (#9-#20) and pad-void tests in tests/acceptance_em.py. Each function
 builds one board (and its project files) and returns its path. Coordinates in mm.
 
-All are the same AC-coupled lane on a 4-layer board (GND on In1 and In2): a pair LANE0_RX_P/N on F.Cu into
-two series capacitors C1 / C2 at x = 20, then LANE0_RXC_P/N on to vias at x = 34 and on B.Cu. The planner
+All are the same AC-coupled lane on a 4-layer board (GND on In1 and In2): a pair LANE0_RX_P/N on F.Cu that
+fans out at 45 degrees into two series capacitors C1 / C2 at x = 20 (pads at y = 9 and 11), then
+LANE0_RXC_P/N on to vias at x = 34 and on B.Cu. The planner
 (`evaluate --em plan`) puts a series-cap box of about [16.75, 6.25, 23.25, 13.75] around C1 / C2 and a
 layer-change box around the vias; the boards differ in what else is near those boxes."""
 import os
@@ -18,13 +19,13 @@ def _p(out, name):
 
 def _lane(b, prefix=""):
     """The AC-coupled lane; `prefix` is put before every lane net name (a hierarchical sheet path)."""
-    for sfx, y in (("_P", 9.865), ("_N", 10.135)):
-        b.track("F.Cu", [(5, y), (19.5, y)], 0.12, prefix + "LANE0_RX" + sfx)
+    for sfx, y, yc in (("_P", 9.865, 9.0), ("_N", 10.135, 11.0)):     # 45-degree jogs into and out of the pads
+        b.track("F.Cu", [(5, y), (19.5 - abs(y - yc), y), (19.5, yc)], 0.12, prefix + "LANE0_RX" + sfx)
     b.two_pin("C1", "100n", 20, 9.0, prefix + "LANE0_RX_P", prefix + "LANE0_RXC_P", pitch=1.0, pad=(0.5, 0.5))
     b.two_pin("C2", "100n", 20, 11.0, prefix + "LANE0_RX_N", prefix + "LANE0_RXC_N", pitch=1.0, pad=(0.5, 0.5))
-    for sfx, y in (("_P", 9.865), ("_N", 10.135)):
+    for sfx, y, yc in (("_P", 9.865, 9.0), ("_N", 10.135, 11.0)):
         dy = -0.4 if sfx == "_P" else 0.4
-        b.track("F.Cu", [(20.5, y), (34, y)], 0.12, prefix + "LANE0_RXC" + sfx)
+        b.track("F.Cu", [(20.5, yc), (20.5 + abs(y - yc), y), (34 - abs(dy), y), (34, y + dy)], 0.12, prefix + "LANE0_RXC" + sfx)
         b.via(34, y + dy, prefix + "LANE0_RXC" + sfx)
         b.track("B.Cu", [(34, y + dy), (45, y)], 0.12, prefix + "LANE0_RXC" + sfx)
 
@@ -99,4 +100,42 @@ def pad_void(out, name="padvoid", c2_margin=0.15, slot_x=10.0):
             b.slot("In1.Cu", x - 0.25 - m, y - 0.25 - m, x + 0.25 + m, y + 0.25 + m)
     if slot_x:
         b.slot("In1.Cu", slot_x - 0.25, 8.4, slot_x + 0.25, 9.6)
+    return b.save()
+
+
+def broken_lane(out, name="broken", gap=(22.0, 22.3)):
+    """The lane with LANE0_RXC_P's F.Cu track interrupted between x = gap[0] and gap[1] (a break the
+    connection check must find)."""
+    b = _base(out, name)
+    for sfx, y, yc in (("_P", 9.865, 9.0), ("_N", 10.135, 11.0)):
+        b.track("F.Cu", [(5, y), (19.5 - abs(y - yc), y), (19.5, yc)], 0.12, "LANE0_RX" + sfx)
+    b.two_pin("C1", "100n", 20, 9.0, "LANE0_RX_P", "LANE0_RXC_P", pitch=1.0, pad=(0.5, 0.5))
+    b.two_pin("C2", "100n", 20, 11.0, "LANE0_RX_N", "LANE0_RXC_N", pitch=1.0, pad=(0.5, 0.5))
+    for sfx, y, yc in (("_P", 9.865, 9.0), ("_N", 10.135, 11.0)):
+        if sfx == "_P":
+            b.track("F.Cu", [(20.5, yc), (20.5 + abs(y - yc), y), (gap[0], y)], 0.12, "LANE0_RXC_P")
+            b.track("F.Cu", [(gap[1], y), (34, y)], 0.12, "LANE0_RXC_P")
+        else:
+            b.track("F.Cu", [(20.5, yc), (20.5 + abs(y - yc), y), (34, y)], 0.12, "LANE0_RXC_N")
+    return b.save()
+
+
+def diagonal_pair(out, name="diagpair"):
+    """A pair DIAG_P/N on F.Cu running at 45 degrees across the board, P along y = x - 8 and N 0.27 mm
+    beside it (0.12 mm tracks, 0.15 mm gap)."""
+    b = _base(out, name)
+    o = 0.27 / 2 ** 0.5
+    b.track("F.Cu", [(9.0, 1.0), (27.0, 19.0)], 0.12, "DIAG_P")
+    b.track("F.Cu", [(9.0 + o, 1.0 - o), (27.0 + o, 19.0 - o)], 0.12, "DIAG_N")
+    return b.save()
+
+
+def pad_end(out, name="padend"):
+    """A pair END_P/N on F.Cu from the board's left edge to the two pads of a connector J1 at x = 20 (the
+    pair's own end: a one-port region in a board-only model)."""
+    b = _base(out, name)
+    for sfx, y in (("_P", 9.865), ("_N", 10.135)):
+        b.track("F.Cu", [(3, y), (20, y)], 0.12, "END" + sfx)
+    b.footprint("J1", "CONN", 20, 10, [{"num": 1, "net": "END_P", "dx": 0, "dy": -0.135, "sx": 0.2, "sy": 0.12},
+                                       {"num": 2, "net": "END_N", "dx": 0, "dy": 0.135, "sx": 0.2, "sy": 0.12}])
     return b.save()

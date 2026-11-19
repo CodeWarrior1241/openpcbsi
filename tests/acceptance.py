@@ -428,17 +428,24 @@ def t14_mesh():
     return ok(f"{m['min_cells_across_track']} cells across track, {m['min_cells_across_gap']} across gap")
 
 
-@case(15, "3D convergence: each run records how it ended; a run cut short is not accepted", slow=True)
+@case(15, "3D convergence: each run records how it ended; a run that would be cut short is refused before solving", slow=True)
 def t15_conv():
     d = out_dir("t15")
     b = boards.line(d, "conv", w=0.22)
+    # a step limit far below what the excitation needs: refused before any solve (it used to run and be
+    # rejected afterwards)
     rc, so, se, res, dt = _region(b, '[region]\nname = "short"\nnets = ["LINE0"]\nbox = [8, 6, 32, 14]\nmax_timesteps = 2000\n')
     need(res, f"no region result (rc {rc}): {(se or so)[-300:]}")
-    ends = [x.get("ended_by") for x in res.get("convergence", {}).get("runs", [])]
-    need(ends and all(e == "timesteps" for e in ends), f"ended_by {ends}")
-    need(res["convergence"].get("converged") is False and "step" in res["convergence"].get("reason", ""), f"{res['convergence']}")
-    need("z_line_diff_pct" in res["convergence"] or "tdr_diff_pct" in res["convergence"], "convergence does not compare Z/TDR between grids")
-    return ok("runs cut short are flagged and not accepted")
+    pr = res.get("preflight", {}).get("problems", [])
+    need(rc == 2 and res.get("ran") is False and any("limit of 2000" in p for p in pr), f"not refused before solving: rc {rc}, {pr}")
+    need(not res.get("convergence"), "a refused model was solved")
+    # a full run records how each grid ended and how quiet its ports were at the end
+    rc, so, se, res, dt = _region(b, '[region]\nname = "full"\nnets = ["LINE0"]\nbox = [8, 6, 32, 14]\n')
+    need(res and res.get("ran"), f"no region result (rc {rc}): {(se or so)[-300:]}")
+    runs = res.get("convergence", {}).get("runs", [])
+    need(runs and all(r.get("ended_by") in ("end_criteria", "timesteps") and r.get("tail_db") is not None for r in runs), f"{runs}")
+    need("z_line_diff_pct" in res["convergence"] or "tdr_shape_diff_pct" in res["convergence"], "convergence does not compare Z/TDR between grids")
+    return ok(f"a 2000-step run refused before solving; full run: {[(r['ended_by'], r['tail_db']) for r in runs]}")
 
 
 @case(16, "3D calibration: each class/layer line is solved in the same mesh and compared with 2D", slow=True)
@@ -507,13 +514,14 @@ def t19_auto():
     os.makedirs(os.path.dirname(p), exist_ok=True)
     bb = Board(p, layers=4, size=(50, 20))
     bb.plane("In1.Cu", "GND"); bb.plane("In2.Cu", "GND")
-    for sfx, y in (("_P", 9.865), ("_N", 10.135)):
-        bb.track("F.Cu", [(5, y), (19.5, y)], 0.12, "LANE0_RX" + sfx)
+    for sfx, y, yc in (("_P", 9.865, 9.0), ("_N", 10.135, 11.0)):     # 45-degree jogs into and out of the pads
+        bb.track("F.Cu", [(5, y), (19.5 - abs(y - yc), y), (19.5, yc)], 0.12, "LANE0_RX" + sfx)
     bb.two_pin("C1", "100n", 20, 9.0, "LANE0_RX_P", "LANE0_RXC_P", pitch=1.0, pad=(0.5, 0.5))
     bb.two_pin("C2", "100n", 20, 11.0, "LANE0_RX_N", "LANE0_RXC_N", pitch=1.0, pad=(0.5, 0.5))
-    for sfx, y in (("_P", 9.865), ("_N", 10.135)):
-        bb.track("F.Cu", [(20.5, y), (34, y)], 0.12, "LANE0_RXC" + sfx)
-        bb.via(34, y + (-0.4 if sfx == "_P" else 0.4), "LANE0_RXC" + sfx)
+    for sfx, y, yc in (("_P", 9.865, 9.0), ("_N", 10.135, 11.0)):
+        dy = -0.4 if sfx == "_P" else 0.4
+        bb.track("F.Cu", [(20.5, yc), (20.5 + abs(y - yc), y), (34 - abs(dy), y), (34, y + dy)], 0.12, "LANE0_RXC" + sfx)
+        bb.via(34, y + dy, "LANE0_RXC" + sfx)
         bb.track("B.Cu", [(34, y + (-0.4 if sfx == "_P" else 0.4)), (45, y)], 0.12, "LANE0_RXC" + sfx)
     bb.save()
     r = evaluate(p, "--checks", "drc", "--no-drc", "--em", "plan")
@@ -1808,7 +1816,7 @@ def _em_case(item, name, slow=False):
 
 for _item, _name, _slow in ((58, "t_em_names", False), (59, "t_em_preflight_crossings", False), (60, "t_em_fit", False),
                             (61, "t_em_grid_reuse", False), (62, "t_em_pad_void", False), (63, "t_no_user_paths", False),
-                            (64, "t_em_grid_reuse_openems", True)):
+                            (64, "t_em_grid_reuse_openems", True), (65, "t_em_mesh_cost", False), (66, "t_em_lanes", False)):
     _em_case(_item, _name, _slow)
 
 

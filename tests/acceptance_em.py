@@ -143,21 +143,32 @@ def t_em_preflight_crossings():
     b = boards_em.diagonal_lane(d)
     rc, so, se, res, _ = region(b, spec)
     need(res and rc == 0 and res["preflight"]["ok"], f"45-degree crossing refused: {(res or {}).get('preflight', {}).get('problems') or (se or so)[-300:]}")
+    # the band rule itself, with all copper in the model (include_mm = 0)
+    every = dict(spec, include_mm=0)
     b = boards_em.stub_lane(d)
-    rc, so, se, res, _ = region(b, spec)
+    rc, so, se, res, _ = region(b, every)
     pr = (res or {}).get("preflight", {}).get("problems", [])
     need(rc == 2 and any("SLOW_B" in p and "ends" in p and "ymax" in p for p in pr), f"track ending near ymax not refused: rc {rc}, {pr}")
-    b = boards_em.parallel_lane(d)
+    # by default the stub, 1.5 mm from the lane's copper, is beyond the inclusion distance: left out, passes
     rc, so, se, res, _ = region(b, spec)
+    need(res and rc == 0 and res["preflight"]["ok"] and (res.get("left_out") or {}).get("tracks", 0) >= 1,
+         f"the far stub was not left out: rc {rc}, {(res or {}).get('left_out')}, {(res or {}).get('preflight', {}).get('problems')}")
+    b = boards_em.parallel_lane(d)
+    rc, so, se, res, _ = region(b, every)
     pr = (res or {}).get("preflight", {}).get("problems", [])
     need(rc == 2 and any("SLOW_C" in p and "runs along" in p for p in pr), f"track along ymax not refused: rc {rc}, {pr}")
     # the clearance does not shrink as the box edge comes closer (the mesh refines there): the same track
     # 0.49 mm inside the via box's ymax side, where PML + 8 cells is only ~0.36 mm, is refused
     rc, so, se, res, _ = region(b, {"name": "via", "nets": ["LANE0_RXC_P", "LANE0_RXC_N"], "box": [30.65, 6.665, 37.35, 13.085],
-                                    "preflight_only": True})
+                                    "preflight_only": True, "include_mm": 0})
     pf = (res or {}).get("preflight", {})
     need(rc == 2 and any("SLOW_C" in p for p in pf.get("problems", [])), f"track 0.49 mm from the boundary passed: {pf}")
-    return f"diagonal crossing passes; end and parallel run refused; clearance floor {pf['keep_um']['ymax']:.0f} um"
+    # a parallel track within the inclusion distance is kept and refused by default too
+    b = boards_em.parallel_lane(d, name="parallel_near", y=12.0)
+    rc, so, se, res, _ = region(b, dict(spec, box=[16.75, 6.25, 23.25, 12.6]))
+    pr = (res or {}).get("preflight", {}).get("problems", [])
+    need(rc == 2 and any("SLOW_C" in p for p in pr), f"a track within the inclusion distance, along ymax, passed: rc {rc}, {pr}")
+    return f"diagonal crossing passes; end and parallel run refused; far stub left out; clearance floor {pf['keep_um']['ymax']:.0f} um"
 
 
 # ---- 3. the planner's box search ---------------------------------------------------------------
@@ -165,20 +176,21 @@ def t_em_fit():
     """Automatic 3D regions: a planned box the pre-flight refuses is moved until it passes; when no box passes the job says why"""
     d = out_dir("fit")
     b = boards_em.stub_lane(d)
-    r = evaluate(b, "--checks", "drc", "--no-drc", "--em", "plan")
+    allcu = {"OPENPCBSI_EM_INCLUDE_MM": "0"}        # every track in the model: the stub forces the fit
+    r = evaluate(b, "--checks", "drc", "--no-drc", "--em", "plan", env=allcu)
     need(r["ev"], f"no evaluation: {(r['err'] or r['out'])[-300:]}")
     j = job(r["ev"], "series_cap")
     fit = j.get("fit") or {}
     need(fit.get("ok") is True and j.get("planned_box") and j["box"] != j["planned_box"], f"box not fitted: {fit}, box {j.get('box')}")
     # oracle: the pre-flight itself, through the region command, on both boxes
     spec = {k: v for k, v in j.items() if k in ("name", "nets", "fmax_ghz")}
-    rc0, so, se, r0, _ = region(b, dict(spec, box=j["planned_box"], preflight_only=True))
-    rc1, so, se, r1, _ = region(b, dict(spec, box=j["box"], preflight_only=True))
+    rc0, so, se, r0, _ = region(b, dict(spec, box=j["planned_box"], preflight_only=True), env=allcu)
+    rc1, so, se, r1, _ = region(b, dict(spec, box=j["box"], preflight_only=True), env=allcu)
     need(r0 and not r0["preflight"]["ok"], f"the planned box {j['planned_box']} passes pre-flight: nothing to fit")
     need(r1 and r1["preflight"]["ok"], f"the fitted box {j['box']} fails pre-flight: {(r1 or {}).get('preflight')}")
     # no box possible: a bus of tracks along every reachable position of the ymax side
     b2 = boards_em.fenced_lane(d)
-    r2 = evaluate(b2, "--checks", "drc", "--no-drc", "--em", "plan")
+    r2 = evaluate(b2, "--checks", "drc", "--no-drc", "--em", "plan", env=allcu)
     j2 = job(r2["ev"], "series_cap")
     f2 = j2.get("fit") or {}
     need(f2.get("ok") is False and "BUS" in f2.get("why", "") and "searched" in f2.get("why", ""), f"fenced box: {f2}")
@@ -368,7 +380,71 @@ def t_no_user_paths():
     return f"no absolute user paths in {len(files)} shipped files; both interpreter variables required by name"
 
 
-TESTS = [t_em_names, t_em_preflight_crossings, t_em_fit, t_em_grid_reuse, t_em_pad_void, t_no_user_paths]
+# ---- 7. what made the revision D regions fail -------------------------------------------------------
+def t_em_mesh_cost():
+    """3D mesh and cost: no two mesh lines closer than 5 um after mirroring about a pair; a run predicted to take too long or to stop on the step limit is refused before solving"""
+    sys.path.insert(0, os.path.dirname(HERE))
+    from openpcbsi import region3d as r3
+    # the revision D split region: a pair centre that is not on the 1 nm grid; mirroring the rounded
+    # lines gave two lines 1 nm apart (a 1000 times shorter time step)
+    c = 78598.9615
+    fixed = [c - 251.0, c - 131.0, c + 131.0, c + 251.0, c - 247.6, c + 247.6]
+    Y = r3.mesh_axis_sym(75290.0, 82290.0, c, fixed, [(c - 400, c + 400, 10.0)], 120.0)
+    dmin = min(b - a for a, b in zip(Y, Y[1:]))
+    need(dmin >= 5.0 - 1e-6, f"mirrored mesh has a {dmin} um cell")
+    X = r3.mesh_axis(0.0, 4000.0, [1000.0, 1001.0, 1000.4, 2000.0, 2000.2], [(900, 2100, 12.0)], 120.0)
+    dmin2 = min(b - a for a, b in zip(X, X[1:]))
+    need(dmin2 >= 5.0 - 1e-6, f"fixed lines 1 um apart kept: {dmin2} um cell")
+    # the cost gate: refused before any solve (openEMS is not even looked up), with the estimate
+    d = out_dir("cost")
+    b = boards_em.hier_lane(d, name="cost", prefix="")
+    rc, so, se, res, _ = region(b, {"name": "cap", "nets": LANE, "box": CAP_BOX, "max_hours": 0.001},
+                                unset=("OPENPCBSI_OPENEMS_PYTHON",))
+    pr = (res or {}).get("preflight", {}).get("problems", [])
+    need(rc == 2 and any("predicted" in p and "max_hours" in p for p in pr) and not (res or {}).get("ran"),
+         f"a run over max_hours was not refused before solving: rc {rc}, {pr}, {(se or so)[-300:]}")
+    est = res.get("estimate") or {}
+    need(est.get("grids") and all(g["dt_fs"] > 1.0 for g in est["grids"]), f"no estimate: {est}")
+    need("refused before solving" in (res.get("verdict") or "") and "region verdict" in so, f"no verdict: {res.get('verdict')}")
+    return f"mirrored min cell {dmin:.1f} um, fixed-line min cell {dmin2:.1f} um; refused at {est['hours']} h > 0.001 h, time step {est['grids'][0]['dt_fs']} fs"
+
+
+def t_em_lanes():
+    """3D lanes: multi-segment routes connect; a break, a pair cut by a box corner, a diagonal port are refused; a turned frame boxes a diagonal pair; a lane ending on a pad gets its termination"""
+    d = out_dir("lanes")
+    spec = {"name": "cap", "nets": LANE, "box": CAP_BOX, "preflight_only": True}
+    b = boards_em.hier_lane(d, name="lane", prefix="")
+    rc, so, se, res, _ = region(b, spec)
+    need(res and rc == 0 and res["path_connected"] is True, f"a multi-segment lane reads as not connected: {(res or {}).get('path_by_net')}")
+    b = boards_em.broken_lane(d)
+    rc, so, se, res, _ = region(b, spec)
+    pr = (res or {}).get("preflight", {}).get("problems", [])
+    need(rc == 2 and any("not connected" in p and "LANE0_RXC_P" in p for p in pr), f"a broken lane was not refused: rc {rc}, {pr}")
+    b = boards_em.diagonal_pair(d)
+    dn = ["DIAG_P", "DIAG_N"]
+    rc, so, se, res, _ = region(b, {"name": "diag", "nets": dn, "box": [14, 6, 21, 13], "preflight_only": True})
+    pr = (res or {}).get("preflight", {}).get("problems", [])
+    need(rc == 2 and any("45 degrees" in p for p in pr), f"a 45-degree port was not refused: rc {rc}, {pr}")
+    rc, so, se, res, _ = region(b, {"name": "diag_corner", "nets": dn, "box": [14, 4, 18.1, 10], "preflight_only": True})
+    pr = (res or {}).get("preflight", {}).get("problems", [])
+    need(rc == 2 and any("different sides" in p for p in pr), f"a pair cut by a box corner was not refused: rc {rc}, {pr}")
+    rc, so, se, res, _ = region(b, {"name": "diag_turned", "nets": dn, "box": [14, 6, 21, 13], "rotate_deg": -45, "preflight_only": True})
+    need(res and rc == 0 and res["preflight"]["ok"] and res["path_connected"] is True,
+         f"the turned frame does not box the diagonal pair: rc {rc}, {(res or {}).get('preflight', {}).get('problems')}")
+    b = boards_em.pad_end(d)
+    rc, so, se, res, _ = region(b, {"name": "end", "nets": ["END_P", "END_N"], "box": [12, 5, 24, 15], "preflight_only": True})
+    t = (res or {}).get("terminations") or []
+    need(res and rc == 0 and len(t) == 2 and all(x["R"] == 50.0 and x["ref"] == "J1" for x in t),
+         f"the lane ending on J1 has no termination: rc {rc}, {t}, {(res or {}).get('preflight', {}).get('problems')}")
+    rc, so, se, res2, _ = region(b, {"name": "end_open", "nets": ["END_P", "END_N"], "box": [12, 5, 24, 15], "terminate": False,
+                                     "preflight_only": True})
+    pr = (res2 or {}).get("preflight", {}).get("problems", [])
+    need(rc == 2 and any("not connected" in p for p in pr), f"an open-ended model was not refused: rc {rc}, {pr}")
+    return f"broken, corner-cut and diagonal-port models refused; turned frame passes; J1 terminated {[(x['pad'], x['ref_layer']) for x in t]}"
+
+
+TESTS = [t_em_names, t_em_preflight_crossings, t_em_fit, t_em_grid_reuse, t_em_pad_void, t_no_user_paths, t_em_mesh_cost,
+         t_em_lanes]
 SLOW = [t_em_grid_reuse_openems]
 
 

@@ -6,7 +6,8 @@ KiCad's: it reads the model written by region3d.py and writes the port waves.
 Units are um. Copper: tracks and pads as PEC prisms of their thickness (zero-thickness conducting
 sheets with the copper's conductivity when the model is lossy); planes as sheets, holes and islands by
 nested priority (no polygon library needed); vias as cylinders with pads. Ports: openEMS MSLPorts on
-the synthetic lead-ins, fed beyond the PML, measured at the box edge.
+the synthetic lead-ins, fed beyond the PML, measured at the box edge; terminations (a region net that ends
+on a pad in the box) as lumped ports from the reference plane to the pad.
 """
 import json
 import math
@@ -66,12 +67,13 @@ def main(mp, od, threads):
             CSX.AddMaterial(f"hole{nh}", epsilon=er_at(z)).AddPolygon(pts, "z", z, priority=s["prio"])
             continue
         outer = z >= ztop - 1e-3 or z <= zbot + 1e-3
-        if s["kind"] in ("track", "pad") and s["thick"] > 0 and not m["lossy"] and outer:   # inner copper: sheets
+        if s["kind"] in ("track", "pad") and s["thick"] > 0 and not m["lossy"] and (outer or s.get("thick_inner")):
+            # outer copper, and the region's own inner copper, with its thickness; other inner copper: sheets
             t = s["thick"]
             z0 = z if z >= ztop - 1e-3 else (z - t if z <= zbot + 1e-3 else z - t / 2)
             pec.AddLinPoly(pts, "z", z0, t, priority=s["prio"])
             # conformal solder mask over the copper's top face, as the 2D solver has it
-            mk = [k for k in m["mask"] if (k["z0"] >= z - 1e-3) == (z >= ztop - 1e-3)]
+            mk = [k for k in m["mask"] if (k["z0"] >= z - 1e-3) == (z >= ztop - 1e-3)] if outer else []
             if mk:
                 # the copper's top face and sidewalls: the outline grown by the mask thickness, from the
                 # copper's base to t_mask over its top (the copper, higher priority, keeps its own volume)
@@ -124,9 +126,13 @@ def main(mp, od, threads):
         port = FDTD.AddMSLPort(p["n"], pec, start, stop, d, "z", excite=p["excite"], FeedShift=feed,
                                MeasPlaneShift=L - 150.0, Feed_R=50.0, priority=80)
         P.append((p["n"], port))
+    # terminations: a lumped port from the reference plane up (or down) to the pad where a region net ends
+    for t in sorted(m.get("terms", []), key=lambda q: q["n"]):
+        port = FDTD.AddLumpedPort(t["n"], t["R"], t["start"], t["stop"], "z", excite=t.get("excite", 0.0), priority=80)
+        P.append((t["n"], port))
     os.makedirs(od, exist_ok=True)
     cells = len(X) * len(Y) * len(m["mesh"]["z"])
-    print(f"em3d: {cells} cells, {len(P)} ports", flush=True)
+    print(f"em3d: {cells} cells, {len(P)} ports ({len(m.get('terms', []))} terminations)", flush=True)
     sim = os.path.join(od, "sim")
     FDTD.Run(sim, cleanup=True, verbose=0, numThreads=int(threads))
     f = np.linspace(0, fmax, 401)
@@ -135,10 +141,15 @@ def main(mp, od, threads):
     for n, port in P:
         port.CalcPort(sim, f)                    # measured line impedance of the lead
         zref = np.array(port.Z_ref)
+        # how far the port's voltage has died away: its peak, and its largest value over the last tenth
+        # of the record (a run cut on the step limit is usable when every port is quiet by then)
+        ut = np.abs(np.array(port.ut_tot, float))
+        tail = float(ut[int(0.9 * len(ut)):].max()) if len(ut) > 10 else float("nan")
         port.CalcPort(sim, f, ref_impedance=50)
         out["ports"][str(n)] = {"a_re": np.real(port.uf_inc).tolist(), "a_im": np.imag(port.uf_inc).tolist(),
                                 "b_re": np.real(port.uf_ref).tolist(), "b_im": np.imag(port.uf_ref).tolist(),
-                                "zref_re": np.real(zref).tolist()}
+                                "zref_re": np.real(zref).tolist(), "u_peak": float(ut.max()) if len(ut) else 0.0, "u_tail": tail,
+                                "t_end_s": float(port.u_time[-1]) if len(port.u_time) else 0.0}
     json.dump(out, open(os.path.join(od, "ports.json"), "w"))
 
 

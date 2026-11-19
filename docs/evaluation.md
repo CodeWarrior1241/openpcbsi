@@ -120,7 +120,11 @@ pair_skew_ps = 1.0            # P/N skew limit (default: the interface standard'
 
 [em]
 fast_ghz = 3.0                # --em plan / run: classes at or above this get automatic 3D regions
+include_mm = 1.0              # other nets' copper beyond this from a region's own copper is left out (0: keep all)
 ```
+
+With `--em plan` the regions are planned and boxed, not solved: the FS9 check reads "not run" (it is
+solved, and judged against the `validate --3d` cases, only with `--em run`).
 
 Limits are taken, in this order, from: a `.kicad_dru` rule that covers the net; the board config;
 without a reviewed config, the interface standard the net's name maps to (`standards.py`); the
