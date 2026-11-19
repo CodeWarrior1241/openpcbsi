@@ -1232,7 +1232,9 @@ def t43_parts():
     paste = by("paste", "warn")
     need("U1" in paste and "IPC-7525" in paste["U1"]["basis"] and abs(paste["U1"]["value"] - 0.547) < 0.03, f"paste ratio: {paste}")
     need("C1" in by("footprint", "fail"), "the 0402 footprint with pads 1.4 mm apart is not failed")
-    sp = by("part_spacing", "warn")
+    # the assembler's spacing table is a recommendation: listed (info), not a warning
+    need(not by("part_spacing", "warn"), "part spacing below a recommendation is a warning")
+    sp = {k: v for k, v in by("part_spacing", "info").items() if "recommends" in v["reason"]}
     need(len(sp) == 1 and abs(next(iter(sp.values()))["limit"] - 0.15) < 1e-6, f"part spacing: {[f['reason'][:60] for f in sp.values()]}")
     asm = ev_findings(r["ev"], "assembly")
     need(any("U2" in f["refs"] and f["severity"] == "fail" and f["limit"] == 0.35 for f in asm), "the 0.3 mm pin pitch is not failed")
@@ -1506,7 +1508,7 @@ def t49_classes():
     need("nominal" in f1["basis"] and f1["limit"] == 1.0, f"footprint basis: {f1['basis']}, limit {f1['limit']}")
     nc = {u["ref"] for u in _rule(r["ev"], "part_spacing")["metrics"]["not_classified"]}
     need(not ({"U1", "U2", "U3"} & nc), f"not classified: {nc}")
-    sp = [f for f in ev_findings(r["ev"], "part_spacing", ("warn",)) if "U3" in f["reason"] and "C3" in f["reason"]]
+    sp = [f for f in ev_findings(r["ev"], "part_spacing", ("info",)) if "U3" in f["reason"] and "C3" in f["reason"]]
     need(len(sp) == 1 and abs(sp[0]["value"] + 0.4) < 0.05 and sp[0]["limit"] == 1.0, f"U3 body to C3: {[(f['value'], f['limit'], f['reason'][:90]) for f in sp]}")
     return ok("footprint fails only where the pads are beyond the EIA body; library and pad classification; spacing to the body 0.6 mm (QFN 1.0 mm) found")
 
