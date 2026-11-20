@@ -15,7 +15,8 @@ CHECK=0; [[ "${1:-}" == "--check" ]] && CHECK=1
 cd "$DEPS"
 export PIP_CACHE_DIR="$DEPS/.pip-cache" TMPDIR="$DEPS/tmp"
 mkdir -p "$PIP_CACHE_DIR" "$TMPDIR"
-val() { python3 -I -c "import tomllib; print(tomllib.load(open('$SRC/parsers.lock','rb'))['$1']['$2'])"; }
+# paths and keys go in as arguments, never into the Python text (a folder named with a ' broke it)
+val() { python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))[sys.argv[2]][sys.argv[3]])' "$SRC/parsers.lock" "$1" "$2"; }
 if [[ "$DEPS" != "$SRC" && $CHECK == 0 ]]; then cp "$SRC/parsers.lock" "$DEPS/parsers.lock"; fi
 
 for p in kicad_monkey kicadfiles; do
@@ -45,8 +46,10 @@ fi
 [[ -d "$SITE" ]] || { echo "$DEPS/$SITE is missing: run setup_parsers.sh" >&2; exit 1; }
 python3 -I "$SRC/pins.py" site "$SITE" "$REQ"
 
-python3 -I -c "
-import sys; sys.path[:0] = '$SITE:$(val kicad_monkey python_path):$(val kicadfiles python_path)'.split(':')
+python3 -I -c '
+import sys; sys.path[:0] = sys.argv[1:4]
 import kicad_monkey.kicad_pcb_parser, kicadfiles, shapely, numpy
-print('kicad-monkey', '$(val kicad_monkey version)', 'kicadfiles', '$(val kicadfiles version)',
-      'shapely', shapely.__version__, 'numpy (host)', numpy.__version__, 'ok in', '$DEPS')"
+print("kicad-monkey", sys.argv[4], "kicadfiles", sys.argv[5], "shapely", shapely.__version__,
+      "numpy (host)", numpy.__version__, "ok in", sys.argv[6])' \
+  "$SITE" "$(val kicad_monkey python_path)" "$(val kicadfiles python_path)" \
+  "$(val kicad_monkey version)" "$(val kicadfiles version)" "$DEPS"

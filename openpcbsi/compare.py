@@ -10,7 +10,7 @@ import math
 import os
 
 from . import report as rep
-from .run import RUNS, _jd, run_checks
+from .run import DETECTED, RUNS, _jd, run_checks
 
 LOWER = ("overshoot", "ringback", "rl_nyq", "uncovered", "crossings", "worst_return", "stub_mm", "uncoupled", "violation", "skew", "drop_mv",
          "drop_pct", "max_ratio", "max_z", "next", "fext", "max_stitch_gap", "max_edge_gap", "dangling",
@@ -181,7 +181,8 @@ def write_html(out, od, charts):
                     num=("findings_A", "findings_B", "better", "worse", "changed")))
     if charts:
         H.append("<h2>PDN impedance, A against B</h2><div class=grid>" + "".join(
-            f"<img src='{p}' alt='impedance of {k}, A and B' loading=lazy>" for k, p in charts.items()) + "</div>")
+            f"<img src='{html.escape(p, quote=True)}' alt='impedance of {html.escape(k, quote=True)}, A and B' loading=lazy>"
+            for k, p in charts.items()) + "</div>")
     for k, c in out["checks"].items():
         rows = sorted([r for r in c["rows"] if r["verdict"] != "changed"], key=lambda r: (r["verdict"] != "worse", -abs(r["delta"])))
         if not rows:
@@ -202,8 +203,12 @@ def rediff(run_a, run_b, label=None, log=print):
     # report.json holds paths relative to its run folder (openpcbsi.paths)
     res = lambda run, p: p if (not p or os.path.isabs(p)) else os.path.normpath(os.path.join(run, p))
     for run_, r_ in ((run_a, ra), (run_b, rb)):
-        r_["board"], r_["config"] = res(run_, r_["board"]), res(run_, r_["config"])
-    ba, bb = load(ra["board"], ra["config"])[0], load(rb["board"], rb["config"])[0]
+        r_["board"] = res(run_, r_["board"])
+        # a run without a config file records "detected from the board": detected again here, not a path
+        r_["config_file"] = None if r_["config"] == DETECTED else res(run_, r_["config"])
+        if r_["config_file"] is not None:
+            r_["config"] = r_["config_file"]
+    ba, bb = load(ra["board"], ra["config_file"])[0], load(rb["board"], rb["config_file"])[0]
     if ra["config_hash"] != rb["config_hash"]:
         raise SystemExit("G15: the two runs used different configurations")
     common, renamed, only_a, only_b = match_nets(ba, bb)

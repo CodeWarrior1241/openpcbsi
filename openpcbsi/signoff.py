@@ -13,17 +13,17 @@ verify-signoff checks, in turn:
 - every field that follows from the hashed evaluation (exit code, counts, checks, families, blockers,
   verdict): a record whose verdict, blockers or counts were edited does not verify;
 - with --allowed-signers, the record's SSH signature (signoff.json.sig, written with --sign-key):
-  only that authenticates the record as a whole and the reviewer's name. A record and an evaluation
+  only that authenticates the record as a whole and the reviewer's name; a record without one fails. A record and an evaluation
   edited together, consistently, are caught only by the signature, or by --rerun;
 - with --rerun, the board is evaluated again with the recorded config and waivers and the verdict
-  compared.
+  compared, in this process (never a child `python -m openpcbsi`, which would import an openpcbsi/
+  folder from the working directory first).
 """
 import datetime
 import hashlib
 import json
 import os
 import subprocess
-import sys
 import tempfile
 
 from . import __version__
@@ -198,25 +198,28 @@ def verify(path, allowed_signers=None, rerun=False):
             notes.append(f"signed by '{ident}' ({(s.stdout or '').strip()[-120:]})")
     elif os.path.exists(sig):
         notes.append("signed, but no --allowed-signers given: the signature was not checked")
+    elif allowed_signers:
+        # asking for a signature check and getting none is a failure: deleting the .sig must not turn a
+        # forged record into an unsigned one that passes
+        bad.append(f"--allowed-signers given, but the record has no signature ({os.path.basename(sig)} is missing)")
     else:
         notes.append("unsigned: the reviewer's name and the record as a whole are not authenticated (sign with --sign-key)")
     if rerun and not bad:
+        # in this process, with this openpcbsi: a child `python -m openpcbsi` would put the working folder
+        # first on its import path, and a received folder could carry its own openpcbsi/ to be run
+        from . import evaluate
         with tempfile.TemporaryDirectory() as td:
             a = rec.get("evaluate_args") or {}
-            cmd = [sys.executable, "-m", "openpcbsi", "evaluate", board, "-o", td, "--no-markers"]
-            if cfg:
-                cmd += ["-c", cfg]
-            if rec.get("waivers"):
-                cmd += ["--waivers", _abs(rec["waivers"]["path"], base)]
-            for k in ("families", "checks", "stage"):
-                if a.get(k):
-                    cmd += [f"--{k}", str(a[k])]
-            if a.get("no_drc"):
-                cmd.append("--no-drc")
-            r = subprocess.run(cmd, capture_output=True, text=True)
+            try:
+                evaluate.run(board, cfg_path=cfg, waivers=_abs(rec["waivers"]["path"], base) if rec.get("waivers") else None,
+                             families=a.get("families") or None, checks=str(a["checks"]).split(",") if a.get("checks") else None, out_dir=td,
+                             markers=False, drc=not a.get("no_drc"), log=lambda *x, **k: None, stage=a.get("stage") or None)
+                err = None
+            except (Exception, SystemExit) as e:
+                err = f"{type(e).__name__}: {e}"
             ev2p = os.path.join(td, "evaluation.json")
             if not os.path.exists(ev2p):
-                bad.append(f"--rerun: the evaluation could not run (exit {r.returncode})")
+                bad.append(f"--rerun: the evaluation could not run ({err or 'no evaluation written'})")
             else:
                 ev2 = json.load(open(ev2p))
                 if ev2["exit_code"] != rec["exit_code"] or ev2["counts"].get("fail") != rec["counts"].get("fail"):

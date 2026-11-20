@@ -106,7 +106,8 @@ def z_chart(rail, out_dir, other=None, labels=("A", "B")):
     ax.set_ylabel("|Z| at the load balls (mOhm)")
     ax.set_title(f"{rail['rail']}: PDN impedance", color=INK, loc="left")
     fig.tight_layout()
-    p = os.path.join(out_dir, f"pdn_{rail['rail']}.png")
+    from .si import inside, safe_name           # a rail name from a config is any text: never a path
+    p = inside(out_dir, os.path.join(out_dir, f"pdn_{safe_name(rail['rail'])}.png"))
     fig.savefig(p, dpi=110)
     plt.close(fig)
     return os.path.basename(p)
@@ -290,7 +291,8 @@ def write_html(report, out_dir, images, zcharts):
                      resonances_mhz=[round(q["f_hz"] / 1e6, 1) for q in x.get("resonances", [])]) for x in r["rails"]]
         H.append(_t(rows, ["rail", "caps", "target_ohm", "max_Z_ohm", "f_at_max_hz", "max_ratio", "resonances_mhz", "add", "met", "removable"],
                     num=("caps", "target_ohm", "max_Z_ohm", "f_at_max_hz", "max_ratio")))
-        H.append("<div class=grid>" + "".join(f"<img src='{p}' alt='impedance of {n}' loading=lazy>" for n, p in zcharts.items()) + "</div>")
+        H.append("<div class=grid>" + "".join(f"<img src='{html.escape(p, quote=True)}' alt='impedance of {html.escape(n, quote=True)}' "
+                                              "loading=lazy>" for n, p in zcharts.items()) + "</div>")
     if c.get("crosstalk"):
         r = c["crosstalk"]
         H.append(f"<h2>G4 crosstalk <span class=chip>{r['validation']}</span></h2>")
@@ -302,7 +304,7 @@ def write_html(report, out_dir, images, zcharts):
         H.append(f"<p>Total {r['total_w']} W ({r['joule_w']} W I²R of the rails). Board maximum {r['T_max_c']} C.</p>")
         H.append(_t(r["parts"], ["ref", "power_w", "T_board_c", "theta_jb", "Tj_est_c"], num=("power_w", "T_board_c", "theta_jb", "Tj_est_c")))
         if r.get("image"):
-            H.append(f"<img src='{r['image']}' alt='temperature map' loading=lazy style='max-width:560px'>")
+            H.append(f"<img src='{html.escape(str(r['image']), quote=True)}' alt='temperature map' loading=lazy style='max-width:560px'>")
     for key in ("vias", "si", "emc"):
         if c.get(key):
             r = c[key]

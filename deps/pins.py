@@ -13,7 +13,8 @@ install with --only-binary :all:, so no sdist is built (a build would fetch unha
 --check regenerates in memory and reports a difference instead of writing.
 
 site: the distributions installed in SITE must be exactly the pins (same names, same versions, none
-missing, none extra), and every installed file must still match the SHA-256 in its RECORD
+missing, none extra), every installed file must still match the SHA-256 in its RECORD, and no
+file may be there that no package's RECORD lists
 (byte-code caches excepted: the interpreter rewrites them).
 
 sdist: the sdist named by parsers.lock's `sdist_url` is fetched (cached in DEPS/.pip-cache/sdist) and
@@ -189,20 +190,22 @@ def read_txt_pins(path):
     return pins
 
 
-def record_problems(site, dist_info):
+def record_problems(site, dist_info, listed=None):
     bad, n = [], 0
     rec = os.path.join(site, dist_info, "RECORD")
     if not os.path.exists(rec):
         return [f"{dist_info}: no RECORD"], 0
     for row in csv.reader(open(rec, newline="")):
-        if len(row) < 2 or not row[1] or row[0].endswith(".pyc"):
-            continue                # byte-code caches: the interpreter rewrites them (PySide6 ships some)
-        n += 1
-        path = os.path.normpath(os.path.join(site, row[0]))
-        m = re.fullmatch(r"(?:\.\./)+bin/([^/]+)", row[0])
+        path = os.path.normpath(os.path.join(site, row[0])) if row else ""
+        m = re.fullmatch(r"(?:\.\./)+bin/([^/]+)", row[0]) if row else None
         if m and not os.path.exists(path):
             # pip --target writes RECORD for scripts relative to its build prefix; they land in SITE/bin
             path = os.path.join(site, "bin", m.group(1))
+        if listed is not None and path:
+            listed.add(os.path.normpath(path))
+        if len(row) < 2 or not row[1] or row[0].endswith(".pyc"):
+            continue                # byte-code caches: the interpreter rewrites them (PySide6 ships some)
+        n += 1
         algo, _, want = row[1].partition("=")
         if not os.path.exists(path):
             bad.append(f"{row[0]} missing")
@@ -236,10 +239,18 @@ def cmd_site(args):
         if want[n] != have[n]:
             problems.append(f"version: {n} is {have[n]}, pinned {want[n]}")
     nfiles = 0
+    listed = set()
     for n in sorted(have):
-        bad, k = record_problems(site, info[n])
+        bad, k = record_problems(site, info[n], listed)
         nfiles += k
         problems += [f"{n}: {b}" for b in bad]
+    # a file no installed package lists (a planted module would be imported like any other): an extra
+    for root, dirs, files in os.walk(site):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for f in files:
+            fp = os.path.normpath(os.path.join(root, f))
+            if fp not in listed and not f.endswith(".pyc"):
+                problems.append(f"not listed by any package: {os.path.relpath(fp, site)}")
     for p in problems:
         print(f"  {p}", file=sys.stderr)
     if problems:

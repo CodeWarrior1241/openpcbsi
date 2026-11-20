@@ -83,8 +83,11 @@ version, and the board has to be saved as KiCad 10.0 first.
 ```sh
 git clone https://github.com/CodeWarrior1241/openpcbsi.git
 cd openpcbsi
+deps/setup_parsers.sh                     # the pinned file parsers, checked against their releases (once)
 python3 -m openpcbsi evaluate path/to/board.kicad_pcb
 ```
+
+KiCad 10's `kicad-cli` must be on the `PATH`; see Requirements above.
 
 1. **Evaluate with no configuration.** openpcbsi detects the board's signal classes, BGA and
    connector fields, and power rails from the netlist and footprints. It runs every check and
@@ -262,10 +265,29 @@ Before anything is solved, the pre-flight refuses a model that would give no usa
 - a pair whose legs leave the box on different sides (a box corner cuts it), or a port whose track
   crosses the box edge more than 10 degrees off square;
 - copper that ends in or runs along the absorbing boundary (see the pre-flight's own text);
-- a run predicted to stop on the time-step limit before the excitation has passed, or that could take
-  longer than `max_hours`: the time step follows the smallest mesh cell (no two lines are closer than
-  5 um), each run's step limit is 4 times the steps its excitation needs, and the speed is this
-  machine's own from its last finished grids (350 Mcells/s until it has some), so the bound holds.
+- a run predicted to stop on the time-step limit before the excitation has passed, or predicted to take
+  longer than `max_hours` at this machine's median speed over its last finished grids (350 Mcells/s
+  until it has some): the time step follows the smallest mesh cell (no two lines are closer than 5 um)
+  and each run's step limit is 4 times the steps its excitation needs. The worst case (every run to its
+  step limit, at the slowest measured speed) is logged.
+
+While it runs, openEMS's field energy is watched: a grid whose energy grows a hundredfold after it has
+decayed (an FDTD instability, which only grows) is stopped at once and solved again, once, at 0.9 of its
+cell size (an instability belongs to one mesh: on the revision D board one region's grid was unstable at
+full size and stable at 0.9, and in a larger box with either absorber thickness). A region still running
+at `max_hours` is stopped there (time spent waiting for a job slot does not count), and the fine grid is
+not started when the coarse grid's measured time says it would pass `max_hours`. A region stopped has no
+answer, and says why.
+
+`evaluate --em run` solves the regions and their fix variants as many at a time as there are openEMS
+job slots (`OPENPCBSI_JOB_SLOTS`, default one per 16 cores). A fix variant is planned only where it
+adds something: return vias only where the board has none within 1 mm of the layer change, placed
+0.6-1.0 mm away and clear of every other net's via, track and pad (an added via has a pad only on its
+own net's planes and a clearance hole in every other plane); a cut-out only where the board has none.
+
+Two grids are accepted when they agree on the TDR's shape within 2 % of the line, or, when they differ
+more, when each grid's excursion plus their difference stays under the 10 % limit FS9 judges against:
+both then give the same verdict (recorded as agreed on the verdict, not the shape).
 
 A run that stops on its step limit (a plane fragment that keeps ringing, which the board's decoupling
 would damp) is accepted when every port's voltage over the last tenth of the run is at least 50 dB
@@ -288,11 +310,24 @@ layout's. The TDR excursion (`tdr_excursion`) is read inside the box, past the n
 of the far one, against the model's calibrated line or else the 2D impedance of the same geometry; it is
 what the planner's FS9 findings judge.
 
-A region runs on two grids and is accepted only when both runs settle and agree. The grids must agree on the shape of the TDR (each normalised to its own
-port reading) within 2 % and on the line impedance within 3 %. The absolute level of a 3D run moves with
-the mesh by up to about 2.5 % (on one pair, three grids gave 98.95, 101.09 and 99.9 ohm against 99.6 ohm
-in 2D), so that level is checked against the 2D solver instead: the model's line is compared with 2D
-for the same geometry, and the TDR is renormalised to it when they differ by more than 2 %.
+A region runs on two grids, and the grids are compared on what the region reports, never on the whole
+trace or on each grid's own port reading (the zero-thickness port lead's level moves by up to about 3 %
+with the mesh; late time is multiple reflections between the model's ports):
+- the TDR excursion inside the box's window, both grids against the same reference (the 2D impedance of
+  the same geometry), and the same in-box reflections time-gated and seen with the link's own edge (the
+  class's `rise_ps`, or 0.15 / `nyquist_ghz`: 30 % of a bit, stated as an assumption);
+- the transmission at the link's Nyquist (`nyquist_ghz`), in dB.
+They agree when every excursion matches within the larger of 1.5 percentage points and 15 % of its size,
+and the transmission within the larger of 0.1 dB and 15 %. When they do not, the region still stands if
+both grids put it on the same side of the 10 % TDR limit (the spread is reported beside it); when they
+straddle the limit, a third, finer grid decides, if `max_hours` allows. A region whose grids both stay
+within 5 % and whose return loss is under the model's own floor is a pass: clean, below the model's
+resolution. FS9 judges each region at its link's own edge when its class gives a rate. The gate keeps
+about 1 % of the near and far leads' steps (their Gaussian tails), which bounds what it can resolve.
+
+The absolute level of a 3D run moves with the mesh by up to about 2.5 % (on one pair, three grids gave
+98.95, 101.09 and 99.9 ohm against 99.6 ohm in 2D), so that level is checked against the 2D solver: the
+model's line is compared with 2D for the same geometry when the box holds a uniform run long enough.
 
 Parts between region nets: a resistor is a lumped resistor; a capacitor too large to charge within the
 run (any AC-coupling capacitor) is modelled as its metal body bridging the pads, since in band it is a

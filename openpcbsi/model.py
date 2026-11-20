@@ -135,6 +135,8 @@ class Board:
         self.layers = self.stack.names
         self.L = self.stack.index
         self.net_names = [""] + sorted(snap["nets"].keys())
+        from .paths import known_names            # written reports must not take these for paths
+        known_names(self.net_names)
         self.net_id = {n: i for i, n in enumerate(self.net_names)}
         self.kicad_class = {n: v["netclass"] for n, v in snap["nets"].items()}
 

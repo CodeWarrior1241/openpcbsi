@@ -26,7 +26,9 @@ def use():
     for p in (lk["site"]["dir"], lk["kicad_monkey"]["python_path"], lk["kicadfiles"]["python_path"]):
         path = os.path.join(DEPS, p)
         if not os.path.isdir(path):
-            raise RuntimeError(f"{path} is missing: run deps/setup_parsers.sh")
+            from ..snapshot import InputError     # reported as a message, not a traceback
+            raise InputError(f"the board file parsers are not set up ({path} is missing): run deps/setup_parsers.sh "
+                             "once from the repository (see README, Quick start)")
         if path not in sys.path:
             sys.path.insert(0, path)
     return lk

@@ -66,14 +66,14 @@ def evaluate(board, *args, env=None):
     return {"rc": rc, "out": so, "err": se, "ev": _load(os.path.join(out, "evaluation.json")), "dir": out}
 
 
-def region(board, spec, env=None, unset=(), fname="region.toml"):
+def region(board, spec, env=None, unset=(), fname="region.toml", timeout=1800):
     """`openpcbsi region BOARD SPEC.toml` with `spec` (a dict) as the [region] table."""
     def val(v):
         return json.dumps(v)
     path = os.path.join(os.path.dirname(board), fname)
     with open(path, "w") as fh:
         fh.write("[region]\n" + "".join(f"{k} = {val(v)}\n" for k, v in spec.items() if not isinstance(v, dict)))
-    rc, so, se = cli(["region", board, path], env=env, unset=unset)
+    rc, so, se = cli(["region", board, path], env=env, unset=unset, timeout=timeout)
     m = re.search(r"region result: (\S+)", so)
     return rc, so, se, (_load(m.group(1)) if m else None), (m.group(1) if m else None)
 
@@ -443,9 +443,123 @@ def t_em_lanes():
     return f"broken, corner-cut and diagonal-port models refused; turned frame passes; J1 terminated {[(x['pad'], x['ref_layer']) for x in t]}"
 
 
+def t_em_variants_and_stops():
+    """3D variants and stops: a fix variant only where the board lacks the fix, return vias clear of other copper, an added via on another net refused; an unstable or overlong solve is stopped"""
+    sys.path.insert(0, os.path.dirname(HERE))
+    from openpcbsi import region3d as r3
+    d = out_dir("variants")
+    # the runner's watch on openEMS's output: a stand-in that prints energy lines
+    prog = ("import sys, time\n"
+            "for e in sys.argv[1].split(','):\n"
+            "    print(f'[@ 1s] Timestep: 1 || Speed: 1 MC/s || Energy: ~{float(e):.3e} (- 0.00dB)', flush=True)\n"
+            "    time.sleep(float(sys.argv[2]))\n")
+    grow = ",".join(str(x) for x in [0, 1e-14, 1e-16, 1e-17, 2e-17, 1e-16, 1e-15, 1e-13, 1e-11, 1e-9])
+    rc, txt, stopped = r3._solve([sys.executable, "-c", prog, grow, "0"], dict(os.environ), None)
+    need(stopped == "unstable" and "1.000e-13" in txt and "1.000e-11" not in txt, f"growing energy not stopped at once: {stopped}")
+    ring = ",".join(str(x) for x in [0, 1e-14, 1e-16, 2e-17, 3e-17, 2e-17, 1.5e-17, 1e-17])
+    rc, txt, stopped = r3._solve([sys.executable, "-c", prog, ring, "0"], dict(os.environ), None)
+    need(stopped is None and rc == 0, f"a decaying, wobbling energy was stopped: {stopped}")
+    t0 = time.time()
+    rc, txt, stopped = r3._solve([sys.executable, "-c", prog, ",".join(["1e-16"] * 100), "1"], dict(os.environ), time.time() + 3)
+    need(stopped == "time" and time.time() - t0 < 20, f"the deadline did not stop the run: {stopped}, {time.time() - t0:.0f} s")
+    # the planner: variants only where the board lacks the fix
+    b = boards_em.hier_lane(d, name="plain", prefix="")
+    r = evaluate(b, "--checks", "drc", "--no-drc", "--em", "plan")
+    jl, jc = job(r["ev"], "layer_change"), job(r["ev"], "series_cap")
+    need(jl.get("variant") and jc.get("variant"), f"variants missing on a board without the fixes: {jl.get('variant_skipped')}, {jc.get('variant_skipped')}")
+    vias = [(34.0, 9.465), (34.0, 10.535)]
+    for v in jl["variant"]["add_vias"]:
+        dmin = min(((v[0] - a) ** 2 + (v[1] - c) ** 2) ** 0.5 for a, c in vias)
+        need(0.6 - 1e-6 <= dmin <= 1.0 + 1e-6 and len(v) == 4, f"return via {v} {dmin:.2f} mm from the signal vias")
+    b2 = boards_em.returned_lane(d)
+    r2 = evaluate(b2, "--checks", "drc", "--no-drc", "--em", "plan")
+    jl2 = job(r2["ev"], "layer_change")
+    need(not jl2.get("variant") and "already has 2 return via" in (jl2.get("variant_skipped") or ""), f"{jl2.get('variant_skipped')}")
+    b3 = boards_em.pad_void(d, slot_x=0)
+    r3_ = evaluate(b3, "--checks", "drc", "--no-drc", "--em", "plan")
+    jc3 = job(r3_["ev"], "series_cap")
+    need(not jc3.get("variant") and "already has the cut-out" in (jc3.get("variant_skipped") or ""), f"{jc3.get('variant_skipped')}")
+    # an added via on another net's via: refused before solving
+    spec = {"name": "via_bad", "nets": ["LANE0_RXC_P", "LANE0_RXC_N"], "box": [30.65, 6.665, 37.35, 13.335], "preflight_only": True}
+    rc, so, se, res, _ = region(b, dict(spec))
+    path = os.path.join(os.path.dirname(b), "bad.toml")
+    with open(path, "w") as fh:
+        fh.write("[region]\n" + "".join(f"{k} = {json.dumps(v)}\n" for k, v in spec.items())
+                 + "[region.variant]\nname = \"return vias\"\nadd_vias = [[34.2, 9.465, 0.4, 0.2]]\n")
+    rc2, so2, se2 = cli(["region", b, path])
+    m = re.search(r"region result: (\S+)", so2)
+    res2 = _load(m.group(1)) if m else None
+    pr = (res2 or {}).get("preflight", {}).get("problems", [])
+    need(res and res["preflight"]["ok"], f"the as-built via box fails: {(res or {}).get('preflight')}")
+    need(rc2 == 2 and any("added via" in p and "overlaps" in p for p in pr), f"an added via on the signal via was not refused: rc {rc2}, {pr}")
+    return (f"unstable and overlong solves stopped; variants on the plain board; skipped where the board has return vias "
+            f"({jl2['variant_skipped'][:40]}...) and cut-outs; overlapping added via refused")
+
+
+def t_em_grid_agreement():
+    """3D grids are compared on what is reported: the six rev D regions' grids (three wrongly rejected before) are accepted, grids that straddle the limit are undecided; the gated TDR keeps the box and drops the leads; a net is judged at its class's edge"""
+    sys.path.insert(0, os.path.dirname(HERE))
+    import numpy as np
+    from openpcbsi import region3d as r3, tdr as T
+    # the in-box excursions against 2D of each grid, from the revision D run (em/openpcbsi_FS_convergence_recommendations.md)
+    good = {"via_FMC_GBTCLK0_M2C_P": ([-2.3, 3.4], [-2.2, 2.7]), "cap_C83": ([1.3, 3.7], [1.1, 3.0]), "cap_C85": ([-4.5, 2.4], [-4.4, 1.7]),
+            "launch_J1": ([-6.8, 0.1], [-6.5, 0.2]), "split_LA25": ([2.2, 6.9], [1.3, 6.4]), "breakout_LA02": ([-21.7, 12.3], [-21.4, 13.7])}
+    for name, (a, b) in good.items():
+        r = r3.grid_agreement({"exc": a, "net": None, "s21": -0.10}, {"exc": b, "net": None, "s21": -0.11})
+        need(r["converged"] and r["agreed_on"] == "result", f"{name}: grids that agree were not accepted: {r}")
+    r = r3.grid_agreement({"exc": [-4.0, 8.5], "net": None, "s21": None}, {"exc": [-4.2, 12.0], "net": None, "s21": None})
+    need(not r["converged"] and r["undecided"], f"grids straddling the 10 % limit were accepted: {r}")
+    r = r3.grid_agreement({"exc": [-20.0, 30.0], "net": None, "s21": None}, {"exc": [-12.0, 16.0], "net": None, "s21": None})
+    need(r["converged"] and r["agreed_on"] == "decision", f"grids far apart but both beyond the limit: {r}")
+    r = r3.grid_agreement({"exc": None, "net": None, "s21": -0.192}, {"exc": None, "net": None, "s21": -0.166})
+    need(r["converged"] and r["agreed_on"] == "transmission", f"a box too short for a TDR window, transmission agreeing: {r}")
+    # the gated TDR on a known line: 2 mm of 90 ohm in 100 ohm, leads of 110 ohm at both ends
+    c = 3e8 / 2.0
+    f = np.linspace(0, 20e9, 401); f[0] = 1e6
+    z = np.full_like(f, 110.0, complex)
+    for Zs, L in reversed([(100, 3e-3), (90, 2e-3), (100, 5e-3)]):
+        bb = 2 * np.pi * f * L / c
+        z = Zs * (z + 1j * Zs * np.tan(bb)) / (Zs + 1j * z * np.tan(bb))
+    s11 = (z - 100) / (z + 100)
+    tl = 2 * 10e-3 / c * 1e12
+    tg, zg = T.gated_tdr(f, s11, 100.0, (21, tl - 21), 35e-12)
+    t, zu = T.tdr(f, s11, 100.0, 35e-12)
+    need(abs(zg.min() - zu[(t > 21e-12) & (t < (tl - 21) * 1e-12)].min()) < 1.0 and zg.max() < 102.0,
+         f"gated TDR: dip {zg.min():.1f} vs {zu.min():.1f} ohm, max {zg.max():.1f} (the far 110 ohm lead must be gone)")
+    tg2, zg2 = T.gated_tdr(f, s11, 100.0, (21, tl - 21), 35e-12, rise_out=190e-12)
+    need(zg2.min() > zg.min() + 3.0, f"a slower edge does not soften the dip: {zg2.min():.1f} vs {zg.min():.1f}")
+    # the link's rate from its net class
+    d = out_dir("rate")
+    b = boards_em.hier_lane(d, name="rate", prefix="")
+    from openpcbsi import run as runmod
+    _, cfg, ctx = runmod.load(b, {"classes": {"lvds": {"patterns": ["LANE0_*"], "nyquist_ghz": 0.8}}})
+    fn, rise, src = r3.net_rate(ctx, LANE)
+    need(fn == 0.8e9 and abs(rise - 187.5) < 0.1 and "lvds" in src, f"link rate {fn}, {rise}, {src}")
+    return (f"six rev D regions accepted on their numbers, a straddle undecided; gated dip {zg.min():.1f} ohm (ungated "
+            f"{zu.min():.1f}), at 190 ps {zg2.min():.1f}; LVDS class: {rise:.0f} ps edge")
+
+
+def t_em_good_structures():
+    """3D good structures are accepted (openEMS): an AC-coupled pair over its pad cut-outs, and a layer change with its return vias"""
+    if not os.environ.get("OPENPCBSI_OPENEMS_PYTHON"):
+        return "blocked: OPENPCBSI_OPENEMS_PYTHON not set"
+    d = out_dir("good")
+    out = []
+    b = boards_em.pad_void(d, slot_x=0)
+    rc, so, se, res, _ = region(b, {"name": "good_caps", "nets": LANE, "box": [12.0, 6.0, 28.0, 14.0], "fmax_ghz": 10}, timeout=10800)
+    need(res and res.get("ran") and res["convergence"].get("converged"), f"the AC-coupled pair was not accepted: {(res or {}).get('convergence')}")
+    out.append(f"caps: {res['verdict'][:70]}")
+    b = boards_em.returned_lane(d)
+    rc, so, se, res, _ = region(b, {"name": "good_via", "nets": ["LANE0_RXC_P", "LANE0_RXC_N"], "box": [30.65, 6.665, 37.35, 13.335],
+                                    "fmax_ghz": 20}, timeout=10800)
+    need(res and res.get("ran") and res["convergence"].get("converged"), f"the layer change was not accepted: {(res or {}).get('convergence')}")
+    out.append(f"via: {res['verdict'][:70]}")
+    return "; ".join(out)
+
+
 TESTS = [t_em_names, t_em_preflight_crossings, t_em_fit, t_em_grid_reuse, t_em_pad_void, t_no_user_paths, t_em_mesh_cost,
-         t_em_lanes]
-SLOW = [t_em_grid_reuse_openems]
+         t_em_lanes, t_em_variants_and_stops, t_em_grid_agreement]
+SLOW = [t_em_grid_reuse_openems, t_em_good_structures]
 
 
 def main(argv):

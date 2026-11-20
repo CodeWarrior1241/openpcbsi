@@ -13,6 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CHECKOUT = os.path.isdir(os.path.join(ROOT, "boards")) or os.path.isdir(os.path.join(ROOT, ".git")) or \
     os.path.exists(os.path.join(ROOT, ".git"))
 _BASE = ROOT if _CHECKOUT else os.path.join(os.getcwd(), "openpcbsi")
+DETECTED = "detected from the board"   # what a report records as its config when none was given
 CACHE = os.environ.get("OPENPCBSI_CACHE") or os.path.join(_BASE, "cache")
 RUNS = os.environ.get("OPENPCBSI_RUNS") or os.path.join(_BASE, "runs")
 
@@ -95,7 +96,7 @@ def run_loaded(b, cfg, ctx, checks=None, out_dir=None, label=None, log=print, ru
     report = {
         "tool": "openpcbsi", "version": __import__("openpcbsi").__version__,
         "date": datetime.datetime.now().isoformat(timespec="seconds"),
-        "board": b.path, "board_sha256": b.sha, "label": label, "config": cfg.path or "detected from the board",
+        "board": b.path, "board_sha256": b.sha, "label": label, "config": cfg.path or DETECTED,
         "detected": getattr(cfg, "detected", None), "downgraded": b.snap.get("downgraded"),
         "kicad_file_version": b.snap.get("kicad_file_version") or snapshot.file_version(b.path),
         "zones_refilled": b.snap.get("zones_refilled"),

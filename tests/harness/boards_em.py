@@ -139,3 +139,12 @@ def pad_end(out, name="padend"):
     b.footprint("J1", "CONN", 20, 10, [{"num": 1, "net": "END_P", "dx": 0, "dy": -0.135, "sx": 0.2, "sy": 0.12},
                                        {"num": 2, "net": "END_N", "dx": 0, "dy": 0.135, "sx": 0.2, "sy": 0.12}])
     return b.save()
+
+
+def returned_lane(out, name="returned"):
+    """The lane with two GND vias 0.8 mm from its layer change at x = 34 (return vias the board already has)."""
+    b = _base(out, name)
+    _lane(b)
+    for y in (8.665, 11.335):
+        b.via(34.0, y, "GND")
+    return b.save()

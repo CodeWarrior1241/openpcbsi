@@ -410,9 +410,22 @@ def check_pages(name_or_path, fetch=None, timeout=60):
     prof = load(name_or_path)
     pages = prof.get("fab", {}).get("pages", {})
 
+    class _HttpsOnly(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not str(newurl).lower().startswith("https://"):
+                raise ValueError(f"redirected to {newurl}: only https:// pages are read")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+    # a profile is a file from someone else: only https:// is fetched (never file://, ftp:// or plain
+    # http://), redirects included, and no other URL handler is installed
+    opener = urllib.request.OpenerDirector()
+    for h in (urllib.request.HTTPSHandler(), _HttpsOnly(), urllib.request.HTTPErrorProcessor(), urllib.request.HTTPDefaultErrorHandler()):
+        opener.add_handler(h)
+
     def get(url):
+        if not str(url).lower().startswith("https://"):
+            raise ValueError(f"{url}: only https:// pages are read")
         req = urllib.request.Request(url, headers={"User-Agent": "openpcbsi-fab-check"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             return r.read().decode("utf-8", errors="replace")
     fetch = fetch or get
     texts, status = {}, {}

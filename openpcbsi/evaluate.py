@@ -529,17 +529,35 @@ def run(board, cfg_path=None, waivers=None, families=None, checks=None, out_dir=
                     findings.append(_f("em_region", "FS", "FS9", "info", msg, j["nets"], j.get("parts", []), extra=j["name"]))
         if em == "plan":                          # listed, not solved: not run (never "unvalidated")
             skipped["em_region"] = f"--em plan: {len(em_jobs)} regions planned, {nfit} with a box; solved only with --em run"
+        for j in em_jobs:
+            if j.get("variant_skipped"):
+                log(f"  {j['name']}: no fix variant: {j['variant_skipped']}")
         if em == "run":
             val["em_region"] = validate.status(runmod.CACHE, "em3d")
+            # every region and fix variant as its own task, as many at a time as there are openEMS job slots
+            # (jobs.slot gives each its share of the threads); results in plan order
+            from concurrent.futures import ThreadPoolExecutor
+            from . import jobs as jobs_mod
+            tasks = [(j, False) for j in em_jobs] + [(j, True) for j in em_jobs if j.get("variant")]
+
+            def solve(t):
+                j, var = t
+                try:
+                    return region3d.run(ctx, emplan.region_spec(j, variant=var), runmod.CACHE, runmod.RUNS, log)
+                except Exception as ex:                      # one region failing does not stop the others
+                    return {"ran": False, "verdict": f"no answer: {type(ex).__name__}: {ex}", "error": str(ex)}
+            with ThreadPoolExecutor(max_workers=max(1, jobs_mod._n()[0])) as pool:
+                out = list(pool.map(solve, tasks))
+            done = dict(zip([(id(j), v) for j, v in tasks], out))
             for j in em_jobs:
-                spec = emplan.region_spec(j)
-                base = region3d.run(ctx, spec, runmod.CACHE, runmod.RUNS, log)
+                base = done[(id(j), False)]
                 j["result"] = {k: base.get(k) for k in ("dir", "ran", "convergence", "calibration", "z_line_ohm", "preflight",
-                                                         "estimate", "terminations", "verdict")}
+                                                         "estimate", "terminations", "verdict", "tdr_excursion", "stopped")}
                 log(f"  {j['name']}: {base.get('verdict')}")
                 if j.get("variant"):
-                    var = region3d.run(ctx, emplan.region_spec(j, variant=True), runmod.CACHE, runmod.RUNS, log)
-                    j["variant_result"] = {k: var.get(k) for k in ("dir", "ran", "convergence", "z_line_ohm")}
+                    var = done[(id(j), True)]
+                    j["variant_result"] = {k: var.get(k) for k in ("dir", "ran", "convergence", "z_line_ohm", "verdict", "tdr_excursion")}
+                    log(f"  {j['name']} ({j['variant']['name']}): {var.get('verdict')}")
                 for sev, msg in emplan.judge(j, base):
                     findings.append(_f("em_region", "FS", "FS9", sev, msg, j["nets"], j.get("parts", []), extra=j["name"]))
     from . import stage as stage_mod

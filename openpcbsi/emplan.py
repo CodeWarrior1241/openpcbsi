@@ -1,8 +1,10 @@
 """Automatic 3D regions (#19, FS9): one openEMS region job per discontinuity on a fast class, each with
 the standard fix as a variant, so the 3D result says whether the fix is worth it.
 
-    series_cap    two-pad part between nets of a fast class    variant: reference voided under the pads (+0.15 mm)
-    layer_change  via of a fast-class net                      variant: two return vias added within 0.7 mm
+    series_cap    two-pad part between nets of a fast class    variant: reference voided under the pads (+0.15 mm),
+                                                               unless the board already has that cut-out
+    layer_change  via of a fast-class net                      variant: two return vias 0.6-1.0 mm away, clear of
+                                                               other nets' copper, unless the board has return vias
     split         split / gap crossing (from G1)               variant: the gap filled with reference copper
     connector     connector pads of a fast-class net           (no variant)
     breakout      the longest breakout neck (from #24)          (no variant)
@@ -31,7 +33,7 @@ FIT_GROW = 3.0      # mm: a side moves out by at most this
 FIT_CORE = 0.5      # mm: the job's own features stay at least this far inside the box
 FIT_POINT = 1.0     # mm: half-size of the core of a point discontinuity (split, connector, breakout)
 FIT_TRIES = 48      # pre-flight builds per job
-PLANNER_KEYS = ("kind", "parts", "core", "fit", "planned_box", "result", "variant_result")
+PLANNER_KEYS = ("kind", "parts", "core", "fit", "planned_box", "result", "variant_result", "variant_skipped")
 
 
 def _fast_nets(ctx, fast_ghz):
@@ -84,9 +86,14 @@ def plan(ctx, report, fast_ghz=3.0, fit=True, log=None):
         others = [r for r, ps in b.pads_by_ref.items() if r != ref and len(ps) == 2 and {q["net"] for q in ps} <= set(key)]
         refs = [ref] + others[:1]
         pts = [(p["x"], p["y"], p["sx"], p["sy"]) for r in refs for p in b.pads_by_ref[r]]
-        jobs.append({"kind": "series_cap", "name": _name("cap", ref), "nets": list(key), "parts": refs,
-                     "box": _bbox(pts), "core": _bbox(pts, FIT_CORE),
-                     "variant": {"name": "cut-out", "void_under": refs, "margin_mm": 0.15}})
+        job = {"kind": "series_cap", "name": _name("cap", ref), "nets": list(key), "parts": refs,
+               "box": _bbox(pts), "core": _bbox(pts, FIT_CORE)}
+        bare = _voided(ctx, refs)
+        if bare:
+            job["variant_skipped"] = f"the board already has the cut-out: {bare}"
+        else:
+            job["variant"] = {"name": "cut-out", "void_under": refs, "margin_mm": 0.15}
+        jobs.append(job)
     # layer changes on fast nets
     seen = set()
     for k in range(len(b.vias["x"])):
@@ -100,9 +107,23 @@ def plan(ctx, report, fast_ghz=3.0, fit=True, log=None):
         x, y = float(b.vias["x"][k]), float(b.vias["y"][k])
         vs = [(float(b.vias["x"][q]), float(b.vias["y"][q]), float(b.vias["d"][q]), float(b.vias["d"][q]))
               for q in range(len(b.vias["x"])) if b.net_names[int(b.vias["net"][q])] in key]
-        feat = vs + [(x + 0.7, y, 0.3, 0.3), (x - 0.7, y, 0.3, 0.3)]
-        jobs.append({"kind": "layer_change", "name": _name("via", net), "nets": list(key), "box": _bbox(feat), "core": _bbox(feat, FIT_CORE),
-                     "variant": {"name": "return vias", "add_vias": [[round(x + 0.7, 3), round(y, 3)], [round(x - 0.7, 3), round(y, 3)]]}})
+        job = {"kind": "layer_change", "name": _name("via", net), "nets": list(key)}
+        have = _return_vias(ctx, vs)
+        if have:
+            job["variant_skipped"] = (f"the board already has {len(have)} return via(s) within {RET_R:g} mm of the {net} vias "
+                                      f"(at {', '.join(f'({a:.2f}, {c:.2f})' for a, c in have[:4])} mm)")
+            feat = list(vs)
+        else:
+            d0, dr0 = float(b.vias["d"][k]), float(b.vias["drill"][k])
+            spots = _clear_spots(ctx, vs, d0)
+            if len(spots) < 2:
+                job["variant_skipped"] = f"no place for two return vias within {RET_R:g} mm of the {net} vias clear of other nets' copper"
+                feat = list(vs)
+            else:
+                job["variant"] = {"name": "return vias", "add_vias": [[round(a, 3), round(c, 3), d0, dr0] for a, c in spots[:2]]}
+                feat = vs + [(a, c, d0, d0) for a, c in spots[:2]]
+        job.update(box=_bbox(feat), core=_bbox(feat, FIT_CORE))
+        jobs.append(job)
     # split crossings
     for rule in report["checks"].get("drc", []):
         if rule["rule"] != "split_crossing":
@@ -186,6 +207,114 @@ def orient(ctx, job):
         job["rotate_deg"] = -45.0
         job["rotate_about"] = [round((bx[0] + bx[2]) / 2, 3), round((bx[1] + bx[3]) / 2, 3)]
     return job
+
+
+RET_R = 1.0         # mm: ground vias this close to a layer change's signal vias are its return vias
+RET_CLEAR = 0.15    # mm: an added return via keeps this much copper clearance from other nets
+
+
+def _return_vias(ctx, sig):
+    """Reference-net vias within RET_R of any of the signal vias `sig` [(x, y, d, d)]: [(x, y)]."""
+    b = ctx.b
+    ref = set(ctx.cfg.reference_nets or ["GND"])
+    out = []
+    for q in range(len(b.vias["x"])):
+        if b.net_names[int(b.vias["net"][q])] not in ref:
+            continue
+        x, y = float(b.vias["x"][q]), float(b.vias["y"][q])
+        if min(math.hypot(x - a, y - c) for a, c, _, _ in sig) <= RET_R:
+            out.append((x, y))
+    return out
+
+
+def _clear_spots(ctx, sig, d):
+    """Places for return vias of pad diameter `d` around the signal vias `sig`, 0.6 to RET_R mm from one of
+    them, each clearing every other net's via, track and pad on every layer (a through via meets them
+    all) by RET_CLEAR, and every via by a via's width: nearest first, the second on the far side."""
+    import numpy as np
+    b = ctx.b
+    ref = set(ctx.cfg.reference_nets or ["GND"])
+    cx = sum(a for a, *_ in sig) / len(sig)
+    cy = sum(c for _, c, *_ in sig) / len(sig)
+    T = b.tracks
+    near = np.flatnonzero((np.minimum(T["x1"], T["x2"]) < cx + 3) & (np.maximum(T["x1"], T["x2"]) > cx - 3)
+                          & (np.minimum(T["y1"], T["y2"]) < cy + 3) & (np.maximum(T["y1"], T["y2"]) > cy - 3))
+    tr = [(float(T["x1"][k]), float(T["y1"][k]), float(T["x2"][k]), float(T["y2"][k]), float(T["w"][k]))
+          for k in near if b.net_names[int(T["net"][k])] not in ref]
+    vi = [(float(b.vias["x"][q]), float(b.vias["y"][q]), float(b.vias["d"][q])) for q in range(len(b.vias["x"]))
+          if abs(float(b.vias["x"][q]) - cx) < 3 and abs(float(b.vias["y"][q]) - cy) < 3]
+    pads = [p for p in b.snap["pads"] if p["net"] not in ref and abs(p["x"] - cx) < 3 and abs(p["y"] - cy) < 3]
+
+    def seg(px, py, x1, y1, x2, y2):
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 <= 0 else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
+        return math.hypot(px - x1 - t * dx, py - y1 - t * dy)
+
+    def clear(px, py):
+        r = d / 2
+        if any(math.hypot(px - x, py - y) < r + dv / 2 + RET_CLEAR for x, y, dv in vi):
+            return False
+        if any(seg(px, py, x1, y1, x2, y2) < r + w / 2 + RET_CLEAR for x1, y1, x2, y2, w in tr):
+            return False
+        for p in pads:
+            for poly in p.get("poly") or []:
+                ring = poly[0]
+                inside = False
+                for i in range(len(ring)):
+                    (x1, y1), (x2, y2) = ring[i], ring[(i + 1) % len(ring)]
+                    if (y1 > py) != (y2 > py) and px < x1 + (py - y1) * (x2 - x1) / (y2 - y1):
+                        inside = not inside
+                if inside or min(seg(px, py, *ring[i], *ring[(i + 1) % len(ring)]) for i in range(len(ring))) < r + RET_CLEAR:
+                    return False
+        return True
+    cand = []
+    for rr in (0.6, 0.7, 0.8, 0.9, RET_R):             # from each signal via, nearest first
+        for sx, sy, *_ in sig:
+            for k in range(24):
+                a = 2 * math.pi * k / 24
+                px, py = sx + rr * math.cos(a), sy + rr * math.sin(a)
+                if clear(px, py):
+                    cand.append((rr, math.atan2(py - cy, px - cx), px, py))
+    if not cand:
+        return []
+    first = cand[0]
+    far = [c for c in cand if abs(((c[1] - first[1] + math.pi) % (2 * math.pi)) - math.pi) >= math.pi / 2]
+    return [(first[2], first[3])] + ([(far[0][2], far[0][3])] if far else [])
+
+
+def _voided(ctx, refs):
+    """'' when some pad of the parts `refs` has plane copper under it on the next copper layer; else what
+    the board already has there (the cut-out variant would repeat the board)."""
+    b = ctx.b
+    names = b.layers
+    seen = []
+    for r in refs:
+        for p in b.pads_by_ref.get(r, []):
+            if not p["layers"] or p["layers"][0] not in b.L:
+                return ""
+            li = b.L[p["layers"][0]]
+            below = names[li + 1] if li < len(names) - 1 else names[li - 1]
+            covered = False
+            for z in b.snap["zones"]:
+                if z.get("layer") != below or not z.get("polys") or z.get("rule_area"):
+                    continue
+                for poly in z["polys"]:
+                    if _pip(p["x"], p["y"], poly[0]) and not any(_pip(p["x"], p["y"], h) for h in poly[1:]):
+                        covered = True
+            if covered:
+                return ""
+            seen.append(f"{r} pad {p.get('num')} on {below}")
+    return f"no plane under {', '.join(seen[:4])}" if seen else ""
+
+
+def _pip(x, y, ring):
+    inside = False
+    for i in range(len(ring)):
+        (x1, y1), (x2, y2) = ring[i], ring[(i + 1) % len(ring)]
+        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+            inside = not inside
+    return inside
 
 
 def region_spec(job, variant=False):
@@ -283,15 +412,28 @@ def fit_box(ctx, job, log=None, tries=FIT_TRIES):
     return job
 
 
-def judge(job, res, base=None, cls_tol_pct=10.0):
+def judge(job, res, base=None, cls_tol_pct=None):
     """FS9 findings from a region result: TDR excursion, Sdd11 at Nyquist, Scd21; the better variant."""
+    from .region3d import TDR_LIMIT_PCT
+    cls_tol_pct = TDR_LIMIT_PCT if cls_tol_pct is None else cls_tol_pct
     out = []
     if not res.get("ran"):
         return [("warn", f"{job['name']}: not run ({'; '.join(res.get('preflight', {}).get('problems', [])[:2]) or res.get('reason', '')})")]
     conv = res.get("convergence", {})
     if not conv.get("converged"):
         out.append(("warn", f"{job['name']}: 3D result not accepted: {conv.get('reason')}"))
-    ex = res.get("tdr_excursion")
-    if ex and max(abs(ex["min_pct"]), abs(ex["max_pct"])) > cls_tol_pct:
+        return out
+    if res.get("clean"):
+        out.append(("info", f"{job['name']}: {res.get('verdict')}"))
+        return out
+    # judged at the link's own edge when its class gives a rate (the in-box reflections, time-gated, seen
+    # with that edge), else at the model's 35 ps
+    net, ex = res.get("tdr_net"), res.get("tdr_excursion")
+    link = res.get("link") or {}
+    if net and link.get("rise_ps"):
+        if max(abs(net["min_pct"]), abs(net["max_pct"])) > cls_tol_pct:
+            out.append(("warn", f"{job['name']}: TDR {net['min_pct']:+.0f} / {net['max_pct']:+.0f} % of the line at the link's "
+                                f"{net['rise_ps']:g} ps edge (limit {cls_tol_pct:g} %)"))
+    elif ex and max(abs(ex["min_pct"]), abs(ex["max_pct"])) > cls_tol_pct:
         out.append(("warn", f"{job['name']}: TDR {ex['min_pct']:+.0f} / {ex['max_pct']:+.0f} % of the line (limit {cls_tol_pct:g} %)"))
     return out

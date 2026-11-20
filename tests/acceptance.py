@@ -444,7 +444,7 @@ def t15_conv():
     need(res and res.get("ran"), f"no region result (rc {rc}): {(se or so)[-300:]}")
     runs = res.get("convergence", {}).get("runs", [])
     need(runs and all(r.get("ended_by") in ("end_criteria", "timesteps") and r.get("tail_db") is not None for r in runs), f"{runs}")
-    need("z_line_diff_pct" in res["convergence"] or "tdr_shape_diff_pct" in res["convergence"], "convergence does not compare Z/TDR between grids")
+    need(res["convergence"].get("per_grid") and res["convergence"].get("spread") is not None, "convergence does not compare the grids' TDR")
     return ok(f"a 2000-step run refused before solving; full run: {[(r['ended_by'], r['tail_db']) for r in runs]}")
 
 
@@ -892,6 +892,9 @@ def t34_signoff():
     os.remove(rec + ".sig")
     rc, so, se, dt = run(["verify-signoff", rec])
     need(rc != 0 and "the evaluation gives" in so, f"an edited verdict verifies: {so[-300:]}")
+    # the signature removed as well: asking for it must fail, not fall back to an unsigned record
+    rc, so, se, dt = run(["verify-signoff", rec, "--allowed-signers", allowed])
+    need(rc != 0 and "no signature" in so, f"a record without its .sig passes --allowed-signers: {so[-300:]}")
     # only the reviewer changed: the derived fields still hold, the signature does not
     open(rec, "w").write(orig)
     subprocess.run(["ssh-keygen", "-Y", "sign", "-f", key, "-n", "openpcbsi-signoff", rec], check=True, capture_output=True)
@@ -901,11 +904,24 @@ def t34_signoff():
     rc, so, se, dt = run(["verify-signoff", rec, "--allowed-signers", allowed])
     need(rc != 0 and "signature does not verify" in so, f"a changed reviewer verifies against the signature: {so[-300:]}")
     open(rec, "w").write(orig)
+    # --rerun from a received folder that carries its own openpcbsi/: the record is checked with this
+    # openpcbsi, never by a child `python -m openpcbsi` that would import the folder's copy first
+    planted = os.path.join(d, "received")
+    os.makedirs(os.path.join(planted, "openpcbsi"), exist_ok=True)
+    mark = os.path.join(d, "planted_ran")
+    for f in ("__init__.py", "__main__.py"):
+        open(os.path.join(planted, "openpcbsi", f), "w").write(f"open({mark!r}, 'w').write('ran')\n")
+    p = subprocess.run([sys.executable, "-I", "-c", "import runpy, sys; sys.path.insert(0, sys.argv[1]); "
+                        "sys.argv = ['openpcbsi'] + sys.argv[2:]; runpy.run_module('openpcbsi', run_name='__main__')",
+                        ROOT, "verify-signoff", rec, "--rerun"], cwd=planted, capture_output=True, text=True, timeout=1800)
+    need(not os.path.exists(mark), "verify-signoff --rerun ran an openpcbsi planted in the working folder")
+    need(p.returncode == 0 and "--rerun: the board evaluates again" in p.stdout, f"--rerun did not re-evaluate: {(p.stdout + p.stderr)[-300:]}")
     open(b, "a").write("\n")
     rc, so, se, dt = run(["verify-signoff", rec])
     need(rc != 0, "verify-signoff passes after the board changed")
-    return ok("record written and signed; edited verdict/blockers/counts refused (recomputed from the evaluation); changed reviewer "
-              "refused by the signature; changed board refused; relative paths only")
+    return ok("record written and signed; edited verdict/blockers/counts refused (recomputed from the evaluation); a missing .sig fails "
+              "--allowed-signers; changed reviewer refused by the signature; --rerun ignores a planted openpcbsi/; changed board "
+              "refused; relative paths only")
 
 
 @case(35, "Regression since the last sign-off: new / resolved findings by stable ID; waivers carried")
@@ -1794,6 +1810,85 @@ def t57_plot_folder():
     return ok("a foreign file kept and the run refused; openpcbsi's own folder marked and reused")
 
 
+@case(67, "Untrusted inputs: rail names are escaped in report and compare pages; rediff works without a config; dfm keeps a folder of one's own Gerbers; fab-check reads only https; a file no package lists in the parser site is found; a renamed copper layer is refused")
+def t67_untrusted():
+    d = out_dir("t67")
+    b = boards.rail_board(d, "evil", second_rail=False)
+    name = "R' onerror='alert(document.title)' x='"
+    cfg = toml(os.path.join(d, "e.toml"), f"""[rails."{name}"]
+net = "+1V8"
+v = 1.8
+tol_pct = 3.0
+current_a = 1.0
+source = "U1"
+loads = ["U2"]
+ripple_pct = 3.0
+step_a = 0.5
+[engines]
+dc = "openpcbsi"
+pdn = "openpcbsi"
+""")
+    ra = evaluate(b, "-c", cfg, "--checks", "pdn", "--no-drc", out=os.path.join(d, "A"))
+    rb = evaluate(b, "-c", cfg, "--checks", "pdn", "--no-drc", out=os.path.join(d, "B"))
+    need(ra["rep"] and rb["rep"], f"no report: {ra['err'][-300:]}")
+    pages = [os.path.join(ra["dir"], f) for f in os.listdir(ra["dir"]) if f.endswith(".html")]
+    rc, so, se, dt = run(["rediff", ra["dir"], rb["dir"]])
+    cdir = os.path.join(ROOT, "runs", "compare_A_vs_B")             # rediff writes under runs/
+    cmp_ = [os.path.join(cdir, "compare.html")] if os.path.exists(os.path.join(cdir, "compare.html")) else []
+    need(rc == 0 and cmp_, f"rediff failed (rc {rc}): {(se or so)[-300:]}")
+    for pg in pages + cmp_:
+        t = open(pg).read()
+        need("onerror='alert" not in t and "onerror=\'alert" not in t, f"{os.path.basename(pg)} carries the rail name unescaped")
+    need(any("&#x27; onerror" in open(pg).read() for pg in pages), "the rail's chart is not in the report (nothing escaped was tested)")
+    charts = [f for f in os.listdir(ra["dir"]) if f.startswith("pdn_")]
+    need(charts and all("'" not in f and " " not in f for f in charts), f"chart files named from the rail as given: {charts}")
+    # rediff on runs made without a config (the README's default flow)
+    r1 = evaluate(b, "--checks", "drc", "--no-drc", out=os.path.join(d, "C"))
+    r2 = evaluate(b, "--checks", "drc", "--no-drc", out=os.path.join(d, "D"))
+    need(r1["rep"] and r1["rep"]["config"] == "detected from the board", f"config recorded as {(r1['rep'] or {}).get('config')}")
+    rc, so, se, dt = run(["rediff", r1["dir"], r2["dir"]])
+    need(rc == 0, f"rediff of two runs without a config fails: {(se or so)[-300:]}")
+    # dfm -o DIR where DIR/fab_files holds one's own Gerbers, named after the board: not emptied
+    o = os.path.join(d, "dfm_out")
+    own = os.path.join(o, "fab_files", "evil-F_Cu.gbr")
+    os.makedirs(os.path.dirname(own))
+    open(own, "w").write("G04 my own file*\n")
+    rc, so, se, dt = run(["dfm", b, "-o", o])
+    need(os.path.exists(own) and open(own).read().startswith("G04 my own"), "dfm emptied a folder of the user's own Gerbers")
+    # fab-check: a profile that names file://, http:// or ftp:// pages is not read from them
+    sys.path.insert(0, ROOT)
+    from openpcbsi import fab
+    prof = open(os.path.join(ROOT, "openpcbsi", "fabs", "jlcpcb.toml")).read()
+    urls = ["file:///etc/hostname", "http://127.0.0.1:9/x", "ftp://127.0.0.1/x"]
+    k = [0]
+
+    def swap(m):
+        k[0] += 1
+        return '"' + urls[k[0] % len(urls)] + '"'
+    pp = os.path.join(d, "hostile.toml")
+    open(pp, "w").write(re.sub(r'"https://[^"]+"', swap, prof))
+    res = fab.check_pages(pp)
+    errs = [v["error"] or "" for v in res["pages"].values()]
+    need(errs and all("only https://" in e for e in errs), f"fab-check read a non-https page: {res['pages']}")
+    # the parser site: a module that no installed package lists is reported
+    site = os.path.join(d, "site")
+    shutil.copytree(os.path.join(ROOT, "deps", "parsers-site"), site)
+    open(os.path.join(site, "zz_planted.py"), "w").write("print('planted')\n")
+    p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "deps", "pins.py"), "site", site,
+                        os.path.join(ROOT, "deps", "requirements", "parsers.txt")], capture_output=True, text=True)
+    need(p.returncode != 0 and "not listed by any package: zz_planted.py" in p.stderr, f"planted module not found: {p.stderr[-300:]}")
+    # a copper layer renamed in the layer table (every reference to it too): refused with the layer named,
+    # not a KeyError where a via's layers come back by their standard names
+    t = open(b).read().replace("In1.Cu", "In1.Cu' onerror='alert(3)")
+    hb = os.path.join(d, "layer", "rail.kicad_pcb")
+    os.makedirs(os.path.dirname(hb))
+    open(hb, "w").write(t)
+    rc, so, se, dt = run(["check", hb, "--checks", "drc", "-o", os.path.join(d, "layer", "out")])
+    need(rc == 3 and "copper layer 4 is called" in se and "Traceback" not in se, f"renamed copper layer: rc {rc}, {se[-300:]}")
+    return ok(f"rail name escaped in {len(pages)} report page(s) and compare.html; charts {charts}; rediff without config; own Gerbers "
+              f"kept; {len(errs)} non-https pages refused; planted module found; renamed copper layer refused")
+
+
 # ---- the 3D-region and pad-void tests (tests/acceptance_em.py), registered here ------------------
 def _em_case(item, name, slow=False):
     def fn():
@@ -1816,7 +1911,9 @@ def _em_case(item, name, slow=False):
 
 for _item, _name, _slow in ((58, "t_em_names", False), (59, "t_em_preflight_crossings", False), (60, "t_em_fit", False),
                             (61, "t_em_grid_reuse", False), (62, "t_em_pad_void", False), (63, "t_no_user_paths", False),
-                            (64, "t_em_grid_reuse_openems", True), (65, "t_em_mesh_cost", False), (66, "t_em_lanes", False)):
+                            (64, "t_em_grid_reuse_openems", True), (65, "t_em_mesh_cost", False), (66, "t_em_lanes", False),
+                            (68, "t_em_variants_and_stops", False), (69, "t_em_grid_agreement", False),
+                            (70, "t_em_good_structures", True)):
     _em_case(_item, _name, _slow)
 
 

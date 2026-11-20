@@ -15,7 +15,10 @@ generalised to geometry cut from any KiCad board.
     rotate_deg = 0                          # turn the board about rotate_about (default: the box centre) first
     include_mm = 1.0                        # other nets' copper beyond this from the region's copper is left out
     term_ohm = 50                           # load at a pad where a region net ends in the box (terminate = false: none)
-    max_hours = 6                           # refused before solving when the run is predicted to take longer
+    max_hours = 6                           # refused when predicted to take longer; stopped there on the clock
+    pml_cells = 8                           # absorbing layer thickness, in cells
+    third_grid = true                       # a third, finer grid when two straddle the TDR limit (time allowing)
+    rise_ps / nyquist_ghz                   # the link's edge and Nyquist (default: the nets' class)
     preflight_only = false
 
 The model (built here in KiCad's python, run by em3d.py in the openEMS python):
@@ -76,13 +79,14 @@ def openems_python():
 # (seen on three grids of one pair: 98.95, 101.09, 99.9 ohm against 99.6 ohm in 2D, the box-to-lead ratio
 # constant to 0.1 %), so the line impedance may differ by 3 % between grids, the TDR's shape by 2 %, and
 # the summed power of a column of S by 5 % above 1 before a result counts as not passive.
-Z_GRID_TOL_PCT = 3.0
-SHAPE_TOL_PCT = 2.0
+CLEAN_PCT = 5.0       # both grids within this in the box, and under the reflection floor: clean
+TDR_LIMIT_PCT = 10.0  # the TDR excursion a region is judged against (emplan.judge, FS9)
 PASSIVE_TOL = 1.05
 T_RUN_S = 0.5e-9      # a series C whose 100 ohm time constant exceeds this is left out of the FDTD model
 PML_CELLS = 8
 KEEP_H = 5.0          # pre-flight clearance from the absorbing boundary: at least this many field heights
 AIR_UM = 1000.0
+ADD_CLEAR_UM = 100.0  # an added (variant) via keeps this much from other nets' copper
 COARSE = 2.5          # other nets' copper: cells this many times the region lines' fine cell
 TERM_OHM = 50.0       # a region net that ends on a pad in the box: its load to the reference plane
 INCLUDE_MM = 1.0      # other nets' copper farther than this from the region's copper is left out (see _inclusion)
@@ -339,6 +343,12 @@ class Rotated:
         for p in pads:
             self.pads_by_ref.setdefault(p["ref"], []).append(p)
         self.deg, self.about = deg, (cx, cy)
+        self._R = R
+
+    def point(self, x, y):
+        """A board point (mm) in the turned frame."""
+        X, Y = self._R(x, y)
+        return float(X), float(Y)
 
     def __getattr__(self, k):
         return getattr(self._b, k)
@@ -663,7 +673,7 @@ class Region:
                     ring = [(x * um, y * um) for x, y in poly[0]]
                     cr = clip_ring(ring, box)
                     if cr:
-                        sheets.append({"layer": ln, "z": Z[ln], "pts": cr, "metal": True, "prio": 50, "thick": thick[ln], "kind": "pad"})
+                        sheets.append({"layer": ln, "z": Z[ln], "pts": cr, "metal": True, "prio": 50, "thick": thick[ln], "kind": "pad", "net": p["net"]})
                         if mask_t.get(ln):
                             gr = clip_ring(grow_ring(ring, mask_t[ln]), box)
                             if gr:
@@ -718,9 +728,34 @@ class Region:
             fx0, fy0, fx1, fy1 = [v * um for v in var["fill_box"]]
             sheets.append({"layer": var["fill_layer"], "z": Z[var["fill_layer"]], "pts": [(fx0, fy0), (fx1, fy0), (fx1, fy1), (fx0, fy1)],
                            "metal": True, "prio": 45, "thick": 0.0, "kind": "plane"})
-        self._extra_vias = [{"x": x * um, "y": y * um, "r": 75.0, "pad_r": 150.0, "z0": min(Z.values()), "z1": max(Z.values()),
-                             "pads": sorted(set(Z.values())), "net": (self.ctx.cfg.reference_nets or ["GND"])[0]}
-                            for x, y in var.get("add_vias", [])]
+        # added vias (the return-via fix): a through via of the reference net, with a pad only where its own
+        # net's plane is, and a clearance hole in every other net's plane (as the board's own vias have): a
+        # plain cylinder would short each power plane it passes through to ground
+        ref_net = (self.ctx.cfg.reference_nets or ["GND"])[0]
+        self._extra_vias = []
+        for v in var.get("add_vias", []):
+            x, y = float(v[0]), float(v[1])
+            d, drill = (float(v[2]), float(v[3])) if len(v) >= 4 else (0.3, 0.15)
+            if isinstance(b, Rotated):
+                x, y = b.point(x, y)
+            pads = []
+            for ln, zs in fills.items():
+                inside_own = inside_other = False
+                for z in zs:
+                    for poly in z["polys"]:
+                        if pip(x, y, poly[0]) and not any(pip(x, y, h) for h in poly[1:]):
+                            if z["net"] == ref_net:
+                                inside_own = True
+                            else:
+                                inside_other = True
+                if inside_own:
+                    pads.append(Z[ln])
+                if inside_other:
+                    ring = [(x * um + (d / 2 + 0.1) * um * math.cos(a), y * um + (d / 2 + 0.1) * um * math.sin(a))
+                            for a in np.linspace(0, 2 * math.pi, 24, endpoint=False)]
+                    sheets.append({"layer": ln, "z": Z[ln], "pts": ring, "metal": False, "prio": 40, "thick": 0.0, "kind": "hole"})
+            self._extra_vias.append({"x": x * um, "y": y * um, "r": drill * um / 2, "pad_r": d * um / 2, "z0": min(Z.values()),
+                                     "z1": max(Z.values()), "pads": sorted(set(pads)), "net": ref_net, "added": True})
         # pair gaps: facing edges of different nets on one layer along the same axis
         for ax, edges in (("y", sig_edges_y), ("x", sig_edges_x)):
             ups = sorted(e for e, s in edges if s == -1)
@@ -1030,7 +1065,7 @@ class Region:
                       "mesh": {"x": X, "y": Y, "z": Zl}, "fmax": self.fmax, "lossy": bool(self.spec.get("lossy", False)),
                       "end_criteria": float(self.spec.get("end_criteria", 1e-4)),
                       "max_timesteps": int(self.spec.get("max_timesteps", 400000)),
-                      "pml_cells": PML_CELLS, "fine_um": fine, "w_min_um": w_min, "gap_min_um": gap_min,
+                      "pml_cells": int(self.spec.get("pml_cells", PML_CELLS)), "fine_um": fine, "w_min_um": w_min, "gap_min_um": gap_min,
                       "field_h_um": round(field_h, 2), "include_um": inc_um, "left_out": left_out,
                       "port_problems": self.port_problems, "nets": list(self.nets), "added_nets": self.added_nets,
                       "rotate_deg": float(self.spec.get("rotate_deg") or 0.0),
@@ -1097,8 +1132,9 @@ class Region:
         dom = m["domain"]
         box = m["box"]
         why = []                                   # (side or None, message)
-        pml = {"xmin": X[PML_CELLS] - X[0], "xmax": X[-1] - X[-1 - PML_CELLS],
-               "ymin": Y[PML_CELLS] - Y[0], "ymax": Y[-1] - Y[-1 - PML_CELLS]}
+        nP = int(m.get("pml_cells", PML_CELLS))
+        pml = {"xmin": X[nP] - X[0], "xmax": X[-1] - X[-1 - nP],
+               "ymin": Y[nP] - Y[0], "ymax": Y[-1] - Y[-1 - nP]}
         cell = {"xmin": X[1] - X[0], "xmax": X[-1] - X[-2], "ymin": Y[1] - Y[0], "ymax": Y[-1] - Y[-2]}
         # the clearance: the PML plus 8 cells, and never less than KEEP_H field heights. The cell count
         # alone shrinks as copper comes closer to the edge (the mesh refines around it, so the PML and its
@@ -1140,6 +1176,25 @@ class Region:
                 if d - v["pad_r"] < keep[side]:
                     why.append((side, f"via at ({v['x'] / 1000:.2f}, {v['y'] / 1000:.2f}) mm within {keep[side]:.0f} um of the {side} boundary"))
         why += [(side, w) for side, w in m.get("port_problems", [])]
+        # an added via (a variant's return via) must clear every other net's copper: one that lands on a
+        # signal via or a track shorts it to ground and the variant measures that short
+        for v in m["vias"]:
+            if not v.get("added"):
+                continue
+            for o in m["vias"]:
+                if o is not v and o.get("net") != v["net"] and math.hypot(o["x"] - v["x"], o["y"] - v["y"]) < o["pad_r"] + v["pad_r"] + ADD_CLEAR_UM:
+                    why.append((None, f"added via at ({v['x'] / 1000:.2f}, {v['y'] / 1000:.2f}) mm overlaps the {o.get('net')} via at "
+                                      f"({o['x'] / 1000:.2f}, {o['y'] / 1000:.2f}) mm"))
+            for sh in m["sheets"]:
+                if not sh.get("metal") or sh["kind"] not in ("track", "pad") or sh.get("net") == v["net"]:
+                    continue
+                xs, ys = [p_[0] for p_ in sh["pts"]], [p_[1] for p_ in sh["pts"]]
+                dx = max(min(xs) - v["x"], 0.0, v["x"] - max(xs))
+                dy = max(min(ys) - v["y"], 0.0, v["y"] - max(ys))
+                if math.hypot(dx, dy) < v["pad_r"] + ADD_CLEAR_UM and _ring_dist(sh["pts"], v["x"], v["y"]) < v["pad_r"] + ADD_CLEAR_UM:
+                    why.append((None, f"added via at ({v['x'] / 1000:.2f}, {v['y'] / 1000:.2f}) mm touches {sh.get('net') or 'a pad'}'s "
+                                      f"copper on {sh['layer']}"))
+                    break
         # every lane must run through the box to a port on another side or to a termination: a lane that
         # does not is an open end (|S11| = 1 whatever the layout) or a break the solver would take as one
         if m["ports"]:
@@ -1244,6 +1299,13 @@ class Region:
                 res[key] = bool(others) and node_of.get(p["n"]) is not None and \
                     any(node_of.get(q["n"]) == node_of[p["n"]] for q in others)
         return (all(res.values()) if res else False), res
+
+
+def _ring_dist(pts, x, y):
+    """Distance from (x, y) to a polygon (0 inside)."""
+    if pip(x, y, pts):
+        return 0.0
+    return min(_pt_seg(x, y, *pts[i], *pts[(i + 1) % len(pts)]) for i in range(len(pts)))
 
 
 def _pt_seg(px, py, x1, y1, x2, y2):
@@ -1397,10 +1459,10 @@ SPEED_MCS = 350.0        # Mcells/s assumed for a machine that has finished no g
 SETTLE = 2.0             # simulated time to the -40 dB end criterion, in excitation lengths (J1 launch: 1.6)
 STEP_CAP = 4.0         # a run's step limit: this many times the steps its excitation needs (run_estimate)
 TAIL_DB = -50.0        # a run cut on the step limit counts when every port is this far below the largest peak
-MAX_HOURS = 6.0          # a region (all its grids) predicted to take longer is refused before it starts
+MAX_HOURS = 6.0          # a region predicted to take longer (typically) is refused; on the clock, it is stopped there
 
 
-def run_estimate(model, speed_mcs=None):
+def run_estimate(model, speed_mcs=None, slow_mcs=None):
     """The FDTD time step (Courant, from the smallest cell on each axis: openEMS's own step is at most
     ~1.3 times longer), the simulated time a run needs (openEMS's Gaussian excitation, 2 * 9 / (2 pi fc),
     then SETTLE excitation lengths to the end criterion), the time steps that takes, whether the step
@@ -1419,15 +1481,15 @@ def run_estimate(model, speed_mcs=None):
             "steps": int(steps), "step_limit": cap, "hits_step_limit": steps > cap, "cells": cells,
             "speed_mcs": round(sp, 1), "speed_measured": speed_mcs is not None,
             "hours": round(cells * min(steps, cap) / (sp * 1e6) / 3600, 2),
-            "hours_max": round(cells * cap / (sp * 1e6) / 3600, 2)}
+            "hours_max": round(cells * cap / (min(sp, float(slow_mcs or sp)) * 1e6) / 3600, 2)}
 
 
-def measured_speed(cache_dir):
-    """This machine's openEMS speed (Mcells/s): the slowest of the last grids it finished (a bound must hold
-    when several solves share the machine; small models run up to twice as fast), or None."""
+def measured_speed(cache_dir, slowest=False):
+    """This machine's openEMS speed (Mcells/s) over the last grids it finished: the median, or with
+    `slowest` the slowest of them (shared with other solves, a run can drop to half its speed), or None."""
     try:
         v = json.load(open(os.path.join(cache_dir, "em_speed.json"))).get("mcs", [])
-        return float(np.min(v)) if v else None
+        return (float(np.min(v)) if slowest else float(np.median(v))) if v else None
     except (OSError, ValueError, TypeError):
         return None
 
@@ -1478,7 +1540,52 @@ def _reuse_grid(gdir, key):
         return None
 
 
-def _run_grid(model, od, gi, threads, log, cache_dir=None):
+DIVERGE = 100.0        # energy this many times its lowest point after the excitation has passed: the run is unstable
+
+
+def _solve(cmd, env, deadline):
+    """Run openEMS, reading its progress as it goes: (returncode, log text, stopped) where `stopped` is
+    None, "unstable" (the field energy, after falling at least 20 dB below its peak, grew DIVERGE times
+    above its lowest point: an FDTD instability, which only grows) or "time" (past `deadline`)."""
+    import threading
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1)
+    lines, state = [], {"stopped": None, "peak": 0.0, "low": None}
+
+    def watch():
+        while p.poll() is None:
+            if deadline and time.time() > deadline:
+                state["stopped"] = "time"
+                p.kill()
+                return
+            time.sleep(5)
+    threading.Thread(target=watch, daemon=True).start()
+    for line in p.stdout:
+        lines.append(line)
+        m = re.search(r"Energy: ~([0-9.eE+-]+)", line)
+        if not m:
+            continue
+        try:
+            e = float(m.group(1))
+        except ValueError:
+            continue
+        state["peak"] = max(state["peak"], e)
+        if e > 0 and e < 1e-2 * state["peak"]:
+            state["low"] = e if state["low"] is None else min(state["low"], e)
+        if state["low"] and e > DIVERGE * state["low"]:
+            state["stopped"] = "unstable"
+            p.kill()
+            break
+    p.wait()
+    txt = "".join(lines)
+    if state["stopped"] == "unstable":
+        txt += (f"\nopenpcbsi: stopped, unstable: the field energy fell to {state['low']:.3g} and then grew past "
+                f"{DIVERGE:g} times that\n")
+    elif state["stopped"] == "time":
+        txt += "\nopenpcbsi: stopped at the region's time limit (max_hours)\n"
+    return p.returncode, txt, state["stopped"]
+
+
+def _run_grid(model, od, gi, threads, log, cache_dir=None, deadline=None):
     from .si import inside
     gdir = inside(od, os.path.join(od, f"grid{gi}"))
     os.makedirs(gdir, exist_ok=True)
@@ -1495,15 +1602,25 @@ def _run_grid(model, od, gi, threads, log, cache_dir=None):
     json.dump(model, open(mp, "w"))
     t0 = time.time()
     from . import jobs
+    t_wait = time.time()
     with jobs.slot("openems", log) as share:
+        # time spent waiting for a job slot (other solves on the machine) does not count against max_hours
+        if isinstance(deadline, dict):
+            deadline["t"] += time.time() - t_wait
+        t0 = time.time()
         th = threads or share
-        p = subprocess.run([py, "-I", RUNNER, mp, gdir, str(th)], capture_output=True, text=True,
-                           env=dict(os.environ, OMP_NUM_THREADS=str(th)))
-    logtxt = p.stdout + "\n" + p.stderr
+        rc, logtxt, stopped = _solve([py, "-I", RUNNER, mp, gdir, str(th)], dict(os.environ, OMP_NUM_THREADS=str(th)),
+                                     deadline["t"] if isinstance(deadline, dict) else deadline)
     open(os.path.join(gdir, "runner.log"), "w").write(logtxt)
-    if p.returncode == 0:
+    if stopped:
+        # no ports.json and no done.json: nothing to read, and a rerun solves it again
+        secs = round(time.time() - t0, 1)
+        log(f"  grid {gi}: stopped after {secs:.0f} s: " + ("unstable (the field energy grew after decaying)" if stopped == "unstable"
+                                                          else "the region's time limit"))
+        return {"ports": None, "ended_by": stopped, "seconds": secs, "cells": None, "tail_db": None}
+    if rc == 0:
         _record_speed(cache_dir, logtxt)
-    if p.returncode != 0:
+    if rc != 0:
         raise RuntimeError(f"openEMS run failed (grid {gi}): {logtxt[-1500:]}")
     ports = json.load(open(os.path.join(gdir, "ports.json")))
     # openEMS prints "Max. number of timesteps: N" at the start of every run; only this warning means
@@ -1597,7 +1714,157 @@ def _post(model, run):
     t, z = T.tdr(fu, T.renorm(s_i, z_port, zref_s), Z0=z_port, rise=tdr_rise_ps(f.max()) * 1e-12)
     out["tdr_t_ps"] = (t[t < 1.5e-9] * 1e12).round(2).tolist()
     out["tdr_z_ohm"] = z[t < 1.5e-9].round(3).tolist()
+    # at the link's own rate: S-parameters at its Nyquist, and the in-box reflections (time-gated to the
+    # box's window, so neither port lead counts) seen with the link's own edge
+    fn = model.get("f_nyq_hz")
+    if fn and fn <= f.max():
+        i = int(np.argmin(np.abs(f - fn)))
+        r_k = next((k for k in ("Sdd11_db", "S11_db", "Scc11_db") if k in out), None)
+        t_k = next((k for k in ("Sdd21_db", "S21_db", "Scc21_db") if k in out), None)
+        out["at_nyquist"] = {"f_ghz": round(float(f[i]) / 1e9, 3), "reflection_db": out[r_k][i] if r_k else None,
+                             "transmission_db": out[t_k][i] if t_k else None}
+    win = window_ps(model)
+    if win:
+        rise = tdr_rise_ps(f.max()) * 1e-12
+        rn = max(float(model.get("rise_net_ps") or 0.0) * 1e-12, rise)
+        tg, zg = T.gated_tdr(fu, T.renorm(s_i, z_port, zref_s), 1.0, win, rise, rn)
+        m = tg > 0
+        if m.any():
+            out["tdr_net"] = {"min_pct": round(float(zg[m].min() - 1) * 100, 2), "max_pct": round(float(zg[m].max() - 1) * 100, 2),
+                              "rise_ps": round(rn * 1e12, 1), "window_ps": [round(v, 1) for v in win]}
     return out
+
+
+def net_rate(ctx, nets, spec=None):
+    """(Nyquist Hz, 10-90 rise ps, where from) of the fastest of the region's nets: the spec's `rise_ps` /
+    `nyquist_ghz`, else the net class's `rise_ps` and `nyquist_ghz`; a rise not given is 30 % of a bit,
+    0.15 / Nyquist (an assumption, stated in the result). (None, None, None) without a class rate."""
+    spec = spec or {}
+    fn = float(spec["nyquist_ghz"]) * 1e9 if spec.get("nyquist_ghz") else None
+    rise = float(spec["rise_ps"]) if spec.get("rise_ps") else None
+    src = "region spec" if (fn or rise) else None
+    for n in nets:
+        c = ctx.cfg.class_of(n)
+        if not c:
+            continue
+        q = ctx.cfg.class_param(c, "nyquist_ghz", 0) or 0
+        r = ctx.cfg.class_param(c, "rise_ps", 0) or 0
+        if q and not spec.get("nyquist_ghz") and (fn is None or q * 1e9 > fn):
+            fn, src = q * 1e9, f"net class {c}"
+        if r and not spec.get("rise_ps") and (rise is None or r < rise):
+            rise, src = float(r), f"net class {c}"
+    if fn and not rise:
+        rise, src = 0.15 / fn * 1e12, (src or "") + " (rise taken as 30 % of a bit, 0.15 / Nyquist)"
+    return fn, rise, src
+
+
+GRID_PTS = 1.5         # grids agree on an excursion within this many percentage points ...
+GRID_REL = 0.15        # ... or within this fraction of the excursion, whichever is larger
+GRID_S21_DB = 0.1      # ... and on the transmission at Nyquist within this many dB (or GRID_REL of it)
+
+
+def grid_agreement(a, b, limit=None):
+    """Two grids' results, each {"exc": [min, max] % in the box against one reference, "net": [min, max] %
+    at the link's own edge or None, "s21": dB at the link's Nyquist or None}: {converged, agreed_on,
+    reason, undecided, spread}. They agree on the metric when every excursion matches within
+    max(GRID_PTS, GRID_REL x its size) and the transmission within max(GRID_S21_DB, GRID_REL x it); on
+    the decision when both put the judged excursion (at the link's edge when there is one) on the same
+    side of `limit`. Either is converged; neither is undecided."""
+    limit = TDR_LIMIT_PCT if limit is None else limit
+    spread, ok = {}, True
+    for k in ("exc", "net"):
+        if a.get(k) is None or b.get(k) is None:
+            continue
+        size = max(abs(v) for v in list(a[k]) + list(b[k]))
+        tol = max(GRID_PTS, GRID_REL * size)
+        d = max(abs(a[k][0] - b[k][0]), abs(a[k][1] - b[k][1]))
+        spread[k] = {"diff_pts": round(d, 2), "tol_pts": round(tol, 2)}
+        ok &= d <= tol
+    if a.get("s21") is not None and b.get("s21") is not None:
+        d = abs(a["s21"] - b["s21"])
+        tol = max(GRID_S21_DB, GRID_REL * max(abs(a["s21"]), abs(b["s21"])))
+        spread["s21"] = {"diff_db": round(d, 3), "tol_db": round(tol, 3)}
+        ok &= d <= tol
+    key = "net" if (a.get("net") is not None and b.get("net") is not None) else "exc"
+    if a.get(key) is None or b.get(key) is None:
+        # a box too short for an in-box TDR window (the leads' steps cover the round trip at this edge):
+        # the grids are compared on the transmission at the link's Nyquist alone, and the result says so
+        if "s21" in spread:
+            agree = spread["s21"]["diff_db"] <= spread["s21"]["tol_db"]
+            return {"converged": agree, "agreed_on": "transmission" if agree else None, "undecided": False, "spread": spread,
+                    "reason": ("the box is too short for an in-box TDR window, so the grids are compared on the transmission at "
+                               f"the link's Nyquist alone: within {spread['s21']['diff_db']} of {spread['s21']['tol_db']} dB"
+                               + ("" if agree else " (not within)"))}
+        return {"converged": False, "undecided": False, "reason": "no in-box TDR to compare (box too short for a window) and no "
+                "transmission at the link's Nyquist", "spread": spread}
+    wa, wb = max(abs(v) for v in a[key]), max(abs(v) for v in b[key])
+    same = (wa <= limit) == (wb <= limit)
+    what = "at the link's own edge" if key == "net" else "in the box"
+    if ok:
+        return {"converged": True, "agreed_on": "result", "undecided": False, "spread": spread,
+                "reason": f"the grids agree on the TDR {what} (" + ", ".join(
+                    f"{k} within {v['diff_pts']} of {v['tol_pts']} points" if "diff_pts" in v else f"{k} within {v['diff_db']} of {v['tol_db']} dB"
+                    for k, v in spread.items()) + ")"}
+    if same:
+        return {"converged": True, "agreed_on": "decision", "undecided": False, "spread": spread,
+                "reason": f"the grids differ ({spread}), but both put the TDR {what} ({wa:.1f} and {wb:.1f} %) "
+                          f"{'within' if wa <= limit else 'beyond'} the {limit:g} % limit: the same verdict"}
+    return {"converged": False, "agreed_on": None, "undecided": True, "spread": spread,
+            "reason": f"the grids straddle the {limit:g} % limit ({wa:.1f} and {wb:.1f} % {what})"}
+
+
+def _convergence(grids, runs, zref):
+    """The grid comparison of a solved region (see grid_agreement): the first and the last grid given."""
+    conv = {"runs": [{"res_scale": r["res_scale"], "cells": r["cells"], "seconds": r["seconds"], "ended_by": r["ended_by"],
+                      "z_line_ohm": r["z_line_ohm"], "tail_db": r.get("tail_db"), "z_port_ohm": r["post"].get("z_port_ohm")}
+                     for r in runs], "reference_ohm": round(float(zref), 2) if zref else None}
+    cut = [r for r in runs if r["ended_by"] != "end_criteria"]
+    loud = [r for r in cut if r.get("tail_db") is None or r["tail_db"] > TAIL_DB]
+    if loud:
+        conv.update(converged=False, undecided=False, reason=("a run hit the time-step limit with its port waves still "
+                    f"{max((r.get('tail_db') or 0) for r in loud):.0f} dB from their peak (limit {TAIL_DB:g} dB)"))
+        return conv
+    g = []
+    for (_, m_), r in zip([grids[0], grids[-1]], [runs[0], runs[-1]]):
+        e = tdr_excursion(m_, {"tdr_t_ps": r["post"].get("tdr_t_ps"), "tdr_z_ohm": r["post"].get("tdr_z_ohm"),
+                               "z_line_ohm": None, "z_2d_ohm": zref})
+        n = r["post"].get("tdr_net")
+        ny = r["post"].get("at_nyquist") or {}
+        g.append({"exc": e and [e["min_pct"], e["max_pct"]], "net": n and [n["min_pct"], n["max_pct"]], "s21": ny.get("transmission_db")})
+    conv["per_grid"] = g
+    # for the record: the in-box shape with each grid's own level removed (a level shift is the port lead's)
+    w = window_ps(grids[-1][1])
+    if w:
+        ts = [np.array(r["post"].get("tdr_t_ps") or []) for r in (runs[0], runs[-1])]
+        zs = [np.array(r["post"].get("tdr_z_ohm") or []) for r in (runs[0], runs[-1])]
+        n = min(len(ts[0]), len(ts[1]))
+        m = (ts[0][:n] > w[0]) & (ts[0][:n] < w[1])
+        if n and m.any():
+            q = [z_[:n][m] / np.mean(z_[:n][m]) for z_ in zs]
+            conv["shape_diff_level_removed_pct"] = round(float(np.max(np.abs(q[0] - q[1]))) * 100, 2)
+    conv.update(grid_agreement(g[0], g[-1]))
+    if cut and conv["converged"]:
+        conv["reason"] += (f"; {len(cut)} run(s) stopped on the step limit with the port waves {max(r['tail_db'] for r in cut):.0f} dB "
+                           "below their peak (energy left ringing in the model's planes, which the board's decoupling would damp)")
+    return conv
+
+
+def window_ps(model):
+    """The TDR window inside the box (ps): from 0.6 rise times after the port (past the near lead's step)
+    to 0.6 short of the round trip to the far side (before the far lead's); to one rise time past it when a
+    termination in the box ends the line (its pad is part of what is judged). None when the box is too
+    short for one."""
+    pe = excited_port(model)
+    if not pe:
+        return None
+    box = model["box"]
+    L = (box[2] - box[0]) if pe["side"][0] == "x" else (box[3] - box[1])
+    tl = 2 * L * 1e-6 * math.sqrt(model.get("eps_eff_2d") or 3.0) / C0 * 1e12
+    rise = tdr_rise_ps(model["fmax"])
+    lo, hi = 0.6 * rise, tl - 0.6 * rise
+    if any(g["side"] == "pad" for g in model["groups"]):
+        hi = tl + rise
+    return (lo, hi) if hi > lo else None
 
 
 def excited_port(model):
@@ -1680,7 +1947,8 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
         m2["max_timesteps"] = int(min(m2["max_timesteps"], max(20000, STEP_CAP * e0["steps"])))
         grids.append((scale, m2))
     speed = measured_speed(cache_dir)
-    est = [dict(run_estimate(m2, speed), res_scale=sc) for sc, m2 in grids]
+    slow = min(measured_speed(cache_dir, slowest=True) or SPEED_MCS, SPEED_MCS)
+    est = [dict(run_estimate(m2, speed, slow), res_scale=sc) for sc, m2 in grids]
     hours = round(sum(e["hours"] for e in est), 2)
     hours_max = round(sum(e["hours_max"] for e in est), 2)
     max_h = float(spec.get("max_hours", os.environ.get("OPENPCBSI_EM_MAX_HOURS", MAX_HOURS)))
@@ -1689,8 +1957,8 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
         if e["hits_step_limit"]:
             pf["problems"].append(f"grid {e['res_scale']}: a run needs {e['steps']} time steps of {e['dt_fs']} fs (smallest cells "
                                   f"{e['min_cell_um']} um) and would stop on the limit of {e['step_limit']} before the end criterion")
-    if hours_max > max_h:
-        pf["problems"].append(f"predicted up to {hours_max:.1f} h (typically {hours:.1f} h) for {len(est)} grids ({', '.join(str(e['cells']) for e in est)} cells at "
+    if hours > max_h:
+        pf["problems"].append(f"predicted {hours:.1f} h (up to {hours_max:.1f} h) for {len(est)} grids ({', '.join(str(e['cells']) for e in est)} cells at "
                               f"{est[0]['speed_mcs']:.0f} Mcells/s{'' if speed else ', not yet measured on this machine'}), over "
                               f"max_hours = {max_h:g}: make the box smaller or raise max_hours")
     # calibration: whether the excited lane's uniform run can hold a TDR plateau, said before solving
@@ -1701,6 +1969,9 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
     pf["n_problems"] = len(pf["problems"])
     pf["ok"] = not pf["problems"]
     cp = res.get("calibration_plan") or {}
+    if hours_max > max_h and hours <= max_h:
+        log(f"  {spec.get('name')}: a run that goes to its step limit would take up to {hours_max:.1f} h; it is stopped at "
+            f"max_hours = {max_h:g} (no answer then)")
     log(f"  {spec.get('name')}: predicted {hours:.1f} h, at most {hours_max:.1f} h ({', '.join(str(e['cells']) for e in est)} cells, step {est[0]['dt_fs']} fs, "
         f"{est[0]['speed_mcs']:.0f} Mcells/s); {len(res['terminations'])} terminations; line calibration "
         + ("possible" if cp.get("possible") else f"not possible in this box (uniform run {(cp.get('run_um') or 0) / 1000:.2f} mm, "
@@ -1712,11 +1983,56 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
         return res
     threads = int(spec.get("threads", os.environ.get("OPENPCBSI_EM_THREADS", 0)))   # 0: the job slot's share
     runs = []
-    for gi, (scale, m2) in enumerate(grids):
-        rr = _run_grid(m2, od, gi, threads, log, cache_dir)
+    clock = {"t": time.time() + max_h * 3600.0}  # max_hours holds on the clock (waits for a job slot excepted)
+    fnq, rnet, rsrc = net_rate(ctx, reg.nets, spec)
+    res["link"] = {"nyquist_ghz": fnq and round(fnq / 1e9, 3), "rise_ps": rnet and round(rnet, 1), "from": rsrc}
+
+    def solve_grid(gi, scale, m2):
+        rr = _run_grid(m2, od, gi, threads, log, cache_dir, clock)
+        if rr["ended_by"] == "unstable" and not spec.get("no_retry"):
+            # an FDTD instability belongs to one mesh (rev D REFCLK0: unstable at res_scale 1.0, stable at 0.9
+            # and in a larger box, with either absorber): the grid once more at 0.9 of the cell size
+            s2 = round(scale * 0.9, 3)
+            log(f"  grid {gi}: unstable at res_scale {scale}; solved again at {s2}")
+            m2 = Region(ctx, spec, s2).build()
+            m2["eps_eff_2d"] = model.get("eps_eff_2d")
+            m2["max_timesteps"] = int(min(m2["max_timesteps"], max(20000, STEP_CAP * run_estimate(m2)["steps"])))
+            grids[gi] = (s2, m2)
+            rr = _run_grid(m2, od, f"{gi}r", threads, log, cache_dir, clock)
+            rr["retried"] = {"unstable_at": scale, "res_scale": s2}
+            scale = s2
+        if rr["ports"] is None:
+            return rr
+        m2["f_nyq_hz"], m2["rise_net_ps"] = fnq, rnet       # post-processing only (after the grid's key)
         rr["post"] = _post(m2, rr)
         rr["z_line_ohm"] = _line_z(m2, rr["post"])
         rr["res_scale"] = scale
+        return rr
+    for gi, (scale, m2) in enumerate(grids):
+        if runs and not runs[-1].get("reused"):
+            # the next grid predicted from the one just solved (its measured time, scaled by cells and time
+            # step): one that would pass max_hours is not started
+            e_prev = est[gi - 1]
+            e_next = est[gi]
+            pred = runs[-1]["seconds"] * (e_next["cells"] / max(e_prev["cells"], 1)) * (e_prev["dt_fs"] / max(e_next["dt_fs"], 1e-9))
+            if time.time() + pred > clock["t"]:
+                res.update(ran=True, stopped={"grid": gi, "res_scale": scale, "why": "time", "seconds": 0.0,
+                                              "predicted_s": round(pred)}, seconds=round(time.time() - t0, 1))
+                res["convergence"] = {"converged": False, "reason": (f"grid {gi} not started: from grid {gi - 1}'s {runs[-1]['seconds']:.0f} s it "
+                                                                     f"would take about {pred / 3600:.1f} h, past max_hours = {max_h:g}")}
+                res["verdict"] = verdict(res)
+                json.dump(res, open(os.path.join(od, "result.json"), "w"), indent=1)
+                return res
+        rr = solve_grid(gi, scale, m2)
+        if rr["ports"] is None:                 # stopped: unstable, or out of time; no answer from this region
+            res.update(ran=True, stopped={"grid": gi, "res_scale": scale, "why": rr["ended_by"], "seconds": rr["seconds"]},
+                       seconds=round(time.time() - t0, 1))
+            res["convergence"] = {"converged": False, "reason": (f"grid {gi} was unstable: the field energy grew after it had decayed "
+                                                                 "(an FDTD instability), so it was stopped" if rr["ended_by"] == "unstable"
+                                                                 else f"grid {gi} was stopped at max_hours = {max_h:g}")}
+            res["verdict"] = verdict(res)
+            json.dump(res, open(os.path.join(od, "result.json"), "w"), indent=1)
+            return res
         runs.append(rr)
     fine = runs[-1]
     res.update({k: v for k, v in fine["post"].items()})
@@ -1727,40 +2043,33 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
         bx = model["box"]
         res["line_length_mm"] = round(((bx[2] - bx[0]) if pe["side"][0] == "x" else (bx[3] - bx[1])) / 1000.0, 3)
     res["eps_eff"] = model.get("eps_eff_2d")
-    # convergence (#15): both runs ended by the criterion, line impedance and TDR agree
-    conv = {"runs": [{"res_scale": r["res_scale"], "cells": r["cells"], "seconds": r["seconds"], "ended_by": r["ended_by"],
-                      "z_line_ohm": r["z_line_ohm"]} for r in runs]}
-    za, zb = runs[0]["z_line_ohm"], runs[-1]["z_line_ohm"]
-    if za and zb:
-        conv["z_line_diff_pct"] = round(abs(za - zb) / zb * 100, 2)
-    ta, tb = np.array(runs[0]["post"].get("tdr_z_ohm", [])), np.array(runs[-1]["post"].get("tdr_z_ohm", []))
-    if len(ta) and len(tb):
-        n = min(len(ta), len(tb))
-        conv["tdr_diff_ohm"] = round(float(np.max(np.abs(ta[:n] - tb[:n]))), 2)
-        # The TDR's shape, each grid's curve over its own port reading: whether the structures in the box
-        # (vias, transitions, parts) are resolved. The absolute level of a whole curve moves with the mesh
-        # by up to ~2.5 % (the zero-thickness port lead's own discretisation, common to every point of the
-        # curve); that level is what the 2D calibration checks and corrects, not the grid comparison.
-        za_p, zb_p = runs[0]["post"].get("z_port_ohm"), runs[-1]["post"].get("z_port_ohm")
-        if za_p and zb_p:
-            conv["tdr_shape_diff_pct"] = round(float(np.max(np.abs(ta[:n] / za_p - tb[:n] / zb_p))) * 100, 2)
-    cut = [r for r in runs if r["ended_by"] != "end_criteria"]
-    loud = [r for r in cut if r.get("tail_db") is None or r["tail_db"] > TAIL_DB]
-    for r, rr in zip(conv["runs"], runs):
-        rr_t = rr.get("tail_db")
-        if rr_t is not None:
-            r["tail_db"] = rr_t
-    if loud:
-        conv["converged"], conv["reason"] = False, ("a run hit the time-step limit with its port waves still "
-                                                    f"{max((r.get('tail_db') or 0) for r in loud):.0f} dB from their peak (limit {TAIL_DB:g} dB)")
-    elif conv.get("z_line_diff_pct", 0) > Z_GRID_TOL_PCT or conv.get("tdr_shape_diff_pct", 0) > SHAPE_TOL_PCT:
-        conv["converged"], conv["reason"] = False, "the two grids disagree on line impedance or TDR shape"
-    elif cut:
-        conv["converged"], conv["reason"] = True, (f"both grids agree; {len(cut)} run(s) stopped on the step limit with the port waves "
-                                                   f"{max(r['tail_db'] for r in cut):.0f} dB below their peak (energy left ringing in the "
-                                                   "model's planes, which the board's decoupling would damp)")
-    else:
-        conv["converged"], conv["reason"] = True, "both runs settled; line impedance and TDR shape agree"
+    # convergence (#15): the grids compared on what is reported, the in-box TDR excursion against one
+    # reference for both (the 2D line), the excursion at the link's own edge and the transmission at its
+    # Nyquist; accepted when they agree within a tolerance scaled to the result, or when both land on the
+    # same side of the limit the region is judged against. When they straddle it, one more grid decides.
+    zr = res.get("z_2d_ohm") or float(np.mean([r["post"].get("z_port_ohm") or 0 for r in runs]))
+    conv = _convergence(grids, runs, zr)
+    if conv.get("undecided") and spec.get("third_grid", True) and len(grids) >= 2:
+        s3 = round(grids[-1][0] * 0.75, 3)
+        m3 = Region(ctx, spec, s3).build()
+        m3["eps_eff_2d"] = model.get("eps_eff_2d")
+        m3["max_timesteps"] = int(min(m3["max_timesteps"], max(20000, STEP_CAP * run_estimate(m3)["steps"])))
+        e3 = run_estimate(m3, speed, slow)
+        if time.time() + e3["hours"] * 3600 < clock["t"]:
+            log(f"  {spec.get('name')}: the grids straddle the limit; a third grid (res_scale {s3}, {e3['cells']} cells, ~{e3['hours']:.1f} h) decides")
+            rr3 = solve_grid(len(grids), s3, m3)
+            if rr3["ports"] is not None:
+                grids.append((s3, m3))
+                runs.append(rr3)
+                conv = _convergence(grids[-2:], runs[-2:], zr)
+                conv["third_grid"] = f"res_scale {s3}: compared with the grid before it"
+            else:
+                conv["third_grid"] = f"res_scale {s3}: stopped ({rr3['ended_by']})"
+        else:
+            conv["third_grid"] = f"not run: ~{e3['hours']:.1f} h would pass max_hours = {max_h:g}"
+        fine = runs[-1]
+        res.update({k: v for k, v in fine["post"].items()})
+        res["z_line_ohm"] = fine["z_line_ohm"]
     res["convergence"] = conv
     # calibration (#16): the model's line against 2D for the same geometry
     if res.get("z_2d_ohm") and res.get("z_line_ohm"):
@@ -1776,6 +2085,19 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
                                       "(move the box edge further from the first part or via)"}
     res["tdr_excursion"] = tdr_excursion(model, res)
     res["reflection_floor_db"] = reflection_floor(res)
+    # clean, below the model's resolution: both grids within CLEAN_PCT in the box (at the link's edge when
+    # there is one) and the return loss under the floor the model's own leads set. A positive answer about
+    # the layout (FS9 met), not "not usable"
+    g = (res.get("convergence") or {}).get("per_grid") or []
+    fl = res.get("reflection_floor_db")
+    rk = next((k for k in ("Sdd11_db", "S11_db", "Scc11_db") if res.get(k)), None)
+    if res["convergence"].get("converged") and g and fl is not None and rk:
+        key = "net" if all(x.get("net") for x in g) else "exc"
+        f_ = np.array(res["freq_ghz"])
+        band = f_ <= ((res.get("link") or {}).get("nyquist_ghz") or f_.max())
+        worst_s11 = float(np.max(np.array(res[rk])[band & (f_ > 0.02 * f_.max())])) if (band & (f_ > 0.02 * f_.max())).any() else None
+        if all(x.get(key) and max(abs(v) for v in x[key]) <= CLEAN_PCT for x in g) and worst_s11 is not None and worst_s11 <= fl:
+            res["clean"] = {"tdr_pct": max(max(abs(v) for v in x[key]) for x in g), "on": key, "s11_db": round(worst_s11, 1), "floor_db": fl}
     if res.get("passive") is False:
         res.setdefault("problems", []).append("result is not passive")
     res["ran"] = True
@@ -1792,19 +2114,12 @@ def tdr_excursion(model, res):
     its zero-thickness lead is not a reference: it reads ~7 % above the line on the calibration case.)"""
     t, z = np.array(res.get("tdr_t_ps") or []), np.array(res.get("tdr_z_ohm") or [])
     ref, what = (res.get("z_line_ohm"), "the model's calibrated line") if res.get("z_line_ohm") else (res.get("z_2d_ohm"), "2D")
-    pe = excited_port(model)
-    if not len(t) or not ref or not pe:
+    win = window_ps(model)
+    if not len(t) or not ref or not win:
         return None
-    box = model["box"]
-    L = (box[2] - box[0]) if pe["side"][0] == "x" else (box[3] - box[1])
-    tl = 2 * L * 1e-6 * math.sqrt(model.get("eps_eff_2d") or 3.0) / C0 * 1e12
-    rise = tdr_rise_ps(model["fmax"])
-    # inside the box: past the near lead's step, short of the far one (both are the model's, not the board's)
-    lo, hi = 0.6 * rise, tl - 0.6 * rise
-    if any(g["side"] == "pad" for g in model["groups"]):
-        hi = tl + rise                  # a termination inside the box: its pad is part of what is judged
+    lo, hi = win
     m = (t > lo) & (t < hi)
-    if hi <= lo or not m.any():
+    if not m.any():
         return None
     return {"min_pct": round(float(z[m].min() / ref - 1) * 100, 2), "max_pct": round(float(z[m].max() / ref - 1) * 100, 2),
             "ref_ohm": round(float(ref), 2), "ref": what, "window_ps": [round(lo, 1), round(hi, 1)]}
@@ -1839,6 +2154,8 @@ def verdict(res):
             return "checked only (not run)"
         return f"refused before solving: {'; '.join(pf.get('problems', [])[:2])}"
     conv, cal = res.get("convergence", {}), res.get("calibration", {})
+    if res.get("stopped"):
+        return f"no answer: {conv.get('reason')}"
     bad = []
     if not conv.get("converged"):
         bad.append(f"not converged ({conv.get('reason')})")
@@ -1847,6 +2164,11 @@ def verdict(res):
     if bad:
         return "not usable: " + "; ".join(bad)
     ex = res.get("tdr_excursion") or {}
+    if res.get("clean"):
+        c = res["clean"]
+        return (f"pass: clean, below the model's resolution (TDR within {c['tdr_pct']:.1f} % "
+                f"{'at the link edge' if c['on'] == 'net' else 'in the box'} on both grids, return loss {c['s11_db']} dB under "
+                f"the model's {c['floor_db']} dB floor)")
     note = "" if cal.get("agree_pct") is not None else \
         f" (line not calibrated in this box: TDR against {ex.get('ref', '2D')}, {ex.get('ref_ohm', res.get('z_2d_ohm'))} ohm)"
     tdr = f"; TDR {ex['min_pct']:+.1f} / {ex['max_pct']:+.1f} %" if ex else ""

@@ -1208,9 +1208,10 @@ def _plot(board_path, layers, od, log):
     PLOT_MARK file); a folder of that name that openpcbsi did not make, and that is not empty, is
     refused rather than cleared. With OPENPCBSI_NO_REFILL the zones are plotted as stored (as the reader
     reads them); otherwise kicad-cli refills them first, as the reader's copy was."""
-    stem = os.path.splitext(os.path.basename(board_path))[0]
     if os.path.isdir(od) and os.listdir(od):
-        ours = os.path.exists(os.path.join(od, PLOT_MARK)) or all(f.startswith(stem) for f in os.listdir(od))
+        # only the mark says openpcbsi made it: a folder of the user's own Gerbers carries the board's name
+        # too (that was once taken as ours, and emptied)
+        ours = os.path.exists(os.path.join(od, PLOT_MARK))
         if not ours:
             raise RuntimeError(f"{od} exists and was not made by openpcbsi: not emptied. Choose another -o folder, or remove it")
         for f in os.listdir(od):

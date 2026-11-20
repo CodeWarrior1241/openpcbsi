@@ -681,9 +681,58 @@ def reader_name(reader=None):
 NEWER_CONSTRUCTS = (r"\(transform\b",)
 
 
+_CU_ENTRY = re.compile(r'\(\s*(\d+)\s+"((?:[^"\\]|\\.)*)"\s+(signal|power|mixed|jumper)\b')
+
+
+def _std_copper(k, old):
+    """KiCad's own name for copper layer number k: KiCad 9/10 (F.Cu 0, B.Cu 2, In n 2n+2), or with `old`
+    the earlier numbering (F.Cu 0, In n n, B.Cu 31); None for a number that is no copper layer."""
+    if k == 0:
+        return "F.Cu"
+    if old:
+        return "B.Cu" if k == 31 else (f"In{k}.Cu" if 1 <= k <= 30 else None)
+    if k == 2:
+        return "B.Cu"
+    return f"In{(k - 2) // 2}.Cu" if k >= 4 and k % 2 == 0 else None
+
+
+def _check_copper_names(path, text):
+    """Every copper layer in the layer table must carry KiCad's own name for its number (a name the user
+    gives a layer is a separate, optional field). A file that calls layer 4 something else is not one
+    KiCad writes, and the readers then disagree on what the layer is called (a via's layers come back by
+    their standard names): refused, with the layer named."""
+    m = re.search(r"\n\s*\(layers\b", text)
+    if not m:
+        return
+    depth, i = 0, m.start() + text[m.start():].index("(")
+    j = i
+    while j < len(text):
+        c = text[j]
+        if c == '"':
+            j += 1
+            while j < len(text) and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    entries = [(int(k), name) for k, name, _ in _CU_ENTRY.findall(text[i:j])]
+    old = any(k == 31 for k, _ in entries)          # the numbering before KiCad 9 (B.Cu is 31)
+    for k, name in entries:
+        std = _std_copper(k, old)
+        if name != std:
+            raise InputError(f"{os.path.basename(path)}: copper layer {k} is called {name!r} in the layer table; KiCad's name for it "
+                             f"is {std or 'none (not a copper layer number)'} (a layer's own user name goes in the optional third "
+                             "field). openpcbsi reads only files whose copper layers carry KiCad's names")
+
+
 def _check_constructs(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         text = f.read()
+    _check_copper_names(path, text)
     hit = [re.sub(r"[^a-z_]", "", c.replace("\\b", "")) for c in NEWER_CONSTRUCTS if re.search(c, text)]
     if hit:
         gen = re.search(r'\(generator_version "([^"]+)"\)', text[:2000])
@@ -780,6 +829,10 @@ def load_or_extract(board_path, cache_dir, refresh=False, reader=None):
     if not os.path.exists(board_path):
         raise InputError(f"{board_path}: no such file")
     rd = reader_name(reader)
+    # the layer-name contract on every load, cached or not (a reading cached before the check existed,
+    # or before a crash downstream, must not skip it)
+    with open(board_path, encoding="utf-8", errors="replace") as f:
+        _check_copper_names(board_path, f.read())
     sha = file_sha256(board_path)
     os.makedirs(cache_dir, exist_ok=True)
     cpath = os.path.join(cache_dir, f"snapshot_{sha[:16]}_{cache_tag(rd)}.json.gz")
