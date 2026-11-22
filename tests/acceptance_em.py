@@ -497,7 +497,7 @@ def t_em_variants_and_stops():
 
 
 def t_em_grid_agreement():
-    """3D grids are compared on what is reported: the six rev D regions' grids (three wrongly rejected before) are accepted, grids that straddle the limit are undecided; the gated TDR keeps the box and drops the leads; a net is judged at its class's edge"""
+    """3D grids are compared on what is reported: the six rev D regions' grids (three wrongly rejected before) are accepted, grids that straddle the limit are undecided; a model still ringing at the step limit counts for its TDR alone; the gated TDR keeps the box and drops the leads; a net is judged at its class's edge"""
     sys.path.insert(0, os.path.dirname(HERE))
     import numpy as np
     from openpcbsi import region3d as r3, tdr as T
@@ -513,6 +513,17 @@ def t_em_grid_agreement():
     need(r["converged"] and r["agreed_on"] == "decision", f"grids far apart but both beyond the limit: {r}")
     r = r3.grid_agreement({"exc": None, "net": None, "s21": -0.192}, {"exc": None, "net": None, "s21": -0.166})
     need(r["converged"] and r["agreed_on"] == "transmission", f"a box too short for a TDR window, transmission agreeing: {r}")
+    # a model still ringing at the step limit: rev D REFCLK0 (-47.0 / -46.9 dB on its two grids) counts for the TDR
+    # alone; one grid louder than RING_DB, grids far apart, or a single grid is refused; quiet runs pass untouched
+    cut = lambda *t: [{"ended_by": "timesteps", "tail_db": v} for v in t]
+    ring, why = r3.ringing(cut(-47.0, -46.9))
+    need(ring and not why and ring["tail_db"] == -46.9, f"REFCLK0's ring-down was not kept for the TDR: {ring}, {why}")
+    for runs, what in ((cut(-38.0, -47.0), "a grid louder than RING_DB"), (cut(-41.0, -49.5), "grids 8.5 dB apart"),
+                       (cut(-45.0), "a single grid"), (cut(None, -45.0), "a grid without a tail reading")):
+        ring, why = r3.ringing(runs)
+        need(ring is None and why and "time-step limit" in why, f"{what} was accepted: {ring}, {why}")
+    need(r3.ringing(cut(-61.7, -60.9)) == (None, None) and r3.ringing([{"ended_by": "end_criteria", "tail_db": -30}] * 2) == (None, None),
+         "runs quiet by the step limit (LA25), or ended by the end criterion, were treated as ringing")
     # the gated TDR on a known line: 2 mm of 90 ohm in 100 ohm, leads of 110 ohm at both ends
     c = 3e8 / 2.0
     f = np.linspace(0, 20e9, 401); f[0] = 1e6

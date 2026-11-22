@@ -276,8 +276,9 @@ decayed (an FDTD instability, which only grows) is stopped at once and solved ag
 cell size (an instability belongs to one mesh: on the revision D board one region's grid was unstable at
 full size and stable at 0.9, and in a larger box with either absorber thickness). A region still running
 at `max_hours` is stopped there (time spent waiting for a job slot does not count), and the fine grid is
-not started when the coarse grid's measured time says it would pass `max_hours`. A region stopped has no
-answer, and says why.
+not started when the coarse grid's measured time says it would pass `max_hours`: the cap holds for the
+region's grids together, so the message gives the time used, the time the next grid needs and the
+`max_hours` that would let it finish. A region stopped has no answer, and says why.
 
 `evaluate --em run` solves the regions and their fix variants as many at a time as there are openEMS
 job slots (`OPENPCBSI_JOB_SLOTS`, default one per 16 cores). A fix variant is planned only where it
@@ -291,7 +292,12 @@ both then give the same verdict (recorded as agreed on the verdict, not the shap
 
 A run that stops on its step limit (a plane fragment that keeps ringing, which the board's decoupling
 would damp) is accepted when every port's voltage over the last tenth of the run is at least 50 dB
-below the largest port peak; the figure is recorded per grid.
+below the largest port peak; the figure is recorded per grid. A model still ringing there, but at least
+40 dB down on both grids and within 6 dB of each other (the structure ringing down, not one mesh), is
+judged on its TDR alone: the in-box window ends long before the cut, so the time record it is read from
+is complete (revision D records cut short to tails of -24 to -55 dB moved the in-box TDR by 0.2 points
+at most), while the spectrum of a cut ring is not, so no S-parameter result is given and the grids are
+not compared on the transmission. The verdict says "usable for the TDR only".
 
 A region net that ends on a part's pad inside the box (a connector pin, a BGA ball) gets a 50 ohm
 lumped port from the pad to the nearest reference plane under it: the receiver's or cable's load (100

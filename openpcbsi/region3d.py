@@ -42,8 +42,9 @@ The model (built here in KiCad's python, run by em3d.py in the openEMS python):
   than the PML plus the feed-to-measurement distance, a lane that reaches no other port or termination,
   a pair cut by a box corner, a port off square; run() then refuses a model predicted to stop on the
   step limit or to take longer than max_hours (run_estimate), all before anything is solved;
-- two grids; each run records whether it ended by the energy criterion or by the time-step limit; the
-  result is accepted only if both ended by the criterion and agree on line impedance and TDR;
+- two grids; each run records whether it ended by the energy criterion or by the time-step limit, and
+  how far its port waves had died away (TAIL_DB; a model still ringing but down by RING_DB on both grids
+  counts for its TDR alone, see ringing()); the grids are compared in grid_agreement;
 - the line impedance of the model is read from the TDR (renormalised to the port's measured impedance)
   and compared with the 2D solver for the same geometry (FS2); beyond 2 % the TDR is reported relative
   to the model's own line.
@@ -1459,6 +1460,8 @@ SPEED_MCS = 350.0        # Mcells/s assumed for a machine that has finished no g
 SETTLE = 2.0             # simulated time to the -40 dB end criterion, in excitation lengths (J1 launch: 1.6)
 STEP_CAP = 4.0         # a run's step limit: this many times the steps its excitation needs (run_estimate)
 TAIL_DB = -50.0        # a run cut on the step limit counts when every port is this far below the largest peak
+RING_DB = -40.0        # cut above TAIL_DB but below this on every grid, within RING_SPREAD_DB of each other: the
+RING_SPREAD_DB = 6.0   # structure rings down (it is not still filling); its TDR counts, its S-parameters do not
 MAX_HOURS = 6.0          # a region predicted to take longer (typically) is refused; on the clock, it is stopped there
 
 
@@ -1813,16 +1816,38 @@ def grid_agreement(a, b, limit=None):
             "reason": f"the grids straddle the {limit:g} % limit ({wa:.1f} and {wb:.1f} % {what})"}
 
 
+def ringing(runs):
+    """(ring, refusal) for the grids' runs, each {"ended_by", "tail_db"}: (None, None) when every run that
+    stopped on the step limit was quiet by then (TAIL_DB); a ring record when the model was still ringing
+    there but down by RING_DB on every grid, within RING_SPREAD_DB of each other (the structure's own
+    ring-down, not one mesh's), so its TDR counts and its S-parameters do not; else the refusal's reason.
+    The in-box TDR window ends long before the cut, so the time record it is read from is complete there
+    (rev D records cut short to tails of -24 to -55 dB moved the in-box TDR by 0.2 points at most); the
+    spectrum is not (a truncated ring smears the S-parameters near its frequency)."""
+    cut = [r for r in runs if r["ended_by"] != "end_criteria"]
+    loud = [r for r in cut if r.get("tail_db") is None or r["tail_db"] > TAIL_DB]
+    if not loud:
+        return None, None
+    worst = max((r.get("tail_db") or 0) for r in loud)
+    tails = [r.get("tail_db") for r in cut]
+    if (len(runs) >= 2 and all(t is not None and t <= RING_DB for t in tails)
+            and max(tails) - min(tails) <= RING_SPREAD_DB):
+        return {"tail_db": worst, "limit_db": TAIL_DB, "floor_db": RING_DB, "runs_cut": len(cut)}, None
+    return None, ("a run hit the time-step limit with its port waves still "
+                  f"{worst:.0f} dB from their peak (limit {TAIL_DB:g} dB" + (
+                      f"; {RING_DB:g} dB on every grid, within {RING_SPREAD_DB:g} dB of each other, for the TDR alone)"
+                      if len(runs) >= 2 else ")"))
+
+
 def _convergence(grids, runs, zref):
     """The grid comparison of a solved region (see grid_agreement): the first and the last grid given."""
     conv = {"runs": [{"res_scale": r["res_scale"], "cells": r["cells"], "seconds": r["seconds"], "ended_by": r["ended_by"],
                       "z_line_ohm": r["z_line_ohm"], "tail_db": r.get("tail_db"), "z_port_ohm": r["post"].get("z_port_ohm")}
                      for r in runs], "reference_ohm": round(float(zref), 2) if zref else None}
     cut = [r for r in runs if r["ended_by"] != "end_criteria"]
-    loud = [r for r in cut if r.get("tail_db") is None or r["tail_db"] > TAIL_DB]
-    if loud:
-        conv.update(converged=False, undecided=False, reason=("a run hit the time-step limit with its port waves still "
-                    f"{max((r.get('tail_db') or 0) for r in loud):.0f} dB from their peak (limit {TAIL_DB:g} dB)"))
+    ring, why = ringing(runs)
+    if why:
+        conv.update(converged=False, undecided=False, reason=why)
         return conv
     g = []
     for (_, m_), r in zip([grids[0], grids[-1]], [runs[0], runs[-1]]):
@@ -1830,7 +1855,8 @@ def _convergence(grids, runs, zref):
                                "z_line_ohm": None, "z_2d_ohm": zref})
         n = r["post"].get("tdr_net")
         ny = r["post"].get("at_nyquist") or {}
-        g.append({"exc": e and [e["min_pct"], e["max_pct"]], "net": n and [n["min_pct"], n["max_pct"]], "s21": ny.get("transmission_db")})
+        g.append({"exc": e and [e["min_pct"], e["max_pct"]], "net": n and [n["min_pct"], n["max_pct"]],
+                  "s21": None if ring else ny.get("transmission_db")})
     conv["per_grid"] = g
     # for the record: the in-box shape with each grid's own level removed (a level shift is the port lead's)
     w = window_ps(grids[-1][1])
@@ -1843,6 +1869,11 @@ def _convergence(grids, runs, zref):
             q = [z_[:n][m] / np.mean(z_[:n][m]) for z_ in zs]
             conv["shape_diff_level_removed_pct"] = round(float(np.max(np.abs(q[0] - q[1]))) * 100, 2)
     conv.update(grid_agreement(g[0], g[-1]))
+    if ring:
+        conv["ringing"] = ring
+        conv["reason"] = (f"TDR only: the model was still ringing when the step limit cut it (port waves {ring['tail_db']:.0f} dB "
+                          f"below their peak on the worst grid, over the {TAIL_DB:g} dB limit for S-parameters); " + conv["reason"])
+        return conv
     if cut and conv["converged"]:
         conv["reason"] += (f"; {len(cut)} run(s) stopped on the step limit with the port waves {max(r['tail_db'] for r in cut):.0f} dB "
                            "below their peak (energy left ringing in the model's planes, which the board's decoupling would damp)")
@@ -2015,11 +2046,19 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
             e_prev = est[gi - 1]
             e_next = est[gi]
             pred = runs[-1]["seconds"] * (e_next["cells"] / max(e_prev["cells"], 1)) * (e_prev["dt_fs"] / max(e_next["dt_fs"], 1e-9))
-            if time.time() + pred > clock["t"]:
+            left = clock["t"] - time.time()
+            if pred > left:
+                # max_hours holds for the region's solves together (waits for a job slot excepted): the
+                # grids already solved count against it
+                used = max_h * 3600.0 - left
                 res.update(ran=True, stopped={"grid": gi, "res_scale": scale, "why": "time", "seconds": 0.0,
-                                              "predicted_s": round(pred)}, seconds=round(time.time() - t0, 1))
-                res["convergence"] = {"converged": False, "reason": (f"grid {gi} not started: from grid {gi - 1}'s {runs[-1]['seconds']:.0f} s it "
-                                                                     f"would take about {pred / 3600:.1f} h, past max_hours = {max_h:g}")}
+                                              "predicted_s": round(pred), "used_s": round(used), "left_s": round(left)},
+                           seconds=round(time.time() - t0, 1))
+                res["convergence"] = {"converged": False, "reason": (
+                    f"grid {gi} not started: the region has used {used / 3600:.2f} h of max_hours = {max_h:g} (grid {gi - 1}: "
+                    f"{runs[-1]['seconds']:.0f} s), and from that grid {gi} would take about {pred / 3600:.2f} h, "
+                    f"{(used + pred) / 3600:.2f} h in all with {max(left, 0) / 3600:.2f} h left: raise max_hours "
+                    f"(OPENPCBSI_EM_MAX_HOURS) to at least {math.ceil((used + pred) / 3600 * 1.1 * 2) / 2:g} to solve it")}
                 res["verdict"] = verdict(res)
                 json.dump(res, open(os.path.join(od, "result.json"), "w"), indent=1)
                 return res
@@ -2091,7 +2130,7 @@ def run(ctx, spec, cache_dir, runs_dir, log=print):
     g = (res.get("convergence") or {}).get("per_grid") or []
     fl = res.get("reflection_floor_db")
     rk = next((k for k in ("Sdd11_db", "S11_db", "Scc11_db") if res.get(k)), None)
-    if res["convergence"].get("converged") and g and fl is not None and rk:
+    if res["convergence"].get("converged") and not res["convergence"].get("ringing") and g and fl is not None and rk:
         key = "net" if all(x.get("net") for x in g) else "exc"
         f_ = np.array(res["freq_ghz"])
         band = f_ <= ((res.get("link") or {}).get("nyquist_ghz") or f_.max())
@@ -2172,6 +2211,11 @@ def verdict(res):
     note = "" if cal.get("agree_pct") is not None else \
         f" (line not calibrated in this box: TDR against {ex.get('ref', '2D')}, {ex.get('ref_ohm', res.get('z_2d_ohm'))} ohm)"
     tdr = f"; TDR {ex['min_pct']:+.1f} / {ex['max_pct']:+.1f} %" if ex else ""
+    if conv.get("ringing"):
+        rg = conv["ringing"]
+        return (f"usable for the TDR only: both grids agree{tdr}; the model was still ringing ({rg['tail_db']:.0f} dB) when the "
+                f"step limit cut it, so its S-parameters are not resolved (energy left in the model's planes, which the "
+                f"board's decoupling would damp){note}")
     fl = res.get("reflection_floor_db")
     fl_s = f"; S11/Sdd11 below {fl:.0f} dB is the model's own (port leads), not resolved" if fl is not None else ""
     return "usable: both grids agree" + tdr + fl_s + note

@@ -426,6 +426,9 @@ def judge(job, res, base=None, cls_tol_pct=None):
     if res.get("clean"):
         out.append(("info", f"{job['name']}: {res.get('verdict')}"))
         return out
+    if conv.get("ringing"):
+        out.append(("info", f"{job['name']}: judged on the TDR alone: the model was still ringing "
+                            f"({conv['ringing']['tail_db']:.0f} dB) when the step limit cut it, so its S-parameters are not resolved"))
     # judged at the link's own edge when its class gives a rate (the in-box reflections, time-gated, seen
     # with that edge), else at the model's 35 ps
     net, ex = res.get("tdr_net"), res.get("tdr_excursion")
