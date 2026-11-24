@@ -66,9 +66,11 @@ def planeless(out, name="planeless"):
     return b.save()
 
 
-def rail_board(out, name="rail", current_field="1.5A", second_rail=True, unrouted=False):
+def rail_board(out, name="rail", current_field="1.5A", second_rail=True, unrouted=False, mid_vias=False):
     """+5V entry J1 -> regulator U1 (TPS62xxx) -> +1V8 -> load U2 (4 pins); optional +3V3 from U3 to U4.
-    U2 carries a `Current` field when `current_field` is set."""
+    U2 carries a `Current` field when `current_field` is set. `mid_vias`: the +1V8 tracks run 1 mm past
+    the two vias instead of ending on them (each via's centre on a track body, no track end on a via),
+    which KiCad connects; the copper between the via centres is the same as without."""
     b = Board(_p(out, name), layers=4, size=(40, 30))
     b.plane("In1.Cu", "GND")
     b.plane("In2.Cu", "GND")
@@ -91,11 +93,12 @@ def rail_board(out, name="rail", current_field="1.5A", second_rail=True, unroute
     load("U2", 30, 10, "+1V8", current_field)
     if not unrouted:
         b.track("F.Cu", [(3, 13.73), (11, 13.73), (11, 9)], 0.5, "+5V")
-        b.track("F.Cu", [(13, 9), (18, 9)], 0.3, "+1V8")          # through two vias on B.Cu (via current)
+        e = 1.0 if mid_vias else 0.0
+        b.track("F.Cu", [(13, 9), (18 + e, 9)], 0.3, "+1V8")      # through two vias on B.Cu (via current)
         b.via(18, 9, "+1V8")
-        b.track("B.Cu", [(18, 9), (24, 9)], 0.3, "+1V8")
+        b.track("B.Cu", [(18 - e, 9), (24 + e, 9)], 0.3, "+1V8")
         b.via(24, 9, "+1V8")
-        b.track("F.Cu", [(24, 9), (28.5, 9)], 0.3, "+1V8")
+        b.track("F.Cu", [(24 - e, 9), (28.5, 9)], 0.3, "+1V8")
         for i in range(4):
             b.track("F.Cu", [(28.5, 9), (28.5 + i, 9)], 0.3, "+1V8")
         for (x, y) in ((11, 11), (13, 11), (28.5, 11), (29.5, 11), (30.5, 11), (31.5, 11), (3, 16.27)):

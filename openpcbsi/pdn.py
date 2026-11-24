@@ -204,6 +204,21 @@ class Network:
                     L2 = T["len"][t] ** 2 or 1
                     s = ((x - T["x1"][t]) * (T["x2"][t] - T["x1"][t]) + (y - T["y1"][t]) * (T["y2"][t] - T["y1"][t])) / L2
                     splits[t].append((min(max(s, 0), 1), node_at[key]))
+        # a via on the body of a track (its centre inside the track, no track end on it): KiCad connects
+        # them, so the via joins the track at that point
+        mine = set(int(t) for t in ks)
+        for t, v in ctx.vias_on_track_bodies():
+            li = int(T["layer"][t])
+            if t not in mine or int(v) not in self.via_nodes or li not in self.via_nodes[int(v)]:
+                continue
+            vx, vy = V["x"][v], V["y"][v]
+            if min(math.hypot(vx - T["x1"][t], vy - T["y1"][t]), math.hypot(vx - T["x2"][t], vy - T["y2"][t])) <= V["d"][v] / 2:
+                continue                                  # an end is on the via: joined below
+            L2 = T["len"][t] ** 2 or 1
+            s = ((vx - T["x1"][t]) * (T["x2"][t] - T["x1"][t]) + (vy - T["y1"][t]) * (T["y2"][t] - T["y1"][t])) / L2
+            n = self.add_node("end", li, vx, vy)
+            splits[t].append((min(max(s, 0), 1), n))
+            self.add_branch(n, self.via_nodes[int(v)][li], "link", 1e-6)
         for t in ks:
             li = int(T["layer"][t])
             a = node_at[(li, round(T["x1"][t], 4), round(T["y1"][t], 4))]

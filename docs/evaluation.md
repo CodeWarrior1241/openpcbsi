@@ -114,6 +114,11 @@ etch_um = 20.0                # width +/- 2 x etch (gap the other way)
 thickness_pct = 10.0
 er_pct = 5.0
 
+[rules.pair_coupling]
+max_gap_mm = 0.18             # a sample is coupled while its P-N gap is at most this; unset, it is the
+gap_allowance_pct = 25.0      # pair's designed gap (.kicad_dru diff_pair_gap opt, else its netclass's
+                              # diff_pair_gap, not Default's) + max(25 %, two raster cells)
+
 [timing]
 skew_ps = 10.0                # group skew limit (groups in [timing.groups])
 pair_skew_ps = 1.0            # P/N skew limit (default: the interface standard's)
@@ -128,7 +133,14 @@ solved, and judged against the `validate --3d` cases, only with `--em run`).
 
 Limits are taken, in this order, from: a `.kicad_dru` rule that covers the net; the board config;
 without a reviewed config, the interface standard the net's name maps to (`standards.py`); the
-defaults above.
+defaults above. A `.kicad_dru` condition is read in the forms `A.NetClass == / != '...'`,
+`A.NetName == / != '...'`, `A.hasNetclass('...')` and `A.inDiffPair('...')` (KiCad's matching: the
+pair's base name, exactly, with `*` and `?`), joined with `&&`, `||`, `!` and parentheses. A rule with
+any other term (`B.`, `insideCourtyard()`, `Type`, ...) is listed under `rules_not_applied` in the
+report and not applied. A `.kicad_dru` `skew` rule is judged as KiCad judges it, in length: tracks
+plus each via's span (when the project uses stackup height for lengths, KiCad's default), over every
+net the rule covers or per pair with `(within_diff_pairs)`; the pairs it covers are not judged again
+against `pair_skew_ps`.
 
 ## Sign-off record
 

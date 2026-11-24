@@ -1355,6 +1355,7 @@ def _match_files(ctx, src, supplied, cmd=None, log=print):
             ox, oy = g.x0 + jj.min() * g.res - gx0, g.y0 + ii.min() * g.res + gy1
             if abs(ox) > 0.2 or abs(oy) > 0.2:
                 dx, dy = round(ox, 3), round(oy, 3)
+                dx, dy = _refine_offset(b, files[ref_layer], ref_layer, dx, dy, 3 * g.res)
     metrics = {}
     compared = 0
 
@@ -1455,6 +1456,32 @@ def _match_files(ctx, src, supplied, cmd=None, log=print):
     params = {"files": src, "command": cmd, "offset_mm": [dx, dy], "resolution_mm": g.res,
               "detects": "tracks, pads and vias to 1 um in position and size; other copper, mask and paste differences wider than two pixels"}
     return {"fs": fs, "metrics": metrics, "params": params, "compared": compared}
+
+
+def _refine_offset(b, G, layer, dx, dy, reach):
+    """The origin shift of the files, exact: the raster estimate (dx, dy) is good to a cell, the 1 um
+    feature comparison needs better. KiCad moves every coordinate by the same amount (the auxiliary
+    origin), so the median offset of this layer's flashes from the board's pad and via centres is the
+    shift; the other layers are then judged against it. Kept as estimated unless at least 3 flashes agree
+    to within 1 um."""
+    li = b.layers.index(layer)
+    pts = [(p["x"], p["y"]) for p in b.pads if layer in p["layers"] and p.get("shape") != "custom"]
+    V = b.vias
+    pts += [(V["x"][k], V["y"][k]) for k in range(len(V["x"])) if li in b.via_flashed[k]]
+    F = np.array([(x + dx, -y + dy) for x, y, w, h, a, dark in G["flashes"] if dark]).reshape(-1, 2)
+    if len(pts) < 3 or len(F) < 3:
+        return dx, dy
+    d, k = cKDTree(np.array(pts)).query(F, distance_upper_bound=reach)
+    ok = np.isfinite(d)
+    if ok.sum() < 3:
+        return dx, dy
+    P = np.array(pts)[k[ok]]
+    res = P - F[ok]
+    mx, my = np.median(res[:, 0]), np.median(res[:, 1])
+    agree = (np.abs(res[:, 0] - mx) <= VEC_TOL) & (np.abs(res[:, 1] - my) <= VEC_TOL)
+    if agree.sum() < 3:
+        return dx, dy
+    return round(dx + float(np.median(res[agree, 0])), 6), round(dy + float(np.median(res[agree, 1])), 6)
 
 
 VEC_TOL = 0.001      # mm: position and size of a feature in the files against the board

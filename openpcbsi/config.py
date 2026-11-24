@@ -39,7 +39,10 @@ DEFAULTS = {
         "decap": {"enabled": True, "via_mm": 0.3, "prefixes": ["C"], "load_refs": [], "load_mm": 10.0},
         "parallel": {"enabled": True, "classes": [], "max_spacing_mm": 1.0, "limits": [[0.5, 0.0]],
                      "nonpair_min_mm": 0.36},
-        "pair_coupling": {"enabled": True, "classes": [], "max_gap_mm": 0.18, "limit_mm": 1.0},
+        # max_gap_mm: a pair sample is coupled while its gap is at most this. Unless the config or a
+        # .kicad_dru diff_pair_gap max sets it, it is the pair's designed gap (.kicad_dru opt or the
+        # netclass's diff_pair_gap) + max(gap_allowance_pct, 2 raster cells); 0.18 only without either.
+        "pair_coupling": {"enabled": True, "classes": [], "max_gap_mm": 0.18, "limit_mm": 1.0, "gap_allowance_pct": 25.0},
         "pad_plane": {"enabled": True, "classes": [], "ratio": 1.5, "fast_ghz": 3.0},
         "power_overlap": {"enabled": True, "max_dielectric_mm": 0.2, "min_area_mm2": 1.0},
         "stubs": {"enabled": True, "classes": [], "max_stub_mm": 2.0, "dangling_min_mm": 0.05},
@@ -150,7 +153,17 @@ class Config:
         self.path = path
         self.detected = None
         self.project = None
+        self.user = copy.deepcopy(data or {})     # what the file (or caller) set, before the defaults
         self.data = deep_merge(DEFAULTS, data or {})
+
+    def is_set(self, *keys):
+        """True if the config itself (not DEFAULTS) gives this key."""
+        d = self.user
+        for k in keys:
+            if not isinstance(d, dict) or k not in d:
+                return False
+            d = d[k]
+        return True
 
     @classmethod
     def load(cls, path):

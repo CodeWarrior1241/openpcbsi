@@ -11,6 +11,7 @@ Writes tests/out/acceptance.json and docs/acceptance.md (the status table). Exit
 Status: pass, fail, blocked (needs an input this machine does not have), error (the test itself broke).
 """
 import argparse
+import fnmatch
 import glob
 import gzip
 import json
@@ -153,7 +154,38 @@ def t02_project():
     lim = {f.get("limit") for f in pc}
     need(2.0 in lim, f"pair_coupling limit {lim}, want 2.0 from .kicad_dru")
     need(any(f["severity"] == "error" for f in pc), "3 mm uncoupled against a 2 mm limit is not an error")
-    return ok("class HS from .kicad_pro, uncoupled limit 2.0 mm from .kicad_dru")
+    # the other forms KiCad writes: function calls, grouping, KiCad's own inDiffPair() (the base name
+    # matched exactly: 'HSL0' is not the pair HSL0_TX, a later rule that would win if it matched), and a
+    # condition outside the understood forms, which must be listed and not applied
+    b2 = boards.pair_uncoupled(d, "forms", "HSL0_TX", split_len=3.0,
+                               netclass=("HS", ["HSL*"], {"diff_pair_width": 0.12, "diff_pair_gap": 0.15}),
+                               dru=['(rule hs_unc (condition "(A.hasNetclass(\'HS\')) && A.inDiffPair(\'HSL0_TX\')") '
+                                    '(constraint diff_pair_uncoupled (max 2mm)))',
+                                    '(rule base_only (condition "A.inDiffPair(\'HSL0\')") (constraint diff_pair_uncoupled (max 9mm)))',
+                                    '(rule geo (condition "A.insideCourtyard(\'U1\') && A.hasNetclass(\'HS\')") '
+                                    '(constraint diff_pair_uncoupled (max 8mm)))'])
+    r2 = evaluate(b2, "--checks", "drc", "--no-drc")
+    need(r2["rep"], f"no report: {r2['err'][-300:]}")
+    pc2 = [f for f in findings(r2["rep"], "pair_coupling", ("error",)) if f["net"].startswith("HSL0")]
+    lim2 = {f.get("limit") for f in pc2}
+    need(lim2 == {2.0}, f"hasNetclass()/inDiffPair() rule: uncoupled limit {lim2}, want {{2.0}} (9.0: inDiffPair('HSL0') matched "
+                        f"HSL0_TX; 8.0: an insideCourtyard() rule applied; empty: the rule was not read)")
+    na = {x["rule"] for x in (r2["rep"].get("project") or {}).get("rules_not_applied", [])}
+    need(na == {"geo"}, f"rules not applied {na}, want only the insideCourtyard() rule")
+    # no gap limit in the config or the .kicad_dru: the pair's designed gap decides what is coupled. A
+    # 0.3 / 0.2 mm pair in its netclass is coupled along its whole length (a fixed 0.18 mm said uncoupled)
+    b3 = boards.pair_over_plane(d, "usbgap", w=0.3, gap=0.2, net="USB_DN1",
+                                netclass=("USB_HS", ["USB_*"], {"diff_pair_width": 0.3, "diff_pair_gap": 0.2}))
+    r3 = evaluate(b3, "--checks", "drc", "--no-drc")
+    need(r3["rep"], f"no report: {r3['err'][-300:]}")
+    met = next(rr["metrics"] for rr in r3["rep"]["checks"]["drc"] if rr["rule"] == "pair_coupling")
+    m3 = next((v for k, v in met.items() if k.startswith("USB_DN1")), None)
+    need(m3 and m3["uncoupled_mm"] < 0.5 and m3["gap_median_mm"] is not None and abs(m3["gap_median_mm"] - 0.2) < 0.03,
+         f"0.3 / 0.2 mm pair, netclass gap 0.2 mm: {m3}")
+    need(not [f for f in findings(r3["rep"], "pair_coupling", ("error",)) if f["net"].startswith("USB_DN1")],
+         "a pair routed at its designed gap fails pair coupling")
+    return ok(f"class HS from .kicad_pro, uncoupled limit 2.0 mm from .kicad_dru (also as hasNetclass() && inDiffPair(), "
+              f"geo rule listed); 0.2 mm pair coupled over {30 - m3['uncoupled_mm']:.1f} of 30 mm, median gap {m3['gap_median_mm']} mm")
 
 
 @case(3, "Zone fills are refilled before extraction (a board saved unfilled gives the right answer)")
@@ -267,7 +299,18 @@ def t06_standards():
     need(res["PCIE_TX0"][0] and "pcie" in str(res["PCIE_TX0"][0]).lower(), f"PCIE nets not mapped to a PCIe standard: {res['PCIE_TX0'][0]}")
     need(res["LVDS_D0"][0] and "lvds" in str(res["LVDS_D0"][0]).lower(), f"LVDS nets not mapped to LVDS: {res['LVDS_D0'][0]}")
     need(res["PCIE_TX0"][2] != res["LVDS_D0"][2], f"same uncoupled limits for both standards: {res}")
-    return ok(f"PCIe limit {res['PCIE_TX0'][2]}, LVDS limit {res['LVDS_D0'][2]}")
+    # detection gives a class its standard's edge and tolerance too: USB names also carry a 90 ohm guess,
+    # which must not keep the usb2 figures (500 ps, +/- 15 %) out of the class
+    USB2 = {"z_diff": 90.0, "z_tol": 13.5, "rise_ps": 500.0, "nyquist_ghz": 0.24}    # 90 ohm +/- 15 %, >= 500 ps, 480 Mb/s
+    bu = boards.pair_over_plane(d, "usb", net="USB_DN1")
+    ru = evaluate(bu, "--checks", "drc", "--no-drc")
+    need(ru["rep"], f"no report for USB: {ru['err'][-200:]}")
+    cls = next((c for c in (ru["rep"].get("config_used") or {}).get("classes", {}).values()
+                if any(fnmatch.fnmatchcase("USB_DN1_P", p) for p in c.get("patterns", []))), None)
+    need(cls, "USB_DN1 is in no detected class")
+    got = {k: cls.get(k) for k in USB2}
+    need(got == USB2, f"detected USB class {got}, want the usb2 standard's {USB2}")
+    return ok(f"PCIe limit {res['PCIE_TX0'][2]}, LVDS limit {res['LVDS_D0'][2]}; detected USB class {got}")
 
 
 def _hj(w, h, t, er):
@@ -663,7 +706,42 @@ def t25_timing():
     want = row["length_mm"] * 1e-3 * math.sqrt(row["eps_eff"]) / 2.998e8 * 1e12
     need(abs(row["delay_ps"] - want) / want < 0.02, f"delay {row['delay_ps']} ps vs {want:.1f}")
     need(t["groups"]["G0"]["skew_ps"] < 1.0, "matched pair shows skew")
-    return ok(f"{row['delay_ps']:.1f} ps over {row['length_mm']:.1f} mm")
+    # a .kicad_dru skew rule is judged on KiCad's measurand (tracks plus via spans): P hops to B.Cu and
+    # back through two vias. KiCad's own DRC on the same board is the oracle for the value
+    from gen import Board
+    p = os.path.join(d, "sk", "sk.kicad_pcb")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    bb = Board(p, layers=4, size=(40, 20))
+    bb.plane("In1.Cu", "GND")
+    bb.plane("In2.Cu", "GND")
+    yp, yn = 10 - 0.135, 10 + 0.135
+    bb.track("F.Cu", [(5, yp), (12, yp), (13, 8.5)], 0.12, "LANE0_TX_P")
+    bb.via(13, 8.5, "LANE0_TX_P")
+    bb.track("B.Cu", [(13, 8.5), (17, 8.5)], 0.12, "LANE0_TX_P")
+    bb.via(17, 8.5, "LANE0_TX_P")
+    bb.track("F.Cu", [(17, 8.5), (18, yp), (35, yp)], 0.12, "LANE0_TX_P")
+    bb.track("F.Cu", [(5, yn), (35, yn)], 0.12, "LANE0_TX_N")
+    bb.rule("(rule pair_skew (condition \"A.inDiffPair('LANE0_TX')\") (constraint skew (max 2mm)))")
+    bb.save()
+    rk = evaluate(p, "-c", _cfg_class(d, "sk"), "--checks", "timing", "--no-drc")
+    need(rk["rep"] and "timing" in rk["rep"]["checks"], f"no timing check: {(rk['err'] or '')[-200:]}")
+    ds = rk["rep"]["checks"]["timing"].get("dru_skew") or []
+    need(len(ds) == 1 and ds[0]["rule"] == "pair_skew", f"the .kicad_dru skew rule was not judged: {ds}")
+    ours = ds[0]["skew_mm"]
+    tracks_only = abs(ds[0]["lengths_mm"]["LANE0_TX_P"]["tracks"] - ds[0]["lengths_mm"]["LANE0_TX_N"]["tracks"])
+    out = os.path.join(d, "sk_drc.json")
+    pr = subprocess.run(["kicad-cli", "pcb", "drc", "--severity-all", "--format", "json", "-o", out, p],
+                        capture_output=True, text=True, timeout=600)
+    need(os.path.exists(out), f"kicad-cli drc wrote nothing: {pr.stderr[-200:]}")
+    sk = [v for v in json.load(open(out)).get("violations", []) if v.get("type") == "skew_out_of_range"]
+    need(sk, "KiCad reports no skew violation (the oracle board is wrong)")
+    m = re.search(r"actual\s+(-?[\d.]+)\s*mm", sk[0]["description"])     # KiCad: net length - longest
+    need(m, f"KiCad's skew text not understood: {sk[0]['description']}")
+    theirs = abs(float(m.group(1)))
+    need(abs(ours - theirs) < 0.01, f"skew {ours:.4f} mm, KiCad {theirs:.4f} mm (tracks only {tracks_only:.4f} mm)")
+    need(tracks_only < 2.0 < ours and ev_findings(rk["ev"], "timing", ("warn",)), "the skew over 2 mm is not reported")
+    return ok(f"{row['delay_ps']:.1f} ps over {row['length_mm']:.1f} mm; .kicad_dru skew {ours:.3f} mm = KiCad {theirs:.3f} mm "
+              f"(tracks only {tracks_only:.3f} mm)")
 
 
 @case(26, "Via technologies: a blind via has no stub; a back-drilled via keeps only its remaining stub")
@@ -803,6 +881,33 @@ def t31_guidance():
     m = re.search(r"w\s*=\s*([\d.]+).*Zdiff\s*=\s*([\d.]+)", so)
     need(rc == 0 and m and abs(float(m.group(2)) - 100) < 1.0, f"plan: {(so or se)[-200:]}")
     return ok(f"budget sums; hint present; plan w={m.group(1)} mm")
+
+
+@case(71, "Connectivity: a via on a track's body (no track end on it) joins the track, as KiCad connects it; the DC network carries the current through it")
+def t71_via_on_track():
+    d = out_dir("t71")
+    ends = boards.rail_board(d, "ends", current_field="1.5A", second_rail=False)
+    mid = boards.rail_board(d, "mid", current_field="1.5A", second_rail=False, mid_vias=True)
+    # the oracle: KiCad itself sees the mid-track vias connected
+    out = os.path.join(d, "mid_drc.json")
+    pr = subprocess.run(["kicad-cli", "pcb", "drc", "--severity-all", "--format", "json", "-o", out, mid],
+                        capture_output=True, text=True, timeout=600)
+    need(os.path.exists(out), f"kicad-cli drc wrote nothing: {pr.stderr[-200:]}")
+    unc = [u for u in json.load(open(out)).get("unconnected_items", [])
+           if "+1V8" in " ".join(i.get("description", "") for i in u.get("items", []))]
+    need(not unc, f"KiCad finds the +1V8 vias unconnected (the test board is wrong): {unc[:1]}")
+    res = {}
+    for nm, b in (("ends", ends), ("mid", mid)):
+        r = evaluate(b, "--checks", "dc,drc", "--no-drc", out=os.path.join(d, "run_" + nm))
+        need(r["rep"], f"{nm}: no report: {r['err'][-300:]}")
+        row = next((x for x in r["rep"]["checks"]["dc"]["rails"] if x["net"] == "+1V8"), None)
+        need(row, f"{nm}: no +1V8 rail")
+        need(not any("not connected" in p for p in row.get("problems", [])) and row.get("drop_mv"),
+             f"{nm}: {row.get('problems')} (drop {row.get('drop_mv')})")
+        res[nm] = row["drop_mv"]
+    # the copper between the via centres is the same on both boards, and the stubs carry no current
+    need(abs(res["mid"] - res["ends"]) / res["ends"] < 0.03, f"drop {res['mid']} mV with vias on track bodies, {res['ends']} mV with ends on them")
+    return ok(f"KiCad: connected; drop {res['mid']:.2f} mV (vias on track bodies) vs {res['ends']:.2f} mV (track ends on the vias)")
 
 
 @case(32, "Library API and live board: a snapshot, and the board open in KiCad, give the CLI's findings")
@@ -1328,6 +1433,38 @@ def t45_output():
     feat = _rule(r2["ev"], "output_match")["metrics"]["sent"]["features"]
     need(feat["F.Cu"]["tracks"] > 0 and feat["F.Cu"]["pads"] > 0 and feat.get("F.Paste", {}).get("apertures", 0) > 0,
          f"features compared: {feat}")
+    # files plotted from the auxiliary origin (KiCad's "use drill/place file origin"), on a board whose
+    # first copper is off the 25 um raster: the shift estimated from the images is then a cell out, and
+    # the 1 um feature and outline comparisons need the exact shift
+    from gen import Board
+    ba = os.path.join(d, "aux", "aux.kicad_pcb")
+    os.makedirs(os.path.dirname(ba))
+    bx = Board(ba, layers=4, size=(30, 20))
+    bx.plane("In1.Cu", "GND")
+    bx.plane("In2.Cu", "GND")
+    bx.track("F.Cu", [(5.0137, 6.0129), (25, 6.0129)], 0.2, "SIG")
+    bx.via(25, 6.0129, "SIG")
+    bx.two_pin("C1", "100n", 15, 12, "SIG", "GND")
+    bx.track("F.Cu", [(14.5, 12), (14.5, 6.0129)], 0.2, "SIG")
+    bx.save()
+    txt = open(ba).read()
+    open(ba, "w").write(txt.replace("\t\t(pcbplotparams", "\t\t(aux_axis_origin 3.0137 2.0071)\n\t\t(pcbplotparams", 1))
+    need("(aux_axis_origin 3.0137 2.0071)" in open(ba).read(), "could not set the auxiliary origin of the test board")
+    aux = os.path.join(d, "sent_aux")
+    os.makedirs(aux)
+    for cmd in (["gerbers", "-o", aux + os.sep, "--layers", "F.Cu,In1.Cu,In2.Cu,B.Cu,F.Paste,B.Paste,F.Mask,B.Mask,Edge.Cuts",
+                 "--use-drill-file-origin", "--no-x2"],
+                ["drill", "-o", aux + os.sep, "--format", "excellon", "--excellon-units", "mm", "--excellon-separate-th",
+                 "--drill-origin", "plot"]):
+        pa = subprocess.run(["kicad-cli", "pcb", "export"] + cmd + [ba], capture_output=True, text=True, timeout=600)
+        need(pa.returncode == 0, f"kicad-cli export {cmd[0]}: {pa.stderr[-200:]}")
+    ra = dfm(ba, "--checks", "output", "--gerbers", aux)
+    need(ra["ev"], f"no dfm.json: {ra['err'][-300:]}")
+    sa = _rule(ra["ev"], "output_match")
+    off = sa.get("params", {}).get("offset_mm") or (sa.get("metrics", {}).get("sent", {}) or {}).get("offset_mm")
+    need(not ev_findings(ra["ev"], "output_match", ("warn", "fail")),
+         f"files plotted from the aux origin (offset found {off}): {[f['reason'][:90] for f in ev_findings(ra['ev'], 'output_match', ('warn', 'fail'))]}")
+    need(off and abs(off[0] - 3.0137) < 1e-4 and abs(off[1] - 2.0071) < 1e-4, f"offset found {off}, want [3.0137, 2.0071]")
     # planted file faults the images cannot see or that are not copper: tracks plotted 40 um narrow
     # (20 um per edge, under the two 25 um pixels of the images), one layer moved by 10 um, a paste
     # aperture removed, the outline cut short, a part moved in the placement file

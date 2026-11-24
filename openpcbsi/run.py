@@ -36,6 +36,7 @@ def configure(snap, cfg=None):
     the snapshot's board, if any, gives netclasses and custom rules (#2)."""
     from . import project as project_mod
     proj = project_mod.load(snap["board"])
+    proj.set_nets(snap["nets"])
     for name, v in snap["nets"].items():
         v["netclass"] = proj.netclass(name, v.get("netclass"))
     if isinstance(cfg, config_mod.Config):

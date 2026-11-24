@@ -170,6 +170,12 @@ by the stated bound where it is not.
 ### The files
 
 With `--gerbers DIR` the files in that folder are read: these should be the files that are sent.
+Files plotted from the auxiliary origin (KiCad's "use drill/place file origin") are moved back by one
+shift for all layers and the drill files: estimated from the first copper layer's image, then made
+exact from the median offset of that layer's flashes from the board's pad and via centres (kept as
+estimated unless three or more agree to 1 µm). A single layer moved against the others still differs.
+The comparison works on the zone fill as refilled; files plotted from a stored fill that is out of
+date differ on the pours.
 
 - **Feature by feature**, to 1 µm: every straight track as a draw with the same ends and width,
   every pad and via as a flash at its centre with its size, every paste aperture as a flash with the

@@ -21,6 +21,7 @@ Detected:
                    at an assumed current is never worse than `warn` (see evaluate.py).
 """
 import fnmatch
+import os
 import re
 from collections import defaultdict
 
@@ -156,10 +157,10 @@ def pair_classes(B, suffixes, gnd, power):
             cname = "diff"
         TIER[cname] = "serdes" if (serdes or TIER.get(cname) == "serdes") else "diff"
         classes[cname] += [n, q]
-        if zm:
-            zdiff.setdefault(cname, float(zm.group(1)))
+        if zm:                                         # the designer's figure, in the netclass name
+            zdiff.setdefault(cname, (float(zm.group(1)), "netclass"))
         elif USB_RE.search(n) and not SERDES_RE.search(n.split("/")[-1]):
-            zdiff.setdefault(cname, 90.0)
+            zdiff.setdefault(cname, (90.0, "name"))       # a guess from the net name
     return classes, zdiff, seen
 
 
@@ -407,13 +408,17 @@ def detect(snap, suffixes=None):
         d = dict(CLASS_DEFAULTS["serdes" if TIER.get(cname) == "serdes" or cname.startswith("serdes") else
                                cname if cname in CLASS_DEFAULTS else "diff"])
         note = d.pop("note")
-        if cname in zdiff:
-            d["z_diff"] = zdiff[cname]
         from . import standards
         std = standards.of_net(nets[0])
-        if std and cname not in zdiff:         # #6: the interface standard of the class's nets
+        z, zsrc = zdiff.get(cname, (None, None))
+        if std:                                # #6: the interface standard of the class's nets
             d.update({k: std[1][k] for k in ("z_diff", "z_tol", "rise_ps", "nyquist_ghz")})
             note = f"standard {std[0]}: {std[1]['source']}"
+        if z is not None and (zsrc == "netclass" or not std):
+            if std and z != d["z_diff"]:       # the netclass's impedance, at the standard's relative tolerance
+                d["z_tol"] = round(d["z_tol"] * z / d["z_diff"], 3)
+                note += f"; Zdiff {z:g} ohm from the netclass name"
+            d["z_diff"] = z
         d["patterns"] = sorted(_glob_escape(n) for n in nets)
         cfg["classes"][cname] = d
         notes["assumptions"].append(f"class {cname}: {len(nets) // 2} pairs, rise {d['rise_ps']:g} ps, "
@@ -495,7 +500,7 @@ def _tk(k):
 def to_toml(cfg, notes, board_path):
     """The detected config as a TOML file to review: every assumption is commented."""
     L = [f"# openpcbsi board config drafted by `python3 -m openpcbsi init` from",
-         f"#   {board_path}",
+         f"#   {os.path.basename(board_path)}   (file name only: a config in boards/ is shipped, #63)",
          "# Everything below was detected from the board (detect.py). Review it before trusting a",
          "# result: edge rates, rail currents, tolerances and ripple targets are not on the board.",
          "# The pilot's boards/au7p-fmc.toml shows every section with comments.", ""]

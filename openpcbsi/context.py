@@ -119,6 +119,12 @@ class Context:
             hit = proj.limit(rule, param, net, self.b.kicad_class.get(net))
             if hit:
                 return hit
+        if (rule, param) == ("pair_coupling", "max_gap_mm") and not self.cfg.is_set("rules", rule, param) and proj is not None:
+            dg = proj.design_gap(net, self.b.kicad_class.get(net))
+            if dg:                             # the board's own designed gap, plus the measurement allowance
+                pct = self.cfg["rules"][rule].get("gap_allowance_pct", 25.0)
+                allow = max(dg[0] * pct / 100.0, 2 * self.g.res)
+                return round(dg[0] + allow, 4), f"designed gap {dg[0]:g} mm ({dg[1]}) + {allow:g} mm"
         if not self.cfg.path:                  # no reviewed config: the interface standard's figure (#6)
             from . import standards
             hit = standards.limit(rule, param, net)
@@ -214,8 +220,30 @@ class Context:
         self._vzl = out
         return out
 
+    def vias_on_track_bodies(self):
+        """[(track, via)] of a via whose centre lies inside a track of its own net (distance to the
+        centreline <= w/2): KiCad connects them (its anchor test), although no track end is on the via."""
+        if hasattr(self, "_vob"):
+            return self._vob
+        b = self.b
+        V, T = b.vias, b.tracks
+        out = []
+        if len(V["x"]) and len(T["w"]):
+            from scipy.spatial import cKDTree
+            tree = cKDTree(np.c_[V["x"], V["y"]])
+            mx, my = (T["x1"] + T["x2"]) / 2, (T["y1"] + T["y2"]) / 2
+            reach = np.hypot(T["x2"] - T["x1"], T["y2"] - T["y1"]) / 2 + T["w"] / 2
+            for t in range(len(T["w"])):
+                for k in tree.query_ball_point([mx[t], my[t]], r=float(reach[t])):
+                    if V["net"][k] == T["net"][t] and \
+                            float(geom.point_seg_dist(V["x"][k], V["y"][k], T["x1"][t], T["y1"][t], T["x2"][t], T["y2"][t])) <= T["w"][t] / 2:
+                        out.append((t, k))
+        self._vob = out
+        return out
+
     def via_track_layers(self):
-        """For every via: set of layers with a track of its net ending on it, or a pad of its net under it."""
+        """For every via: set of layers with a track of its net ending on it or running over it (the via's
+        centre inside the track's copper), or a pad of its net under it."""
         if hasattr(self, "_vtl"):
             return self._vtl
         b = self.b
@@ -232,6 +260,8 @@ class Context:
                     for k in cand:
                         if V["net"][k] == T["net"][t] and math.hypot(V["x"][k] - pts[t, 0], V["y"][k] - pts[t, 1]) <= V["d"][k] / 2 + 0.01:
                             out[k].add(int(T["layer"][t]))
+            for t, k in self.vias_on_track_bodies():
+                out[k].add(int(T["layer"][t]))
             for p in b.pads:
                 if p["kind"] not in ("smd", "conn") or not p["poly"]:
                     continue
