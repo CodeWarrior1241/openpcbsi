@@ -54,41 +54,42 @@ measurements.
 ## Example: an FPGA carrier board
 
 An 8-layer, 100 × 100 mm carrier for an XCAU7P FPGA with an FMC LPC connector was laid out by an
-agentic KiCad tool (Backplane) and released as revision A with KiCad DRC clean: 0 violations,
-0 unconnected, schematic parity. openpcbsi found the following on it and on the later revisions;
-the fixes went into revisions B to D, with DRC clean throughout:
+agentic KiCad tool (Backplane), which called it complete with KiCad DRC clean: 0 violations,
+0 unconnected, schematic parity. openpcbsi's sign-off found the issues below in that board. The
+final board, still DRC clean, is what Backplane made of them:
 
-- **Supply drop.** On revision A, VCCBRAM lost 36.5 mV from regulator to balls (143 % of its ±3 %
+- **Supply drop.** Initial: VCCBRAM lost 36.5 mV from regulator to balls (143 % of its ±3 %
   window) and MGTVCCAUX 58.2 mV (108 %). openpcbsi splits each drop into shunt and copper, which
-  showed the layout's share: a 0.2 mm feed bar into the ball field, and a 56 mm run of thin +1V8
-  plane shared with two LDOs. Widening both brought MGTVCCAUX to 36.2 mV (67 %) and VCCBRAM's copper
-  share from 14.6 to 4.7 mV. The rest is the 50 mΩ sense shunt, a schematic choice.
-- **Track heating.** Four VCCAUX balls were fed only by a chain of 0.1 mm inner-layer tracks:
-  0.27 A in the worst segment, a 58 °C rise by IPC-2221. Two parallel paths per link cut this to
-  0.07 A and 3.2 °C, and the VCCAUX drop from 29.4 to 21.9 mV.
-- **Pads over solid plane.** The 0402 AC-coupling capacitors on the GTH receive lane and reference
-  clock sat 0.116 mm above solid ground. A separate openEMS model put this at a −29 % TDR dip and
-  −10.4 dB return loss at 6.25 GHz; with the plane cut out under the pads, −15 % and −20.4 dB. On
-  the final revision, openpcbsi's own 3D region passes these capacitors as clean: TDR within 3.1 %,
-  return loss −22 dB. The same check then found the six GTH pads of the FMC connector, cut out in
-  revision D.
-- **Return paths.** The GTH reference clock changed layers 6.2 / 6.8 mm from the nearest return
-  via. The board edge ran 364 mm with no stitching, and stretches of the GTH pairs ran up to 20 mm
-  without a ground via. About 230 ground vias brought the return-via failures to zero and the
-  stitching gaps to at most 13.2 mm on the edge and 3.2 mm along the GTH pairs.
+  pointed at the layout's share: a 0.2 mm feed bar into the ball field, and a 56 mm run of thin
+  +1V8 plane shared with two LDOs. Final: both widened; MGTVCCAUX 36.2 mV (67 %), VCCBRAM's copper
+  share 4.7 mV instead of 14.6 mV. The rest of VCCBRAM's drop is its 50 mΩ sense shunt, a
+  schematic choice.
+- **Track heating.** Initial: four VCCAUX balls fed only by a chain of 0.1 mm inner-layer tracks,
+  0.27 A in the worst segment, a 58 °C rise by IPC-2221. Final: two parallel paths per link,
+  0.07 A and 3.2 °C, and the VCCAUX drop down from 29.4 to 21.9 mV.
+- **Pads over solid plane.** Initial: the 0402 AC-coupling capacitors on the GTH receive lane and
+  reference clock, and six GTH pads of the FMC connector, sat over solid ground. For the receive
+  capacitors, a separate openEMS model gave a −29 % TDR dip and −10.4 dB return loss at 6.25 GHz.
+  Final: the plane is cut out under all of them, and openpcbsi's own 3D region passes the receive
+  capacitors as clean: TDR within 3.1 %, return loss −22 dB.
+- **Return paths.** Initial: the GTH reference clock changed layers 6.2 / 6.8 mm from the nearest
+  return via, the board edge ran 364 mm with no stitching, and stretches of the GTH pairs ran up to
+  20 mm without a ground via. Final: about 230 ground vias; return vias at every pair layer change,
+  stitching gaps of at most 13.2 mm on the edge and 3.2 mm along the GTH pairs.
 - **Manufacturing.** The review against the fabricator's limits found 14 same-net copper gaps of
-  0.12–0.22 mm, under the 0.25 mm minimum. Eleven were filled; the other three could not be without
-  coming within 0.09 mm of another net. It also flagged 62 vias in SMD pads, which must be ordered
-  filled and capped.
+  0.12–0.22 mm, under its 0.25 mm minimum, and 62 vias in SMD pads. Final: 11 gaps filled (the other
+  three cannot be without coming within 0.09 mm of another net), and the vias in pads called out to
+  be ordered filled and capped.
 
-The findings are inputs for an engineer, not a certificate. On revision C openpcbsi reported 84
-failures; three kinds of finding were changed in revision D, and the rest were assessed and kept:
-PDN targets at 100 MHz stricter than AMD's own guidance, fan-out necks that are electrically short at
-LVDS rates, and power-split crossings that openEMS showed cost under 1 % on the differential signal.
-Its DC results agree with KiPI's to within +3 to +13 %. The board also tested the tool: on
-revision A none of openpcbsi's 3D regions gave a usable answer. After the fixes that board prompted,
-all seven give one: five pass or are usable, and two raise TDR warnings (one of them needs a longer
-time cap).
+What remains on the final board was assessed and kept, which is how openpcbsi is meant to be used:
+its findings are inputs for an engineer, not a certificate. VCCBRAM still uses 104 % of its window,
+all of it in the sense shunt. The PDN targets at 100 MHz are stricter than AMD's own guidance.
+Fan-out necks are electrically short at LVDS rates. The power-split crossings cost under 1 % on the
+differential signal in openEMS. The GTH stitching gaps of 2.7–3.2 mm sit just over a 2.3 mm rule
+of thumb. openpcbsi's DC results agree with KiPI's to within +3 to +13 %. The board also tested
+openpcbsi itself: when it first ran here, none of its 3D field-solver regions gave a usable answer.
+After the fixes this board prompted, all seven do. Five pass or are usable, and two raise TDR
+warnings (one of them needs a longer time cap).
 
 ## Requirements
 
@@ -253,33 +254,45 @@ checked and the file formats: [docs/dfm.md](docs/dfm.md).
 
 ## Commands
 
-| Command | What it does |
-|---------|--------------|
-| `evaluate BOARD [-c CFG] [--waivers FILE] [--families ...] [--checks ...] [--stage S] [--since EVAL] [--em none\|plan\|run] [--json OUT] [-o DIR] [--no-drc] [--no-markers]` | Every check plus KiCad DRC, a scorecard and an exit code. `--em plan` lists automatic 3D regions, `--em run` runs them (minutes each). |
-| `signoff BOARD [evaluate options] [--reviewer NAME] [--sign-key KEY]` | Evaluate and write `signoff.json`, tied to the exact inputs (and signed). |
-| `verify-signoff RECORD [--allowed-signers FILE] [--rerun]` | Check that a sign-off record still matches its board, files and evaluation (and its signature). |
-| `fab-check [PROFILE]` | Read a fabricator profile's pages again and check that every quoted figure is still there. |
-| `dfm BOARD [-c CFG] [--fab NAME\|FILE] [--gerbers DIR] [--observed FILE] [--checks audit,output,copper,drill,mask,paste,parts,reflow,chips] [--waivers FILE] [--json OUT] [-o DIR] [--no-markers]` | Manufacturing review against a fabricator profile: rules with a verdict and an exit code, and rankings without one. |
-| `plan BOARD --layer L (--zdiff Z [--gap G] \| --z0 Z)` | Track width for a target impedance on a layer of the board's stackup. |
-| `init BOARD [-o FILE] [--force]` | Draft a board configuration from the board. |
-| `check BOARD [-c CFG] [--checks ...] [--rules ...] [-o DIR] [--no-markers]` | Run checks and write the report, without scorecard or DRC. |
-| `compare A B -c CFG [--config-b CFG] [--checks ...]` | Run both boards with the same configuration and report what changed. |
+Run every command as `python3 -m openpcbsi <command>`; `<command> --help` lists all of its options.
+Without `-c CONFIG`, the configuration is detected from the board and the report says what it assumed.
+
+### Reviewing a layout
+
+| Command | Use it to |
+|---|---|
+| `init BOARD` | Draft a configuration for a new board (`boards/<board>.toml`) to review. |
+| `evaluate BOARD -c CFG` | Run every check plus KiCad DRC: a scorecard and an exit code (0 ok, 1 warn, 2 fail). |
+| `check BOARD -c CFG --checks ...` | Run only some checks, without the scorecard or DRC: quick, during layout. |
+| `compare A B -c CFG` | See what changed between two layouts of the same design. |
+| `plan BOARD --layer L --zdiff Z` | Find the track width for a target impedance (`--z0 Z` for single-ended). |
+
+`--checks` takes a comma-separated list from `drc` (electrical rules), `impedance`, `crosstalk`, `si`,
+`vias`, `timing`, `dc`, `pdn`, `thermal` and `emc`. `evaluate --families` selects whole groups instead:
+`g1`, `rp`, `sd`, `si`, `th`, `emc`, `ev`.
+
+### Before ordering
+
+| Command | Use it to |
+|---|---|
+| `dfm BOARD --fab jlcpcb --gerbers DIR` | Check the layout and the files you will send against a fabricator's and assembler's limits. |
+| `signoff BOARD -c CFG --reviewer NAME` | Evaluate and write `signoff.json`, tied to the exact inputs (and signed, with `--sign-key`). |
+| `verify-signoff RECORD` | Confirm a sign-off still matches its board and files. |
+| `fab-check [PROFILE]` | Confirm a fabricator profile's quoted limits are still on the fabricator's pages. |
+
+### Going deeper
+
+| Command | Use it to |
+|---|---|
+| `whatif BOARD -c CFG SPEC` | Sweep one line's length, driver and termination before routing it. |
+| `evaluate BOARD -c CFG --em run` | Also solve automatic 3D regions in openEMS (minutes to hours each); `--em plan` only lists them. |
+| `region BOARD -c CFG SPEC` | Solve one 3D region you describe yourself. |
+| `validate [--3d]` | Run the solvers' reference cases; `--3d` adds the openEMS cases. |
+| `correlate` | Compare openpcbsi with a measured board ([Correlation](#correlation-with-a-measured-board)). |
 | `rediff RUN_A RUN_B` | Compare two finished runs again without re-running them. |
-| `whatif BOARD -c CFG SPEC` | Sweep a single line's geometry, driver and termination before routing it. |
-| `region BOARD [-c CFG] SPEC` | Full-wave openEMS run on a region cut from the board (see below). |
-| `validate [--3d]` | Run the solvers' reference cases; `--3d` adds the openEMS cases (minutes each). |
-| `correlate [--fetch]` | Compare openpcbsi with a measured, published board (see [Correlation](#correlation-with-a-measured-board)). |
 | `snapshot BOARD` | Re-read the board into the cache. |
 
-All commands are run as `python3 -m openpcbsi <command>`. Without `-c`, `evaluate`, `check`,
-`whatif` and `region` use the configuration detected from the board.
-
-`--checks` takes a comma-separated list of `drc` (electrical rules), `impedance`, `crosstalk`,
-`si`, `vias`, `timing`, `dc`, `pdn`, `thermal` and `emc`. `--families` selects by group instead: `g1`
-and `rp` (rules and return paths), `sd` (supply delivery), `si`, `th` (thermal), `emc` and `ev`
-(KiCad DRC).
-
-A 3D region spec names the nets and a box; ports are placed where the nets cross the box edge:
+A 3D region names its nets and a box; ports go where the nets cross the box edge:
 
 ```toml
 [region]
@@ -289,95 +302,11 @@ box = [118.0, 62.0, 126.0, 70.0]      # mm
 fmax_ghz = 20
 ```
 
-Optional keys: `rotate_deg` turns the board about `rotate_about` (default the box's centre) before the
-box is applied, so that a 45-degree route runs along an axis and a side can cut it square (the planner
-sets `rotate_deg = -45` where the box's sides cut its nets at 45 degrees); `include_mm` (default 1.0, at
-least 10 field heights) is how far from the region's own copper other nets' copper is kept in the model
-(farther copper is left out, as the absorbing sides already stand for the board beyond them; 0 keeps
-everything); `term_ohm` (default 50) and `terminate = false` set or remove the load at a pad where a
-region net ends inside the box; `max_hours` (default 6, or `OPENPCBSI_EM_MAX_HOURS`) caps the
-predicted run time.
-
-Before anything is solved, the pre-flight refuses a model that would give no usable answer:
-- a lane that does not run through the box to a port on another side or to a termination (an open
-  end, or a break); routes are followed segment by segment, through vias, pads and series parts;
-- a pair whose legs leave the box on different sides (a box corner cuts it), or a port whose track
-  crosses the box edge more than 10 degrees off square;
-- copper that ends in or runs along the absorbing boundary (see the pre-flight's own text);
-- a run predicted to stop on the time-step limit before the excitation has passed, or predicted to take
-  longer than `max_hours` at this machine's median speed over its last finished grids (350 Mcells/s
-  until it has some): the time step follows the smallest mesh cell (no two lines are closer than 5 um)
-  and each run's step limit is 4 times the steps its excitation needs. The worst case (every run to its
-  step limit, at the slowest measured speed) is logged.
-
-While it runs, openEMS's field energy is watched: a grid whose energy grows a hundredfold after it has
-decayed (an FDTD instability, which only grows) is stopped at once and solved again, once, at 0.9 of its
-cell size (an instability belongs to one mesh: on the revision D board one region's grid was unstable at
-full size and stable at 0.9, and in a larger box with either absorber thickness). A region still running
-at `max_hours` is stopped there (time spent waiting for a job slot does not count), and the fine grid is
-not started when the coarse grid's measured time says it would pass `max_hours`: the cap holds for the
-region's grids together, so the message gives the time used, the time the next grid needs and the
-`max_hours` that would let it finish. A region stopped has no answer, and says why.
-
-`evaluate --em run` solves the regions and their fix variants as many at a time as there are openEMS
-job slots (`OPENPCBSI_JOB_SLOTS`, default one per 16 cores). A fix variant is planned only where it
-adds something: return vias only where the board has none within 1 mm of the layer change, placed
-0.6-1.0 mm away and clear of every other net's via, track and pad (an added via has a pad only on its
-own net's planes and a clearance hole in every other plane); a cut-out only where the board has none.
-
-Two grids are accepted when they agree on the TDR's shape within 2 % of the line, or, when they differ
-more, when each grid's excursion plus their difference stays under the 10 % limit FS9 judges against:
-both then give the same verdict (recorded as agreed on the verdict, not the shape).
-
-A run that stops on its step limit (a plane fragment that keeps ringing, which the board's decoupling
-would damp) is accepted when every port's voltage over the last tenth of the run is at least 50 dB
-below the largest port peak; the figure is recorded per grid. A model still ringing there, but at least
-40 dB down on both grids and within 6 dB of each other (the structure ringing down, not one mesh), is
-judged on its TDR alone: the in-box window ends long before the cut, so the time record it is read from
-is complete (revision D records cut short to tails of -24 to -55 dB moved the in-box TDR by 0.2 points
-at most), while the spectrum of a cut ring is not, so no S-parameter result is given and the grids are
-not compared on the transmission. The verdict says "usable for the TDR only".
-
-A region net that ends on a part's pad inside the box (a connector pin, a BGA ball) gets a 50 ohm
-lumped port from the pad to the nearest reference plane under it: the receiver's or cable's load (100
-ohm differential for a pair) and a measured second port, instead of an open end that reflects
-everything. Its height is part of that load: a pad over a cut-out reaches a plane further down.
-
-The region's own copper on inner layers has its real thickness, as on the outer layers (a zero-
-thickness sheet read an inner-layer pair 8.9 % high against 2D); other nets' inner copper stays a sheet.
-
-The port leads are zero-thickness strips (openEMS's line port measures current on a sheet), so their
-impedance differs from the board's thick track: about 7 % on a microstrip, 13 to 16 % on pairs. That step
-at each box edge, and the lead's own mismatch to the 50 ohm-per-leg reference, put a floor under every
-S11 / Sdd11: a uniform line shows -20 to -23 dB. Each result states this floor (`reflection_floor_db`,
-from the port's and the line's readings); a return loss near or below it is the model's, not the
-layout's. The TDR excursion (`tdr_excursion`) is read inside the box, past the near lead's step and short
-of the far one, against the model's calibrated line or else the 2D impedance of the same geometry; it is
-what the planner's FS9 findings judge.
-
-A region runs on two grids, and the grids are compared on what the region reports, never on the whole
-trace or on each grid's own port reading (the zero-thickness port lead's level moves by up to about 3 %
-with the mesh; late time is multiple reflections between the model's ports):
-- the TDR excursion inside the box's window, both grids against the same reference (the 2D impedance of
-  the same geometry), and the same in-box reflections time-gated and seen with the link's own edge (the
-  class's `rise_ps`, or 0.15 / `nyquist_ghz`: 30 % of a bit, stated as an assumption);
-- the transmission at the link's Nyquist (`nyquist_ghz`), in dB.
-They agree when every excursion matches within the larger of 1.5 percentage points and 15 % of its size,
-and the transmission within the larger of 0.1 dB and 15 %. When they do not, the region still stands if
-both grids put it on the same side of the 10 % TDR limit (the spread is reported beside it); when they
-straddle the limit, a third, finer grid decides, if `max_hours` allows. A region whose grids both stay
-within 5 % and whose return loss is under the model's own floor is a pass: clean, below the model's
-resolution. FS9 judges each region at its link's own edge when its class gives a rate. The gate keeps
-about 1 % of the near and far leads' steps (their Gaussian tails), which bounds what it can resolve.
-
-The absolute level of a 3D run moves with the mesh by up to about 2.5 % (on one pair, three grids gave
-98.95, 101.09 and 99.9 ohm against 99.6 ohm in 2D), so that level is checked against the 2D solver: the
-model's line is compared with 2D for the same geometry when the box holds a uniform run long enough.
-
-Parts between region nets: a resistor is a lumped resistor; a capacitor too large to charge within the
-run (any AC-coupling capacitor) is modelled as its metal body bridging the pads, since in band it is a
-short (its reactance at the lowest reported frequency is recorded, and reported as a problem when it is
-not small); a small capacitor or an inductor is a series R-L-C lumped element.
+Each region is solved on two grids and ends with one verdict line: `pass: clean`, `usable`, `usable for
+the TDR only`, `not usable` (the grids disagree) or `no answer` (stopped, with the reason). A model that
+cannot give an answer is refused before it is solved, and `max_hours` (default 6) caps the run time.
+Options, the checks before and during a run, and how to read the results are in
+[docs/regions.md](docs/regions.md).
 
 ## Outputs
 
