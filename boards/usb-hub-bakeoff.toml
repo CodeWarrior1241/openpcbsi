@@ -1,0 +1,175 @@
+# openpcbsi board config for the USB hub bakeoff board (Sandbox/USB_Hub_Board, rev A).
+# Drafted by `openpcbsi init`, then reviewed against that project's REQUIREMENTS.md and .kicad_dru.
+# Every changed limit names its source. Values marked "assumed" have none and only rank.
+# The board's .kicad_dru gives the pair limits (uncoupled 4 mm, skew 1.25 mm per pair, gap 0.2 mm opt);
+# they are not repeated here.
+# openpcbsi board config drafted by `python3 -m openpcbsi init` from
+#   usb-hub-bakeoff.kicad_pcb
+# Everything below was detected from the board (detect.py). Review it before trusting a
+# result: edge rates, rail currents, tolerances and ripple targets are not on the board.
+# The pilot's boards/au7p-fmc.toml shows every section with comments.
+
+# Assumed:
+#   class USB_HS: 9 pairs, rise 300 ps, Nyquist 1 GHz, Zdiff 90 ohm (other differential pairs; LVDS-like edge rate assumed)
+#   class clk: 1 nets, rise 500 ps (single-ended clock names; 500 ps edge assumed)
+# Left out (add by hand where needed):
+#   power net V12_C: no voltage in the net name (source -, loads U3)
+#   power net V33_A: no voltage in the net name (source -, loads U1)
+#   power net V33_B: no voltage in the net name (source -, loads U2)
+#   power net V33_C: no voltage in the net name (source -, loads U3)
+#   power net VBAT_C: no voltage in the net name (source -, loads U3)
+#   power net VBUS_A: no voltage in the net name (source J3, loads J1, J2, U1)
+#   power net VBUS_B: no voltage in the net name (source J4, loads J5, J6, U2)
+#   power net VBUS_C: no voltage in the net name (source J7, loads J8, J9)
+#   PDN impedance (G11): needs ripple_pct and step_a per rail, not on the board
+#   thermal dissipation per part (G13): only I2R of the assumed rail currents
+#   G7 channels and G3 drivers/terminations: none configured
+
+[board]
+reference_nets = ["GND"]
+
+# --- signal classes: edge rates are defaults, set them from the interface standards ---------
+[classes.USB_HS]
+rise_ps = 500.0         # USB 2.0 spec 7.1.2.2: HS driver rise/fall >= 500 ps (10-90 %)
+nyquist_ghz = 0.24      # 480 Mb/s
+z_diff = 90.0           # USB 2.0 spec: 90 ohm +/- 15 %
+z_tol = 13.5
+patterns = [
+    "USB_A_DN1_N",
+    "USB_A_DN1_P",
+    "USB_A_DN2_N",
+    "USB_A_DN2_P",
+    "USB_A_UP_N",
+    "USB_A_UP_P",
+    "USB_B_DN1_N",
+    "USB_B_DN1_P",
+    "USB_B_DN2_N",
+    "USB_B_DN2_P",
+    "USB_B_UP_N",
+    "USB_B_UP_P",
+    "USB_C_DN1_N",
+    "USB_C_DN1_P",
+    "USB_C_DN2_N",
+    "USB_C_DN2_P",
+    "USB_C_UP_N",
+    "USB_C_UP_P",
+]
+
+[classes.clk]
+rise_ps = 1000.0        # assumed, conservative: Epson SG-210STF publishes tr/tf <= 3.5 ns (12 MHz CMOS)
+nyquist_ghz = 0.35
+patterns = ["REFCLK_C"]
+
+# --- exclusion areas (BGA and connector fields) ----------------------------------------------
+[areas.conn_J3]
+footprints = ["J3"]
+margin = 0.0
+
+[areas.conn_J7]
+footprints = ["J7"]
+margin = 0.0
+
+[areas.conn_J4]
+footprints = ["J4"]
+margin = 0.0
+
+[areas.conn_J5]
+footprints = ["J5"]
+margin = 0.0
+
+[areas.conn_J2]
+footprints = ["J2"]
+margin = 0.0
+
+[areas.conn_J1]
+footprints = ["J1"]
+margin = 0.0
+
+[areas.conn_J8]
+footprints = ["J8"]
+margin = 0.0
+
+[areas.conn_J6]
+footprints = ["J6"]
+margin = 0.0
+
+[areas.conn_J9]
+footprints = ["J9"]
+margin = 0.0
+
+# --- rules: which classes each G1 rule applies to (limits stay at their defaults) ------------
+[rules.ref_plane]
+classes = ["USB_HS", "clk"]
+
+[rules.split_crossing]
+classes = ["USB_HS", "clk"]
+
+[rules.return_via]
+classes = ["USB_HS", "clk"]
+
+[rules.via_stub]
+classes = ["USB_HS"]
+
+[rules.edge_distance]
+classes = ["USB_HS"]
+
+[rules.pair_coupling]
+classes = ["USB_HS"]
+
+[rules.parallel]
+classes = ["USB_HS"]
+
+[rules.pad_plane]
+classes = ["USB_HS"]
+
+[rules.stubs]
+classes = ["USB_HS", "clk"]
+
+[rules.stitching]
+classes = ["USB_HS"]
+max_gap_mm = 12.0       # lambda/10 at 1.2 GHz (5th harmonic of 240 MHz), er 4.2: rule of thumb, not a published limit
+
+[rules.decap]
+load_refs = []
+
+# --- rails: CURRENTS ARE ASSUMED. Set current_a (and ripple_pct / step_a for G11) per rail; --
+# --- then delete current_assumed. While it is true a DC drop is never judged worse than warn. -
+# VBUS: bus-powered, passed straight through to the downstream ports (D14, D15).
+# 0.25 A = 2 x 100 mA per downstream port (D16) + hub; CH334P ICC 21 mA (CH334DS1), rounded up to 50 mA.
+[rails.VBUS_A]
+net = "VBUS_A"
+v = 5.0
+tol_pct = 5.0           # USB 2.0 VBUS 4.75-5.25 V
+current_a = 0.25
+source = "J1"
+loads = ["J2", "J3", "U1"]
+
+[rails.VBUS_B]
+net = "VBUS_B"
+v = 5.0
+tol_pct = 5.0
+current_a = 0.25
+source = "J4"
+loads = ["J5", "J6", "U2"]
+
+[rails.VBUS_C]
+net = "VBUS_C"
+v = 5.0
+tol_pct = 5.0
+current_a = 0.25        # USB3803 current not taken from its datasheet: hub share assumed as for the CH334P
+current_assumed = true
+source = "J7"
+loads = ["J8", "J9", "JP1"]   # JP1 feeds VBAT_C (U3)
+
+[engines]
+dc = "openpcbsi"     # "kipi" needs [kipi] and [kipi.input] (see boards/au7p-fmc.toml)
+pdn = "openpcbsi"
+cross_check = false
+
+[crosstalk]
+classes = ["USB_HS", "clk"]
+
+[evaluate]
+warnings_exit = true      # exit code 1 when there are warnings and no fails
+drc_warning = "warn"      # KiCad DRC warnings as "warn" or "fail"
+dc_warn_pct = 50.0

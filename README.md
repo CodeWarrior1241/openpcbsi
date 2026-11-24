@@ -51,6 +51,45 @@ measurements.
   verdict, it ranks acute copper corners, each part's place in a modelled reflow, and how far apart in
   time the two joints of each chip melt.
 
+## Example: an FPGA carrier board
+
+An 8-layer, 100 × 100 mm carrier for an XCAU7P FPGA with an FMC LPC connector was laid out by an
+agentic KiCad tool (Backplane) and released as revision A with KiCad DRC clean: 0 violations,
+0 unconnected, schematic parity. openpcbsi found the following on it and on the later revisions;
+the fixes went into revisions B to D, with DRC clean throughout:
+
+- **Supply drop.** On revision A, VCCBRAM lost 36.5 mV from regulator to balls (143 % of its ±3 %
+  window) and MGTVCCAUX 58.2 mV (108 %). openpcbsi splits each drop into shunt and copper, which
+  showed the layout's share: a 0.2 mm feed bar into the ball field, and a 56 mm run of thin +1V8
+  plane shared with two LDOs. Widening both brought MGTVCCAUX to 36.2 mV (67 %) and VCCBRAM's copper
+  share from 14.6 to 4.7 mV. The rest is the 50 mΩ sense shunt, a schematic choice.
+- **Track heating.** Four VCCAUX balls were fed only by a chain of 0.1 mm inner-layer tracks:
+  0.27 A in the worst segment, a 58 °C rise by IPC-2221. Two parallel paths per link cut this to
+  0.07 A and 3.2 °C, and the VCCAUX drop from 29.4 to 21.9 mV.
+- **Pads over solid plane.** The 0402 AC-coupling capacitors on the GTH receive lane and reference
+  clock sat 0.116 mm above solid ground. A separate openEMS model put this at a −29 % TDR dip and
+  −10.4 dB return loss at 6.25 GHz; with the plane cut out under the pads, −15 % and −20.4 dB. On
+  the final revision, openpcbsi's own 3D region passes these capacitors as clean: TDR within 3.1 %,
+  return loss −22 dB. The same check then found the six GTH pads of the FMC connector, cut out in
+  revision D.
+- **Return paths.** The GTH reference clock changed layers 6.2 / 6.8 mm from the nearest return
+  via. The board edge ran 364 mm with no stitching, and stretches of the GTH pairs ran up to 20 mm
+  without a ground via. About 230 ground vias brought the return-via failures to zero and the
+  stitching gaps to at most 13.2 mm on the edge and 3.2 mm along the GTH pairs.
+- **Manufacturing.** The review against the fabricator's limits found 14 same-net copper gaps of
+  0.12–0.22 mm, under the 0.25 mm minimum. Eleven were filled; the other three could not be without
+  coming within 0.09 mm of another net. It also flagged 62 vias in SMD pads, which must be ordered
+  filled and capped.
+
+The findings are inputs for an engineer, not a certificate. On revision C openpcbsi reported 84
+failures; three kinds of finding were changed in revision D, and the rest were assessed and kept:
+PDN targets at 100 MHz stricter than AMD's own guidance, fan-out necks that are electrically short at
+LVDS rates, and power-split crossings that openEMS showed cost under 1 % on the differential signal.
+Its DC results agree with KiPI's to within +3 to +13 %. The board also tested the tool: on
+revision A none of openpcbsi's 3D regions gave a usable answer. After the fixes that board prompted,
+all seven give one: five pass or are usable, and two raise TDR warnings (one of them needs a longer
+time cap).
+
 ## Requirements
 
 - `kicad-cli` of KiCad 10 on the `PATH` (it refills zones on a copy, runs DRC and plots files).
